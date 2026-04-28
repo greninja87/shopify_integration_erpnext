@@ -1,0 +1,30 @@
+[project]
+name = "shopify_integration"
+dynamic = ["version"]
+description = "Shopify to ERPNext integration with automatic Sales Orders, Payment Entries, Sales Invoices, and India GST compliance."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Yash Chaurasia", email = "chaurasiayash351@gmail.com" }
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Framework :: Frappe",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+    "Programming Language :: Python :: 3",
+    "Topic :: Office/Business",
+]
+keywords = ["shopify", "erpnext", "frappe", "ecommerce", "gst", "india"]
+
+[build-system]
+requires = ["flit_core >=3.4,<4"]
+build-backend = "flit_core:main"
+
+[tool.bench.frappe-dependencies]
+frappe = ">=15.0.0"
+erpnext = ">=15.0.0"
+
+[tool.bench.categories]
+category = ["Integrations", "E-commerce"]

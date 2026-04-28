@@ -1,0 +1,124 @@
+{
+  "actions": [],
+  "creation": "2026-04-15 00:00:00.000000",
+  "doctype": "DocType",
+  "document_type": "Document",
+  "editable_grid": 1,
+  "engine": "InnoDB",
+  "field_order": [
+    "topic",
+    "shop_domain",
+    "shopify_order_id",
+    "shopify_order_name",
+    "status",
+    "column_break_top",
+    "erpnext_sales_order",
+    "section_break_payload",
+    "payload",
+    "section_break_error",
+    "error_message"
+  ],
+  "fields": [
+    {
+      "fieldname": "topic",
+      "fieldtype": "Data",
+      "in_list_view": 1,
+      "label": "Topic",
+      "read_only": 1,
+      "description": "e.g. orders/create, orders/paid"
+    },
+    {
+      "fieldname": "shop_domain",
+      "fieldtype": "Data",
+      "in_list_view": 1,
+      "label": "Shop Domain",
+      "read_only": 1
+    },
+    {
+      "fieldname": "shopify_order_id",
+      "fieldtype": "Data",
+      "in_list_view": 1,
+      "label": "Shopify Order ID",
+      "read_only": 1
+    },
+    {
+      "fieldname": "shopify_order_name",
+      "fieldtype": "Data",
+      "in_list_view": 1,
+      "label": "Shopify Order Name",
+      "read_only": 1,
+      "description": "e.g. #1001"
+    },
+    {
+      "fieldname": "status",
+      "fieldtype": "Select",
+      "in_list_view": 1,
+      "label": "Status",
+      "options": "Received\nProcessed\nFailed\nSkipped",
+      "default": "Received",
+      "read_only": 1
+    },
+    {
+      "fieldname": "column_break_top",
+      "fieldtype": "Column Break"
+    },
+    {
+      "fieldname": "erpnext_sales_order",
+      "fieldtype": "Link",
+      "label": "ERPNext Sales Order",
+      "options": "Sales Order",
+      "read_only": 1,
+      "in_list_view": 1,
+      "description": "Sales Order created from this webhook event"
+    },
+    {
+      "fieldname": "section_break_payload",
+      "fieldtype": "Section Break",
+      "label": "Raw Payload"
+    },
+    {
+      "fieldname": "payload",
+      "fieldtype": "Long Text",
+      "label": "Payload",
+      "read_only": 1,
+      "description": "Full JSON received from Shopify"
+    },
+    {
+      "fieldname": "section_break_error",
+      "fieldtype": "Section Break",
+      "label": "Error Details"
+    },
+    {
+      "fieldname": "error_message",
+      "fieldtype": "Long Text",
+      "label": "Error Message",
+      "read_only": 1
+    }
+  ],
+  "index_web_pages_for_search": 0,
+  "is_submittable": 0,
+  "links": [],
+  "modified": "2026-04-17 00:00:00.000000",
+  "modified_by": "Administrator",
+  "module": "Shopify Integration",
+  "name": "Shopify Log",
+  "owner": "Administrator",
+  "permissions": [
+    {
+      "create": 1,
+      "delete": 1,
+      "email": 1,
+      "export": 1,
+      "print": 1,
+      "read": 1,
+      "report": 1,
+      "role": "System Manager",
+      "share": 1,
+      "write": 1
+    }
+  ],
+  "sort_field": "creation",
+  "sort_order": "DESC",
+  "states": [],
+  "track_changes": 0
+}

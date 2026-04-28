@@ -1,0 +1,548 @@
+{
+  "actions": [],
+  "allow_rename": 1,
+  "autoname": "field:store_name",
+  "creation": "2026-04-15 00:00:00.000000",
+  "doctype": "DocType",
+  "document_type": "Document",
+  "editable_grid": 1,
+  "engine": "InnoDB",
+  "field_order": [
+    "store_name",
+    "shop_domain",
+    "enable_sync",
+    "webhook_secret",
+
+    "tab_connection",
+    "section_company",
+    "company",
+    "column_break_company",
+    "warehouse",
+    "section_addresses",
+    "company_address",
+    "dispatch_address",
+
+    "tab_order_defaults",
+    "section_naming",
+    "naming_series",
+    "column_break_naming",
+    "selling_price_list",
+    "customer_naming_series",
+    "section_customer_defaults",
+    "customer_group",
+    "column_break_customer",
+    "territory",
+    "section_payment_terms",
+    "payment_terms_paid",
+    "payment_terms_partial",
+    "payment_terms_pending",
+    "section_draft_behaviour",
+    "keep_draft_partial",
+    "column_break_draft",
+    "keep_draft_pending",
+
+    "tab_accounting",
+    "section_dimensions",
+    "cost_center",
+    "column_break_dimensions",
+    "branch",
+    "section_shipping",
+    "shipping_item",
+    "section_gst",
+    "gst_field_path",
+
+    "tab_payment_entry",
+    "section_pe_settings",
+    "enable_payment_entry",
+    "column_break_pe_settings",
+    "auto_submit_payment_entry",
+    "section_pe_series",
+    "pe_naming_series",
+    "section_pe_defaults",
+    "default_mode_of_payment",
+    "column_break_pe_defaults",
+    "default_bank_account",
+    "section_pe_mapping",
+    "payment_gateway_mapping",
+
+    "tab_sales_invoice",
+    "section_si_settings",
+    "enable_sales_invoice",
+    "column_break_si_settings",
+    "sales_invoice_trigger",
+    "auto_submit_sales_invoice",
+    "section_si_series",
+    "si_naming_series",
+
+    "tab_notifications",
+    "section_failure",
+    "failure_email_to",
+    "column_break_failure",
+    "failure_email_cc",
+    "shopify_log_retention_days",
+
+    "tab_field_mapping",
+    "section_field_mapping",
+    "field_mapping"
+  ],
+  "fields": [
+
+    {
+      "fieldname": "store_name",
+      "fieldtype": "Data",
+      "label": "Store Name",
+      "reqd": 1,
+      "unique": 1,
+      "in_list_view": 1,
+      "description": "Friendly name for this store, e.g. 'Not Drones India'. Used as the record identifier."
+    },
+    {
+      "fieldname": "shop_domain",
+      "fieldtype": "Data",
+      "label": "Shop Domain",
+      "reqd": 1,
+      "unique": 1,
+      "in_list_view": 1,
+      "description": "Your Shopify store domain, e.g. notdrones.myshopify.com — must match the X-Shopify-Shop-Domain header sent in webhooks."
+    },
+    {
+      "default": "0",
+      "fieldname": "enable_sync",
+      "fieldtype": "Check",
+      "label": "Enable Sync",
+      "in_list_view": 1,
+      "description": "Master switch. When off, incoming webhooks from this store are ignored."
+    },
+    {
+      "fieldname": "webhook_secret",
+      "fieldtype": "Password",
+      "label": "Webhook Secret",
+      "description": "Signing secret from Shopify Admin → Settings → Notifications → Webhooks. Used to verify that incoming requests are genuinely from Shopify."
+    },
+
+    {
+      "fieldname": "tab_connection",
+      "fieldtype": "Tab Break",
+      "label": "Connection"
+    },
+    {
+      "fieldname": "section_company",
+      "fieldtype": "Section Break",
+      "label": "ERPNext Company"
+    },
+    {
+      "fieldname": "company",
+      "fieldtype": "Link",
+      "label": "Company",
+      "options": "Company",
+      "reqd": 1,
+      "description": "All documents created from this store will be posted under this company."
+    },
+    {
+      "fieldname": "column_break_company",
+      "fieldtype": "Column Break"
+    },
+    {
+      "fieldname": "warehouse",
+      "fieldtype": "Link",
+      "label": "Default Warehouse",
+      "options": "Warehouse",
+      "description": "Default stock location for items on Sales Orders created from this store."
+    },
+    {
+      "fieldname": "section_addresses",
+      "fieldtype": "Section Break",
+      "label": "Addresses"
+    },
+    {
+      "fieldname": "company_address",
+      "fieldtype": "Link",
+      "label": "Company Address",
+      "options": "Address",
+      "description": "Your company's billing address — printed on Sales Orders."
+    },
+    {
+      "fieldname": "dispatch_address",
+      "fieldtype": "Link",
+      "label": "Dispatch Address",
+      "options": "Address",
+      "description": "Address goods are dispatched from. India Compliance uses this to determine intra-state vs inter-state GST. Leave blank to fall back to Company Address."
+    },
+
+    {
+      "fieldname": "tab_order_defaults",
+      "fieldtype": "Tab Break",
+      "label": "Order Defaults"
+    },
+    {
+      "fieldname": "section_naming",
+      "fieldtype": "Section Break",
+      "label": "Document Naming"
+    },
+    {
+      "fieldname": "naming_series",
+      "fieldtype": "Select",
+      "label": "Sales Order Series",
+      "description": "Naming series applied to Sales Orders created from this store."
+    },
+    {
+      "fieldname": "column_break_naming",
+      "fieldtype": "Column Break"
+    },
+    {
+      "fieldname": "selling_price_list",
+      "fieldtype": "Link",
+      "label": "Price List",
+      "options": "Price List",
+      "description": "Price list to attach to Sales Orders. Rates are always taken directly from the Shopify order — the price list is used for reference only."
+    },
+    {
+      "fieldname": "customer_naming_series",
+      "fieldtype": "Select",
+      "label": "Customer Series",
+      "description": "Naming series for new Customers auto-created from Shopify orders. Leave blank to use the ERPNext default."
+    },
+    {
+      "fieldname": "section_customer_defaults",
+      "fieldtype": "Section Break",
+      "label": "Customer Defaults"
+    },
+    {
+      "fieldname": "customer_group",
+      "fieldtype": "Link",
+      "label": "Default Customer Group",
+      "options": "Customer Group",
+      "description": "Customer Group assigned to new customers created from Shopify orders."
+    },
+    {
+      "fieldname": "column_break_customer",
+      "fieldtype": "Column Break"
+    },
+    {
+      "fieldname": "territory",
+      "fieldtype": "Link",
+      "label": "Default Territory",
+      "options": "Territory",
+      "description": "Territory assigned to new customers and Sales Orders from this store."
+    },
+    {
+      "fieldname": "section_payment_terms",
+      "fieldtype": "Section Break",
+      "label": "Payment Terms",
+      "description": "Select a Payment Terms Template to apply based on the Shopify order's payment status. Leave blank to create Sales Orders without payment terms."
+    },
+    {
+      "fieldname": "payment_terms_paid",
+      "fieldtype": "Link",
+      "label": "Paid Orders",
+      "options": "Payment Terms Template",
+      "description": "Applied when Shopify financial_status = 'paid'."
+    },
+    {
+      "fieldname": "payment_terms_partial",
+      "fieldtype": "Link",
+      "label": "Partially Paid Orders",
+      "options": "Payment Terms Template",
+      "description": "Applied when Shopify financial_status = 'partially_paid'."
+    },
+    {
+      "fieldname": "payment_terms_pending",
+      "fieldtype": "Link",
+      "label": "Pending / Unpaid Orders",
+      "options": "Payment Terms Template",
+      "description": "Applied when Shopify financial_status = 'pending', 'voided', or 'unpaid'."
+    },
+    {
+      "fieldname": "section_draft_behaviour",
+      "fieldtype": "Section Break",
+      "label": "Draft Behaviour",
+      "description": "By default all Sales Orders are submitted automatically. Enable these to keep specific order types as Draft for manual review before submission."
+    },
+    {
+      "default": "0",
+      "fieldname": "keep_draft_partial",
+      "fieldtype": "Check",
+      "label": "Keep Draft — Partially Paid",
+      "description": "Sales Orders for 'partially_paid' Shopify orders will be saved as Draft instead of submitted."
+    },
+    {
+      "fieldname": "column_break_draft",
+      "fieldtype": "Column Break"
+    },
+    {
+      "default": "0",
+      "fieldname": "keep_draft_pending",
+      "fieldtype": "Check",
+      "label": "Keep Draft — Pending / Unpaid",
+      "description": "Sales Orders for 'pending', 'voided', or 'unpaid' Shopify orders will be saved as Draft instead of submitted."
+    },
+
+    {
+      "fieldname": "tab_accounting",
+      "fieldtype": "Tab Break",
+      "label": "Accounting"
+    },
+    {
+      "fieldname": "section_dimensions",
+      "fieldtype": "Section Break",
+      "label": "Accounting Dimensions",
+      "description": "These dimensions are stamped on every Sales Order and Payment Entry created from this store."
+    },
+    {
+      "fieldname": "cost_center",
+      "fieldtype": "Link",
+      "label": "Cost Center",
+      "options": "Cost Center"
+    },
+    {
+      "fieldname": "column_break_dimensions",
+      "fieldtype": "Column Break"
+    },
+    {
+      "fieldname": "branch",
+      "fieldtype": "Link",
+      "label": "Branch",
+      "options": "Branch"
+    },
+    {
+      "fieldname": "section_shipping",
+      "fieldtype": "Section Break",
+      "label": "Shipping",
+      "description": "The ERPNext item used to represent Shopify shipping charges as a line item on the Sales Order."
+    },
+    {
+      "fieldname": "shipping_item",
+      "fieldtype": "Link",
+      "label": "Shipping Item",
+      "options": "Item",
+      "description": "Must have an Item Tax Template so GST is stripped correctly from Shopify's tax-inclusive shipping price."
+    },
+    {
+      "fieldname": "section_gst",
+      "fieldtype": "Section Break",
+      "label": "GST",
+      "description": "When a GSTIN is found at the configured path in the Shopify order, the integration will:<br>1. Use the GST-registered <b>legal name</b> as the customer name.<br>2. Use the GST-registered <b>address</b> as the billing address (looked up locally first, then fetched from India Compliance portal if available).<br>3. Leave the <b>shipping address</b> exactly as provided by Shopify."
+    },
+    {
+      "fieldname": "gst_field_path",
+      "fieldtype": "Data",
+      "label": "GSTIN Shopify Field Path",
+      "description": "Dot-notation path in the Shopify order payload where the customer's GSTIN is stored. e.g. <code>billing_address.company</code>. The value is validated against the standard GSTIN format — non-GSTIN values at this path are ignored. Leave blank to disable GST-based resolution."
+    },
+
+    {
+      "fieldname": "tab_payment_entry",
+      "fieldtype": "Tab Break",
+      "label": "Payment Entry"
+    },
+    {
+      "fieldname": "section_pe_settings",
+      "fieldtype": "Section Break",
+      "label": "Settings",
+      "description": "When enabled, a Payment Entry is automatically created for every Shopify order with payment status <b>Paid</b> or <b>Partially Paid</b>."
+    },
+    {
+      "default": "0",
+      "fieldname": "enable_payment_entry",
+      "fieldtype": "Check",
+      "label": "Enable Payment Entry Creation"
+    },
+    {
+      "fieldname": "column_break_pe_settings",
+      "fieldtype": "Column Break"
+    },
+    {
+      "default": "1",
+      "fieldname": "auto_submit_payment_entry",
+      "fieldtype": "Check",
+      "label": "Auto-Submit Payment Entry",
+      "depends_on": "eval:doc.enable_payment_entry",
+      "description": "Uncheck to save Payment Entries as Draft for manual review before submission."
+    },
+    {
+      "fieldname": "section_pe_series",
+      "fieldtype": "Section Break",
+      "label": "Naming Series",
+      "depends_on": "eval:doc.enable_payment_entry"
+    },
+    {
+      "fieldname": "pe_naming_series",
+      "fieldtype": "Select",
+      "label": "Payment Entry Series",
+      "depends_on": "eval:doc.enable_payment_entry",
+      "description": "Naming series for Payment Entries created from this store. Leave blank to use the default."
+    },
+    {
+      "fieldname": "section_pe_defaults",
+      "fieldtype": "Section Break",
+      "label": "Default Fallback Account",
+      "depends_on": "eval:doc.enable_payment_entry",
+      "description": "Used when no row in the Gateway Mapping table matches the incoming order's payment gateway."
+    },
+    {
+      "fieldname": "default_mode_of_payment",
+      "fieldtype": "Link",
+      "label": "Mode of Payment",
+      "options": "Mode of Payment",
+      "depends_on": "eval:doc.enable_payment_entry"
+    },
+    {
+      "fieldname": "column_break_pe_defaults",
+      "fieldtype": "Column Break"
+    },
+    {
+      "fieldname": "default_bank_account",
+      "fieldtype": "Link",
+      "label": "Bank / Cash Account",
+      "options": "Account",
+      "depends_on": "eval:doc.enable_payment_entry",
+      "description": "Ledger account (type: Bank or Cash) that receives the payment."
+    },
+    {
+      "fieldname": "section_pe_mapping",
+      "fieldtype": "Section Break",
+      "label": "Gateway → Account Mapping",
+      "depends_on": "eval:doc.enable_payment_entry",
+      "description": "Map each Shopify payment gateway to an ERPNext Bank / Cash Account. Rows are evaluated <b>top-down — first match wins</b>.<br><br><b>Tag Contains</b> (higher priority) — matches if the order's <i>tags</i> field contains this text (case-insensitive). Use this when your payment app registers orders as 'manual' but tags them 'CASHFREE', 'RAZORPAY', etc.<br><b>Shopify Gateway</b> — matches against <i>payment_gateway_names[0]</i> in the webhook. Exact match first, then similarity-based fallback.<br><br>Tip: open any Shopify Log → Raw Payload to see the exact <i>payment_gateway_names</i> and <i>tags</i> your store sends."
+    },
+    {
+      "fieldname": "payment_gateway_mapping",
+      "fieldtype": "Table",
+      "label": "Payment Gateway Mapping",
+      "options": "Shopify Payment Gateway Mapping",
+      "depends_on": "eval:doc.enable_payment_entry"
+    },
+
+    {
+      "fieldname": "tab_sales_invoice",
+      "fieldtype": "Tab Break",
+      "label": "Sales Invoice"
+    },
+    {
+      "fieldname": "section_si_settings",
+      "fieldtype": "Section Break",
+      "label": "Settings",
+      "description": "Automatically create a Sales Invoice after the Sales Order is processed. Works with or without Payment Entry.<br><br><b>After Payment Entry</b> — Invoice is created right after the Payment Entry succeeds. If Payment Entry is disabled, the Invoice is created immediately after Sales Order submission.<br><b>After Delivery Note</b> — A scheduler checks every hour for submitted Delivery Notes and creates the Invoice from the DN."
+    },
+    {
+      "default": "0",
+      "fieldname": "enable_sales_invoice",
+      "fieldtype": "Check",
+      "label": "Enable Sales Invoice Creation"
+    },
+    {
+      "fieldname": "column_break_si_settings",
+      "fieldtype": "Column Break"
+    },
+    {
+      "default": "After Payment Entry",
+      "fieldname": "sales_invoice_trigger",
+      "fieldtype": "Select",
+      "label": "Create Invoice",
+      "options": "\nAfter Payment Entry\nAfter Delivery Note",
+      "depends_on": "eval:doc.enable_sales_invoice"
+    },
+    {
+      "default": "1",
+      "fieldname": "auto_submit_sales_invoice",
+      "fieldtype": "Check",
+      "label": "Auto-Submit Sales Invoice",
+      "depends_on": "eval:doc.enable_sales_invoice",
+      "description": "Uncheck to save Sales Invoices as Draft for manual review before submission."
+    },
+    {
+      "fieldname": "section_si_series",
+      "fieldtype": "Section Break",
+      "label": "Naming Series",
+      "depends_on": "eval:doc.enable_sales_invoice"
+    },
+    {
+      "fieldname": "si_naming_series",
+      "fieldtype": "Select",
+      "label": "Sales Invoice Series",
+      "depends_on": "eval:doc.enable_sales_invoice",
+      "description": "Naming series for Sales Invoices created from this store. Leave blank to use the default."
+    },
+
+    {
+      "fieldname": "tab_notifications",
+      "fieldtype": "Tab Break",
+      "label": "Notifications"
+    },
+    {
+      "fieldname": "section_failure",
+      "fieldtype": "Section Break",
+      "label": "Failure Alerts",
+      "description": "Email addresses to notify when automation fails. Covers two scenarios:<br>1. <b>Sales Order creation failure</b> — any error during order processing.<br>2. <b>Payment Entry failure</b> — when the Sales Order was created successfully but payment processing failed and requires manual attention."
+    },
+    {
+      "fieldname": "failure_email_to",
+      "fieldtype": "Data",
+      "label": "To",
+      "description": "Comma-separated list of recipients."
+    },
+    {
+      "fieldname": "column_break_failure",
+      "fieldtype": "Column Break"
+    },
+    {
+      "fieldname": "failure_email_cc",
+      "fieldtype": "Data",
+      "label": "CC",
+      "description": "Comma-separated list of addresses to CC."
+    },
+    {
+      "fieldname": "shopify_log_retention_days",
+      "fieldtype": "Int",
+      "label": "Delete Shopify Logs After (Days)",
+      "description": "Automatically delete Shopify Logs older than this many days. Leave blank or 0 to keep all logs.",
+      "default": "0"
+    },
+
+    {
+      "fieldname": "tab_field_mapping",
+      "fieldtype": "Tab Break",
+      "label": "Field Mapping"
+    },
+    {
+      "fieldname": "section_field_mapping",
+      "fieldtype": "Section Break",
+      "label": "Custom Field Mapping",
+      "description": "Map any field from the Shopify order payload to a field on an ERPNext document.<br><br>Any standard or custom Sales Order field can be a target — e.g. <code>po_no</code>, <code>customer_gstin</code>, <code>custom_shopify_note</code>. Only internal system fields that control document identity or state are blocked (name, docstatus, owner, etc.).<br><br>Use dot-notation for nested Shopify values, e.g. <code>billing_address.company</code> or <code>customer.email</code>."
+    },
+    {
+      "fieldname": "field_mapping",
+      "fieldtype": "Table",
+      "label": "Field Mapping",
+      "options": "Shopify Field Mapping"
+    }
+
+  ],
+  "index_web_pages_for_search": 0,
+  "is_single": 0,
+  "issingle": 0,
+  "links": [],
+  "modified": "2026-04-24 00:00:00.000000",
+  "modified_by": "Administrator",
+  "module": "Shopify Integration",
+  "name": "Shopify Settings",
+  "owner": "Administrator",
+  "permissions": [
+    {
+      "create": 1,
+      "delete": 1,
+      "email": 1,
+      "export": 1,
+      "print": 1,
+      "read": 1,
+      "report": 1,
+      "role": "System Manager",
+      "share": 1,
+      "write": 1
+    }
+  ],
+  "sort_field": "modified",
+  "sort_order": "DESC",
+  "states": [],
+  "track_changes": 1
+}

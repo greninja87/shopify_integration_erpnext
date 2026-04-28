@@ -1,0 +1,136 @@
+"""
+scheduler.py — Background jobs for Shopify Integration.
+
+Registered in hooks.py under scheduler_events → hourly.
+
+create_invoices_after_delivery_note()
+    For every active Shopify Settings record that has:
+      - enable_sales_invoice = 1
+      - sales_invoice_trigger = "After Delivery Note"
+
+    Find all submitted Delivery Notes whose items link to a Shopify Sales Order
+    from that store, where no Sales Invoice has been made from the DN yet, then
+    create the Sales Invoice (and optionally submit it).
+
+    Runs hourly.  Each SI creation is wrapped in its own try/except so one
+    failed DN does not block the rest of the batch.
+"""
+
+import frappe
+
+
+def create_invoices_after_delivery_note():
+    """
+    Hourly scheduler entry point.  Processes all active stores configured for
+    'After Delivery Note' invoice creation.
+    """
+    active_stores = frappe.get_all(
+        "Shopify Settings",
+        filters={
+            "enable_sync": 1,
+            "enable_sales_invoice": 1,
+            "sales_invoice_trigger": "After Delivery Note",
+        },
+        pluck="name",
+    )
+
+    for store_name in active_stores:
+        try:
+            settings = frappe.get_doc("Shopify Settings", store_name)
+            _process_store(settings)
+        except Exception:
+            frappe.log_error(
+                frappe.get_traceback(),
+                f"Shopify: Scheduler Error for store {store_name}",
+            )
+
+
+def _process_store(settings):
+    """
+    For one store: find DNs with Shopify-SO items that have no SI yet, and
+    create a Sales Invoice for each.
+
+    Query logic:
+      - Delivery Note is submitted (docstatus = 1)
+      - At least one DN item links back to a submitted Sales Order whose
+        shopify_store matches this settings record
+      - No submitted (or draft) Sales Invoice already references this DN
+    """
+    dn_rows = frappe.db.sql(
+        """
+        SELECT DISTINCT dn.name AS dn_name
+        FROM `tabDelivery Note` dn
+        JOIN `tabDelivery Note Item` dni ON dni.parent = dn.name
+        JOIN `tabSales Order` so ON so.name = dni.against_sales_order
+        WHERE dn.docstatus  = 1
+          AND so.docstatus  = 1
+          AND so.shopify_store = %(store)s
+          AND NOT EXISTS (
+              SELECT 1
+              FROM `tabSales Invoice Item` sii
+              JOIN `tabSales Invoice` si ON si.name = sii.parent
+              WHERE sii.delivery_note = dn.name
+                AND si.docstatus != 2
+          )
+        """,
+        {"store": settings.shop_domain},
+        as_dict=True,
+    )
+
+    for row in dn_rows:
+        _create_si_for_dn(row["dn_name"], settings)
+
+
+def _create_si_for_dn(dn_name: str, settings):
+    """Create (and optionally submit) a Sales Invoice from one Delivery Note."""
+    try:
+        from shopify_integration.utils.sales_invoice import create_sales_invoice_from_dn
+
+        si_name = create_sales_invoice_from_dn(dn_name, settings)
+        frappe.logger().info(
+            f"Shopify scheduler: created Sales Invoice {si_name} from DN {dn_name}"
+        )
+    except Exception:
+        frappe.log_error(
+            frappe.get_traceback(),
+            f"Shopify: Sales Invoice from DN Failed — {dn_name}",
+        )
+
+
+def delete_old_shopify_logs():
+    """
+    Daily scheduler entry point.  Deletes Shopify Logs older than
+    `shopify_log_retention_days` days for each configured store.
+    Skips stores where the setting is 0 or blank (keep all logs).
+    """
+    from frappe.utils import add_days, today
+
+    active_stores = frappe.get_all(
+        "Shopify Settings",
+        filters={"enable_sync": 1},
+        fields=["name", "shop_domain", "shopify_log_retention_days"],
+    )
+
+    for store in active_stores:
+        days = store.get("shopify_log_retention_days") or 0
+        if not days or days <= 0:
+            continue
+
+        cutoff = add_days(today(), -days)
+        old_logs = frappe.get_all(
+            "Shopify Log",
+            filters={"shop_domain": store.get("shop_domain") or store["name"], "creation": ["<", cutoff]},
+            pluck="name",
+        )
+
+        deleted = 0
+        for log_name in old_logs:
+            try:
+                frappe.delete_doc("Shopify Log", log_name, force=True, ignore_permissions=True, delete_permanently=True)
+                deleted += 1
+            except Exception:
+                frappe.log_error(frappe.get_traceback(), f"Shopify: Log Deletion Failed — {log_name}")
+
+        if deleted:
+            frappe.db.commit()  # nosemgrep: frappe-manual-commit — batch deletion needs intermediate commits per store
+            frappe.logger().info(f"Shopify: deleted {deleted} old logs for store {store['name']}")
