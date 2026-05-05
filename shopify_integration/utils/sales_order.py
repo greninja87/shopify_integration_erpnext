@@ -23,7 +23,11 @@ Flow:
 
 import frappe
 from frappe.utils import nowdate, flt
-from shopify_integration.utils.customer import get_or_create_customer
+from shopify_integration.utils.customer import (
+    get_or_create_customer,
+    find_or_create_address_for_order,
+    addresses_are_different,
+)
 from shopify_integration.utils.item import (
     map_line_items,
     adjust_rows_to_match_total,
@@ -71,14 +75,17 @@ def create_sales_order_from_shopify(order: dict, settings):
     billing_addr  = order.get("billing_address") or {}
     shipping_addr = order.get("shipping_address") or {}
 
-    gstin          = None
-    gst_legal_name = None
+    gstin               = None
+    gst_legal_name      = None
+    gst_customer_type   = "Individual"   # default; overridden by IC portal below
     if settings.get("gst_field_path"):
         try:
-            from shopify_integration.utils.gst import extract_gstin, get_gst_legal_name
+            from shopify_integration.utils.gst import extract_gstin, get_gst_customer_info
             gstin = extract_gstin(order, settings)
             if gstin:
-                gst_legal_name = get_gst_legal_name(gstin)
+                info           = get_gst_customer_info(gstin)
+                gst_legal_name = info["legal_name"]
+                gst_customer_type = info["customer_type"]
         except Exception:
             frappe.log_error(frappe.get_traceback(), f"Shopify: GST Name Lookup Failed — {shopify_order_name}")
 
@@ -89,6 +96,7 @@ def create_sales_order_from_shopify(order: dict, settings):
         settings=settings,
         gstin=gstin,
         gst_legal_name=gst_legal_name,
+        gst_customer_type=gst_customer_type,
     )
 
     # ── 2b. GST billing address ────────────────────────────────────────────────
@@ -160,12 +168,55 @@ def create_sales_order_from_shopify(order: dict, settings):
     transaction_date = created_at[:10] if created_at else nowdate()
 
     # ── 10. Addresses ──────────────────────────────────────────────────────────
-    # Billing: GST-registered address when available; else customer's billing.
-    customer_billing_address = gst_billing_addr or _get_customer_address(customer_name, "Billing")
-    # Shipping: always comes from Shopify — explicitly exclude the GST billing
-    # address so it never bleeds into shipping.
-    customer_shipping_address = _get_customer_shipping_address(customer_name, exclude=gst_billing_addr)
-    shipping_address_name     = customer_shipping_address or customer_billing_address or ""
+    # Both billing and shipping are resolved from THIS order's Shopify data so
+    # repeat customers with a different address always get the correct address on
+    # the SO, not the one from their first-ever order.
+    #
+    # Billing:
+    #   B2B  → gst_billing_addr (GSTIN-registered address, resolved earlier)
+    #   B2C  → find or create from this order's billing_addr
+    if not gst_billing_addr and billing_addr:
+        try:
+            gst_billing_addr = find_or_create_address_for_order(
+                customer_name=customer_name,
+                shopify_address=billing_addr,
+                address_type="Billing",
+                is_primary=False,
+                is_shipping=False,
+            )
+        except Exception:
+            frappe.log_error(
+                frappe.get_traceback(),
+                f"Shopify: Billing Address Resolution Failed — {shopify_order_name}",
+            )
+
+    customer_billing_address = gst_billing_addr or ""
+
+    # Shipping:
+    #   When shipping != billing → find or create from this order's shipping_addr
+    #   When shipping == billing → reuse the billing address (mark it as shipping)
+    order_shipping_addr = ""
+    if shipping_addr:
+        if addresses_are_different(billing_addr, shipping_addr):
+            try:
+                order_shipping_addr = find_or_create_address_for_order(
+                    customer_name=customer_name,
+                    shopify_address=shipping_addr,
+                    address_type="Shipping",
+                    is_primary=False,
+                    is_shipping=True,
+                )
+            except Exception:
+                frappe.log_error(
+                    frappe.get_traceback(),
+                    f"Shopify: Shipping Address Resolution Failed — {shopify_order_name}",
+                )
+        else:
+            order_shipping_addr = customer_billing_address
+            if customer_billing_address:
+                frappe.db.set_value("Address", customer_billing_address, "is_shipping_address", 1)
+
+    shipping_address_name = order_shipping_addr or customer_billing_address or ""
 
     # ── 11. Build the SO document ──────────────────────────────────────────────
     so_doc = {
@@ -476,73 +527,6 @@ def _absorb_paisa_on_submitted_doc(so, shopify_total: float):
         row.margin_rate_or_amount = 0
         row.rate_with_margin     = 0
         row.base_rate_with_margin = 0
-
-
-# ── Address helpers ────────────────────────────────────────────────────────────
-
-def _get_customer_address(customer_name: str, address_type: str) -> str:
-    """Return the ERPNext Address name for a customer's Billing or Shipping address."""
-    links = frappe.get_all(
-        "Dynamic Link",
-        filters={
-            "link_doctype": "Customer",
-            "link_name":    customer_name,
-            "parenttype":   "Address",
-        },
-        fields=["parent"],
-    )
-    if not links:
-        return ""
-
-    parent_names = [l["parent"] for l in links]
-    addresses = frappe.get_all(
-        "Address",
-        filters={"name": ["in", parent_names], "address_type": address_type},
-        fields=["name"],
-        limit=1,
-    )
-    if addresses:
-        return addresses[0]["name"]
-
-    # If no typed address found, return first linked address as fallback
-    return parent_names[0] if parent_names else ""
-
-
-def _get_customer_shipping_address(customer_name: str, exclude: str = "") -> str:
-    """
-    Return the best shipping address for a customer, explicitly excluding
-    `exclude` (the GST billing address) so it never bleeds into shipping.
-
-    Priority:
-      1. Address with address_type = "Shipping"
-      2. Address with is_shipping_address = 1  (Shopify billing==shipping case)
-      3. First remaining linked address
-    """
-    links = frappe.get_all(
-        "Dynamic Link",
-        filters={
-            "link_doctype": "Customer",
-            "link_name":    customer_name,
-            "parenttype":   "Address",
-        },
-        fields=["parent"],
-    )
-    names = [l["parent"] for l in links if l["parent"] != exclude]
-    if not names:
-        return ""
-
-    # 1. Explicit Shipping type
-    addr = frappe.db.get_value("Address", {"name": ["in", names], "address_type": "Shipping"}, "name")
-    if addr:
-        return addr
-
-    # 2. Shopify billing address also marked as shipping
-    addr = frappe.db.get_value("Address", {"name": ["in", names], "is_shipping_address": 1}, "name")
-    if addr:
-        return addr
-
-    # 3. Any remaining address
-    return names[0]
 
 
 # ── Misc helpers ───────────────────────────────────────────────────────────────

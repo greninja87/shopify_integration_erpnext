@@ -73,16 +73,30 @@ def extract_gstin(order: dict, settings) -> str | None:
     return None
 
 
-def get_gst_legal_name(gstin: str) -> str | None:
+def get_gst_customer_info(gstin: str) -> dict:
     """
-    Return the GST-registered legal/trade name for a GSTIN.
+    Return the GST-registered name and ERPNext customer_type for a GSTIN.
 
-    Checks local ERPNext Address first (instant, no external call).
-    Falls back to India Compliance portal if no local record exists.
-    Returns None if neither source has the name (IC not configured, etc.).
+    customer_type is derived from constitution_of_business the same way
+    India Compliance's Customer form JS does it:
+      • "Proprietorship" / "Hindu Undivided Family" → "Individual"
+      • Everything else (Pvt Ltd, LLP, Partnership, Trust, etc.) → "Company"
 
-    Called BEFORE customer creation so the customer can be created with
-    the correct company name in one pass.
+    Returns:
+        {
+            "legal_name":    str | None,    # GST-registered business name
+            "customer_type": "Individual" | "Company",
+        }
+    Defaults to {"legal_name": None, "customer_type": "Individual"} when
+    IC is not installed / portal unavailable / GSTIN not found.
+
+    Called BEFORE customer creation so the customer is created with the
+    correct name AND type in one pass.
+
+    NOTE: The fast-path (local Address already exists) only returns the name;
+    customer_type from it doesn't matter because get_or_create_customer() step 0
+    would have already returned the existing customer before reaching the
+    creation path.  The portal path is what matters for new customers.
     """
     # Fast path — existing local Address already has the title
     if frappe.db.has_column("Address", "gstin"):
@@ -90,14 +104,20 @@ def get_gst_legal_name(gstin: str) -> str | None:
             "Address", {"gstin": gstin, "disabled": ["!=", 1]}, "address_title"
         )
         if addr:
-            return addr
+            # customer_type is irrelevant here (existing customer returned by step 0)
+            return {"legal_name": addr, "customer_type": "Individual"}
 
-    # IC portal fetch
+    # IC portal fetch — use constitution_of_business for customer_type
     portal_data = _fetch_from_ic_portal(gstin)
     if portal_data:
-        return portal_data.get("business_name") or None
+        return {
+            "legal_name":    portal_data.get("business_name") or None,
+            "customer_type": _constitution_to_customer_type(
+                portal_data.get("constitution_of_business") or ""
+            ),
+        }
 
-    return None
+    return {"legal_name": None, "customer_type": "Individual"}
 
 
 def resolve_billing_from_gstin(gstin: str, customer_name: str) -> str | None:
@@ -131,7 +151,13 @@ def resolve_billing_from_gstin(gstin: str, customer_name: str) -> str | None:
 # ── Internal helpers ───────────────────────────────────────────────────────────
 
 def _ensure_address_linked(addr_name: str, customer_name: str):
-    """Add a Dynamic Link from Address to Customer if not already present."""
+    """Add a Dynamic Link from Address to Customer if not already present.
+
+    Uses the Document layer (get_doc → append → save) so Frappe correctly
+    auto-generates a `name` for the child row.  frappe.db.insert() bypasses
+    naming and would leave the row with a NULL name, causing a DB error.
+    """
+    # Fast-path: check before loading the full doc
     exists = frappe.db.exists(
         "Dynamic Link",
         {
@@ -141,15 +167,21 @@ def _ensure_address_linked(addr_name: str, customer_name: str):
             "link_name":    customer_name,
         },
     )
-    if not exists:
-        frappe.db.insert({
-            "doctype":      "Dynamic Link",
-            "parenttype":   "Address",
-            "parentfield":  "links",
-            "parent":       addr_name,
-            "link_doctype": "Customer",
-            "link_name":    customer_name,
-        })
+    if exists:
+        return
+
+    addr_doc = frappe.get_doc("Address", addr_name)
+    # Double-check in the loaded doc to guard against concurrent inserts
+    for link in addr_doc.get("links") or []:
+        if link.link_doctype == "Customer" and link.link_name == customer_name:
+            return
+
+    addr_doc.append("links", {
+        "link_doctype": "Customer",
+        "link_name":    customer_name,
+    })
+    addr_doc.flags.ignore_permissions = True
+    addr_doc.save()
 
 
 def _fetch_from_ic_portal(gstin: str) -> dict | None:
@@ -234,3 +266,29 @@ def _create_gst_address(gstin: str, portal_data: dict, customer_name: str) -> st
 def _state_from_gstin(gstin: str) -> str:
     """Derive the Indian state name from the first 2 digits of the GSTIN."""
     return _STATE_CODE_MAP.get(gstin[:2], "")
+
+
+# Sole proprietors and HUFs register individually; all other constitution types
+# (Pvt Ltd, LLP, Partnership, Trust, etc.) represent organisations.
+_INDIVIDUAL_CONSTITUTIONS = frozenset({
+    "proprietorship",
+    "hindu undivided family",
+    "huf",
+    "individual",
+})
+
+
+def _constitution_to_customer_type(constitution: str) -> str:
+    """
+    Map GST portal constitution_of_business → ERPNext customer_type.
+
+    Mirrors the mapping India Compliance uses when you enter a GSTIN on
+    the Customer form: Proprietorship / HUF → Individual, everything else
+    (Private Limited, LLP, Partnership, Trust, etc.) → Company.
+
+    Falls back to "Company" for any unrecognised string because in practice
+    the vast majority of B2B GST registrations are corporate entities.
+    """
+    if not constitution:
+        return "Company"   # safe default for unknown constitution
+    return "Individual" if constitution.strip().lower() in _INDIVIDUAL_CONSTITUTIONS else "Company"

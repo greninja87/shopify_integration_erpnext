@@ -20,7 +20,7 @@ keywords = ["shopify", "erpnext", "frappe", "ecommerce", "gst", "india"]
 
 [build-system]
 requires = ["flit_core >=3.4,<4"]
-build-backend = "flit_core:main"
+build-backend = "flit_core.buildapi"
 
 [tool.bench.frappe-dependencies]
 frappe = ">=15.0.0"

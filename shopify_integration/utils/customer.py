@@ -13,10 +13,15 @@ Matching priority:
   4. Create new customer
 
 Address behaviour:
-  - Billing address always created
-  - Shipping address created separately if different from billing
-  - Billing address marked is_primary_address = 1 on customer
-  - Shipping address marked is_shipping_address = 1 on customer
+  - find_or_create_address_for_order() is the single entry point for all address
+    work, called for both new and repeat customers.  It matches existing addresses
+    by content (address_line1 + city + pincode, case-insensitive) so repeat orders
+    from the same customer with the same address reuse the existing record, while
+    orders with a new address get a new record with a unique title.
+  - Billing address created/found per order; marked is_primary_address=1 only on
+    first creation for that customer.
+  - Shipping address created/found per order separately when different from billing.
+  - When billing == shipping, billing address is marked is_shipping_address=1.
 """
 
 import frappe
@@ -29,6 +34,7 @@ def get_or_create_customer(
     settings,
     gstin: str = None,
     gst_legal_name: str = None,
+    gst_customer_type: str = "Individual",
 ) -> str:
     """
     Find existing ERPNext customer or create one.
@@ -40,6 +46,9 @@ def get_or_create_customer(
     :param settings:          Shopify Settings document
     :param gstin:             Validated GSTIN (if present — triggers B2B flow)
     :param gst_legal_name:    GST-registered legal name (overrides Shopify name)
+    :param gst_customer_type: "Individual" or "Company" derived from IC portal
+                              constitution_of_business (Proprietorship/HUF →
+                              Individual, everything else → Company)
     """
     if not shopify_customer:
         return _get_default_customer(settings)
@@ -102,6 +111,7 @@ def get_or_create_customer(
             shipping_address=shipping_address,
             settings=settings,
             contact_person_name=shopify_person_name,
+            customer_type=gst_customer_type,
         )
 
     # ── B2C path — name from Shopify, Individual type ────────────────────────
@@ -168,11 +178,20 @@ def _create_customer(
     full_name, phone, email, shopify_id,
     billing_address, shipping_address, settings,
     contact_person_name="",
+    customer_type="Individual",
 ):
-    """Create a new ERPNext Customer from Shopify data."""
+    """Create a new ERPNext Customer from Shopify data.
+
+    customer_type is "Individual" for B2C and most B2B Proprietorship/HUF registrations,
+    "Company" for Pvt Ltd / LLP / Partnership / Trust etc.  Derived from IC portal's
+    constitution_of_business — mirrors what ERPNext's Customer form does when you
+    manually enter a GSTIN.  Defaults to "Individual" (safe fallback when IC is not
+    available or GSTIN is absent).
+    """
     customer_doc = {
         "doctype":        "Customer",
         "customer_name":  full_name,
+        "customer_type":  customer_type,
         "customer_group": settings.customer_group or "All Customer Groups",
         "territory":      settings.territory or "All Territories",
         "mobile_no":      phone,
@@ -192,32 +211,31 @@ def _create_customer(
     customer.insert()
     frappe.db.commit()  # nosemgrep: frappe-manual-commit — runs in background job; customer must persist before SO creation
 
-    # Create addresses
+    # Create addresses via the unified find-or-create path so the same dedup
+    # logic applies whether this is a new or repeat customer.
     billing_addr_name  = None
     shipping_addr_name = None
 
     if billing_address:
-        billing_addr_name = _create_address(
+        billing_addr_name = find_or_create_address_for_order(
             customer_name=customer.name,
-            address=billing_address,
+            shopify_address=billing_address,
             address_type="Billing",
             is_primary=True,
-            is_shipping=False
+            is_shipping=False,
         )
 
-    # Create shipping address only if different from billing
-    if shipping_address and _addresses_are_different(billing_address, shipping_address):
-        shipping_addr_name = _create_address(
+    if shipping_address and addresses_are_different(billing_address, shipping_address):
+        shipping_addr_name = find_or_create_address_for_order(
             customer_name=customer.name,
-            address=shipping_address,
+            shopify_address=shipping_address,
             address_type="Shipping",
             is_primary=False,
-            is_shipping=True
+            is_shipping=True,
         )
-    elif billing_address and not shipping_addr_name:
-        # Mark the billing address also as shipping address
-        if billing_addr_name:
-            frappe.db.set_value("Address", billing_addr_name, "is_shipping_address", 1)
+    elif billing_addr_name:
+        # billing == shipping: mark the billing address as shipping too
+        frappe.db.set_value("Address", billing_addr_name, "is_shipping_address", 1)
 
     # Create contact — use the Shopify customer's first+last name (passed in as
     # contact_person_name) so the Contact shows the real person, not the company
@@ -240,17 +258,14 @@ def _create_address(
     is_shipping: bool
 ) -> str:
     """
-    Create an ERPNext Address linked to the customer.
-    Returns the address name or "" on failure.
+    Create a new ERPNext Address linked to the customer and return its name.
+    Title is unique (sequential suffix) so a customer may have multiple
+    billing or shipping addresses without collision.
+    Returns "" on failure.
     """
     try:
-        # Build unique title to avoid duplicates
-        suffix = "Billing" if address_type == "Billing" else "Shipping"
-        addr_title = f"{customer_name}-{suffix}"
-
-        # Check if this address already exists to avoid duplicate insert
-        if frappe.db.exists("Address", {"address_title": addr_title}):
-            return frappe.db.get_value("Address", {"address_title": addr_title}, "name")
+        suffix     = "Billing" if address_type == "Billing" else "Shipping"
+        addr_title = _unique_address_title(customer_name, suffix)
 
         # Shopify sends province = full state name (e.g. "Gujarat"),
         # province_code = abbreviated code (e.g. "GJ").
@@ -292,13 +307,113 @@ def _create_address(
         return ""
 
 
-def _addresses_are_different(addr1: dict, addr2: dict) -> bool:
+def find_or_create_address_for_order(
+    customer_name: str,
+    shopify_address: dict,
+    address_type: str,
+    is_primary: bool = False,
+    is_shipping: bool = False,
+) -> str:
+    """
+    Single entry point for all per-order address work (new and repeat customers).
+
+    1. Fetches every Address linked to `customer_name`.
+    2. Compares each against `shopify_address` using normalised field matching
+       (address_line1 + city + pincode, case-insensitive).
+    3. Match found  → returns existing address name unchanged.
+    4. No match     → creates a new Address with a unique title and returns it.
+
+    Returns "" if shopify_address is empty/has no street line, or on creation failure.
+    """
+    if not shopify_address or not (shopify_address.get("address1") or "").strip():
+        return ""
+
+    # Fetch all addresses already linked to this customer.
+    linked = frappe.get_all(
+        "Dynamic Link",
+        filters={
+            "link_doctype": "Customer",
+            "link_name":    customer_name,
+            "parenttype":   "Address",
+        },
+        pluck="parent",
+    )
+
+    if linked:
+        existing = frappe.get_all(
+            "Address",
+            filters={"name": ["in", linked]},
+            fields=["name", "address_line1", "city", "pincode"],
+        )
+        for addr in existing:
+            if _shopify_matches_erpnext_address(shopify_address, addr):
+                return addr["name"]
+
+    # No matching address found — create a new one.
+    return _create_address(
+        customer_name=customer_name,
+        address=shopify_address,
+        address_type=address_type,
+        is_primary=is_primary,
+        is_shipping=is_shipping,
+    )
+
+
+def _shopify_matches_erpnext_address(shopify_addr: dict, erpnext_addr: dict) -> bool:
+    """
+    Return True if a Shopify address dict matches an ERPNext Address record
+    (supplied as a dict with keys address_line1, city, pincode).
+
+    Matches on address_line1 + city + pincode, all normalised (strip + lower).
+    Falls back to address_line1 + city when either side has no pincode.
+    Returns False when the street line is missing on either side.
+    """
+    def n(v):
+        return (v or "").strip().lower()
+
+    s_line1 = n(shopify_addr.get("address1"))
+    s_city  = n(shopify_addr.get("city"))
+    s_zip   = n(shopify_addr.get("zip"))
+
+    e_line1 = n(erpnext_addr.get("address_line1"))
+    e_city  = n(erpnext_addr.get("city"))
+    e_zip   = n(erpnext_addr.get("pincode"))
+
+    if not s_line1 or not e_line1:
+        return False
+
+    if s_zip and e_zip:
+        return s_line1 == e_line1 and s_city == e_city and s_zip == e_zip
+
+    # One side is missing pincode — match on street + city only.
+    return s_line1 == e_line1 and s_city == e_city
+
+
+def _unique_address_title(customer_name: str, suffix: str) -> str:
+    """
+    Return the next available address_title of the form
+    '{customer_name}-{suffix}', '{customer_name}-{suffix}-2', etc.
+    Scans sequentially so every customer can have an unlimited number of
+    billing/shipping addresses without collision.
+    """
+    base = f"{customer_name}-{suffix}"
+    if not frappe.db.exists("Address", {"address_title": base}):
+        return base
+    counter = 2
+    while True:
+        candidate = f"{base}-{counter}"
+        if not frappe.db.exists("Address", {"address_title": candidate}):
+            return candidate
+        counter += 1
+
+
+def addresses_are_different(addr1: dict, addr2: dict) -> bool:
     """Return True if two Shopify address dicts are meaningfully different."""
     if not addr1 or not addr2:
         return bool(addr2)
     compare_keys = ["address1", "address2", "city", "zip", "province_code", "country_code"]
     for key in compare_keys:
-        if (addr1.get(key) or "").strip() != (addr2.get(key) or "").strip():
+        if (addr1.get(key) or "").strip().lower() != (addr2.get(key) or "").strip().lower():
             return True
     return False
 

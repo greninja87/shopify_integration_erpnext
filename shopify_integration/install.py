@@ -7,14 +7,19 @@ def before_uninstall():
     Prevents orphaned fields from cluttering the Customer and Sales Order forms.
     """
     _SHOPIFY_CUSTOM_FIELDS = [
+        # Customer
+        "Customer-shopify_section",
         "Customer-shopify_customer_id",
-        "Customer-shopify_store",
+        "Customer-shopify_phone",
+        "Customer-shopify_email",
+        # Sales Order
+        "Sales Order-shopify_section",
         "Sales Order-shopify_order_id",
         "Sales Order-shopify_store",
-        "Sales Order-shopify_section",
+        # Delivery Note
+        "Delivery Note-shopify_section",
         "Delivery Note-shopify_order_id",
         "Delivery Note-shopify_store",
-        "Delivery Note-shopify_section",
     ]
     for cf_name in _SHOPIFY_CUSTOM_FIELDS:
         if frappe.db.exists("Custom Field", cf_name):

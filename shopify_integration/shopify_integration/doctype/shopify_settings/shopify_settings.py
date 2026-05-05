@@ -14,6 +14,17 @@ class ShopifySettings(Document):
                 .lower()
             )
 
+        # Company is the only hard-required field — SO creation fails immediately
+        # without it.  Warehouse, customer_group and territory all have safe
+        # ERPNext built-in fallbacks (default warehouse from item/company,
+        # "All Customer Groups", "All Territories") so they are optional here.
+        if self.get("enable_sync") and not self.get("company"):
+            frappe.throw(
+                "<b>Company</b> is required when Enable Sync is on. "
+                "Every Sales Order must belong to a company.",
+                title="Required Field Missing",
+            )
+
         if self.enable_sync and not self.webhook_secret:
             frappe.msgprint(
                 "Warning: Webhook secret is empty. It is strongly recommended to set a "
@@ -25,6 +36,17 @@ class ShopifySettings(Document):
         # Bank / Cash account is a group account or wrong type.
         if self.get("enable_payment_entry"):
             self._validate_payment_accounts()
+
+        # Sales Invoice trigger must be set when SI is enabled.
+        if self.get("enable_sales_invoice") and not self.get("sales_invoice_trigger"):
+            frappe.throw(
+                "<b>Sales Invoice Trigger</b> must be set when "
+                "<b>Enable Sales Invoice Creation</b> is on. "
+                "Choose <b>After Payment Entry</b> (invoice created immediately when "
+                "the order is processed) or <b>After Delivery Note</b> (invoice created "
+                "by the hourly scheduler after stock is dispatched).",
+                title="Sales Invoice Trigger Required",
+            )
 
         # Gateway mapping rows: each row must have at least one matching key
         self._validate_gateway_mapping_rows()

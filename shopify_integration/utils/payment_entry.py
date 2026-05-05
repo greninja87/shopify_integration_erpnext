@@ -49,12 +49,9 @@ def create_payment_entry_from_shopify(so, order: dict, settings) -> str:
     if amount_paid <= 0:
         return ""
 
-    # so_outstanding is used only to:
-    #   a) skip PE creation if the SO is already fully paid (advance_paid covers it)
-    #   b) set ref_total on the PE reference row so ERPNext's validation
-    #      (allocated_amount <= outstanding_amount) does not fire
-    # It does NOT cap amount_paid — Shopify's total_price is the source of truth
-    # for how much was actually collected.
+    # Guard: skip PE creation if the SO is already fully settled (another PE
+    # was submitted and linked to this SO, advancing advance_paid to grand_total).
+    # Does NOT cap amount_paid — Shopify's total_price is the source of truth.
     so_outstanding = flt(so.grand_total) - flt(so.advance_paid or 0)
     if so_outstanding <= 0:
         return ""
@@ -129,38 +126,52 @@ def create_payment_entry_from_shopify(so, order: dict, settings) -> str:
     if mode_of_payment:
         pe.mode_of_payment = mode_of_payment
     pe.paid_to         = bank_account
-    pe.paid_amount     = amount_paid
-    pe.received_amount = amount_paid
 
-    # ── Create the PE as an unallocated advance (no SO reference) ────────────
+    # ── Trim instalment rows from get_payment_entry() to match amount_paid ─────
     #
-    # We intentionally do NOT link this PE to the Sales Order.  The Sales
-    # Invoice is created immediately after the PE in our "After Payment Entry"
-    # flow, and it uses allocate_advances_automatically = 1 to pull in this PE
-    # at submit time.  ERPNext's advance-allocation engine finds PEs by
-    # querying unallocated_amount > 0 for the customer — that only works when
-    # the PE has no prior reference consuming its unallocated amount.
+    # get_payment_entry() creates one reference row per payment-schedule
+    # instalment, and each row carries the correct `payment_term` field.
+    # That field is mandatory when the SO has
+    # allocate_payment_based_on_payment_terms enabled — so we must NOT replace
+    # the rows with a hand-built row (which would lack payment_term).
     #
-    # If we linked the PE to the SO (as the old code did), unallocated_amount
-    # would be 0 after submit, and the SI would find nothing to allocate.  The
-    # result was an SI with outstanding = grand_total and no reconciliation.
+    # Instead we keep the rows ERPNext produced and walk through them in order,
+    # consuming `allocated` rupees until the payment is fully accounted for:
+    #   • rows whose instalment fits within remaining → kept as-is
+    #   • the first row that exceeds remaining → trimmed to remaining, kept
+    #   • any rows after that → dropped (not yet paid)
     #
-    # Without a SO reference the SO's advance_paid stays at 0, but since the
-    # SI is created in the same request, the SO's billing_status transitions
-    # to "Fully Billed" when the SI is submitted — the brief window where
-    # advance_paid = 0 on the SO is never visible to the user.
-    # 
-    # FIX: We now keep the references to the Sales Order so that the Payment
-    # Entry correctly shows as linked to the SO. The Sales Invoice will pull 
-    # these advances automatically from the SO.
-    pe.set("deductions", [])    # wipe any bridge/write-off rows ERPNext injected
+    # This ensures:
+    #   total_allocated = paid_amount → difference_amount = 0  (submit passes)
+    #   payment_term is present on every kept row              (validation passes)
+    #   SO is referenced                                       (advance_paid updated)
+    #   SI finds this PE via the SO-reference lookup in get_advance_payment_entries
+    #
+    # Cap to so_outstanding so allocated_amount ≤ outstanding_amount on each row.
+    allocated = min(flt(amount_paid), flt(so_outstanding))
+    pe.paid_amount     = allocated
+    pe.received_amount = allocated
 
-    # Recompute totals:
-    #   total_allocated_amount = 0  (no references)
-    #   unallocated_amount     = paid_amount  (SI will consume this)
-    #   difference_amount      = paid_amount - received_amount = 0 (same currency)
+    remaining  = allocated
+    kept_refs  = []
+    for ref in (pe.get("references") or []):
+        if remaining <= 0:
+            break
+        row_amt = flt(ref.allocated_amount)
+        if row_amt <= remaining:
+            remaining -= row_amt
+            kept_refs.append(ref)
+        else:
+            ref.allocated_amount = remaining
+            remaining = 0
+            kept_refs.append(ref)
+
+    pe.set("references", kept_refs)
+    pe.set("deductions", [])    # clear any write-off / bridge rows ERPNext injected
+
+    # After set_amounts(): total_allocated = allocated = paid_amount → difference = 0.
     pe.set_amounts()
-    pe.difference_amount = 0
+    pe.difference_amount = 0    # explicit safety; set_amounts() should already yield 0
 
     pe.reference_no   = (order.get("name") or order.get("order_number") or str(order.get("id", "")))[:140]
     pe.reference_date = _get_order_date(order)

@@ -65,8 +65,16 @@ def retry_order(docname: str):
 
     # ── Pre-flight duplicate check ────────────────────────────────────────────
     # If a live (non-cancelled) SO already exists for this Shopify order, link
-    # it back to the log and bail — retry is only meaningful when the target
-    # SO is gone.
+    # it back to the log and bail — full SO+PE+SI re-creation is only meaningful
+    # when the target SO is gone.
+    #
+    # NOTE — PE-only failure scenario:
+    #   If the SO was created successfully but the Payment Entry failed (e.g.
+    #   the "Difference Amount must be zero" bug fixed in payment_entry.py),
+    #   this check will find the existing SO and return "duplicate".  The PE
+    #   will NOT be retried automatically.
+    #   To retry: cancel/delete the SO first (use the Shopify Log →
+    #   Reset for Retry button, then cancel the linked SO and resubmit the log).
     shopify_order_id = str(order_data.get("id", "")) or (log.shopify_order_id or "")
     if shopify_order_id:
         existing = frappe.db.get_value(

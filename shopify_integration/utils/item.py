@@ -327,12 +327,6 @@ def _erpnext_row_inclusive(row: dict) -> float:
     return amount + tax
 
 
-# Kept as a thin wrapper for backward compatibility (sales_order.py may still
-# call this during older flows).  New code should call adjust_rows_to_match_total.
-def _adjust_last_item_for_rounding(so_items: list, shopify_items_total: float):
-    adjust_rows_to_match_total(so_items, shopify_items_total)
-
-
 # ── ERPNext item / tax helpers ─────────────────────────────────────────────────
 
 def get_item_and_tax(sku: str, company: str) -> dict:
