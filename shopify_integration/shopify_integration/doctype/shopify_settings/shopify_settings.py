@@ -25,6 +25,15 @@ class ShopifySettings(Document):
                 title="Required Field Missing",
             )
 
+        # Mandatory accounting dimensions — block save when sync is on.
+        # ERPNext lets admins mark any accounting dimension (Branch, Department,
+        # Project, etc.) as mandatory for BS/PL accounts.  If a dimension is
+        # mandatory and not configured here, every single webhook will fail with
+        # a MandatoryError on SO insert.  Check now so the error surfaces at
+        # config time, not at 2 AM during order processing.
+        if self.get("enable_sync"):
+            self._validate_mandatory_accounting_dimensions()
+
         if self.enable_sync and not self.webhook_secret:
             frappe.msgprint(
                 "Warning: Webhook secret is empty. It is strongly recommended to set a "
@@ -163,6 +172,75 @@ class ShopifySettings(Document):
                     alert=True,
                 )
                 warned = True  # show at most once per save to avoid spam
+
+    def _validate_mandatory_accounting_dimensions(self):
+        """
+        Block save when any ERPNext mandatory accounting dimension is not
+        configured in Shopify Settings.
+
+        ERPNext stores accounting dimensions in the `Accounting Dimension`
+        doctype.  A dimension is considered mandatory here when either
+        `mandatory_for_bs` or `mandatory_for_pl` is set.  When mandatory,
+        ERPNext adds a required custom field to Sales Order (and other
+        transactional doctypes) — if we don't set it, every webhook fails
+        with a MandatoryError on SO insert.
+
+        We only check dimensions whose fieldname exists as a field on THIS
+        settings doc.  Dimensions without a matching settings field are
+        flagged as a warning (we have no way to supply a value for them).
+        """
+        if not frappe.db.exists("DocType", "Accounting Dimension"):
+            return  # ERPNext version doesn't have this doctype
+
+        mandatory_dims = frappe.get_all(
+            "Accounting Dimension",
+            filters={
+                "disabled": 0,
+                "mandatory_for_bs": 1,
+            },
+            fields=["document_type", "fieldname"],
+        ) + frappe.get_all(
+            "Accounting Dimension",
+            filters={
+                "disabled": 0,
+                "mandatory_for_pl": 1,
+                "mandatory_for_bs": 0,   # avoid duplicates
+            },
+            fields=["document_type", "fieldname"],
+        )
+
+        if not mandatory_dims:
+            return
+
+        settings_meta = frappe.get_meta("Shopify Settings")
+        for dim in mandatory_dims:
+            fieldname = dim.get("fieldname") or ""
+            label     = dim.get("document_type") or fieldname
+            if not fieldname:
+                continue
+
+            if settings_meta.has_field(fieldname):
+                # Shopify Settings has a field for this dimension — require it
+                if not self.get(fieldname):
+                    frappe.throw(
+                        f"<b>{label}</b> is a mandatory accounting dimension in "
+                        f"this ERPNext instance but is not set in Shopify Settings. "
+                        f"Every Sales Order will fail with a MandatoryError until "
+                        f"this is configured. Set the <b>{label}</b> field in "
+                        f"Shopify Settings → Accounting Dimensions.",
+                        title=f"Mandatory Dimension Missing: {label}",
+                    )
+            else:
+                # No field on Shopify Settings — warn, can't auto-supply value
+                frappe.msgprint(
+                    f"<b>{label}</b> (<code>{fieldname}</code>) is a mandatory "
+                    f"accounting dimension but Shopify Settings has no field for it. "
+                    f"Sales Orders created by this integration will fail unless a "
+                    f"default value is configured elsewhere (e.g. on the Company or "
+                    f"Item master).",
+                    indicator="orange",
+                    title=f"Unmapped Mandatory Dimension: {label}",
+                )
 
 
 def get_settings_for_store(shop_domain: str):

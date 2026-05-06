@@ -257,10 +257,24 @@ def create_sales_order_from_shopify(order: dict, settings):
     }
 
     # ── 12. Accounting dimensions ──────────────────────────────────────────────
+    # Apply every accounting dimension that is configured in Shopify Settings.
+    # We read directly from the Accounting Dimension doctype so new dimensions
+    # added to ERPNext are picked up automatically without code changes.
+    # cost_center is a core ERPNext field (not an Accounting Dimension row) —
+    # handled separately below.
     if settings.get("cost_center"):
         so_doc["cost_center"] = settings.cost_center
-    if settings.get("branch"):
-        so_doc["branch"] = settings.branch
+
+    if frappe.db.exists("DocType", "Accounting Dimension"):
+        all_dims = frappe.get_all(
+            "Accounting Dimension",
+            filters={"disabled": 0},
+            fields=["fieldname"],
+        )
+        for dim in all_dims:
+            fn = dim.get("fieldname") or ""
+            if fn and settings.get(fn):
+                so_doc[fn] = settings.get(fn)
 
     so = frappe.get_doc(so_doc)
 
@@ -325,10 +339,24 @@ def create_sales_order_from_shopify(order: dict, settings):
         if snap["tax_template"]:
             row.item_tax_template = snap["tax_template"]
 
-    # ── 14. Branch dimension on each item row ──────────────────────────────────
-    if settings.get("branch"):
-        for item_row in so.items:
-            item_row.branch = settings.branch
+    # ── 14. Accounting dimensions on each item row ─────────────────────────────
+    # Mirror whatever was applied to the SO header onto every item row.
+    # ERPNext expects the dimension on both header and child rows.
+    if frappe.db.exists("DocType", "Accounting Dimension"):
+        all_dims = frappe.get_all(
+            "Accounting Dimension",
+            filters={"disabled": 0},
+            fields=["fieldname"],
+        )
+        dim_values = {
+            dim["fieldname"]: settings.get(dim["fieldname"])
+            for dim in all_dims
+            if dim.get("fieldname") and settings.get(dim["fieldname"])
+        }
+        if dim_values:
+            for item_row in so.items:
+                for fn, val in dim_values.items():
+                    item_row.set(fn, val)
 
     # ── 15. Custom field mapping ───────────────────────────────────────────────
     _apply_field_mapping(so, order, settings)
