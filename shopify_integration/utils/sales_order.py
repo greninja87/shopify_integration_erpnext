@@ -259,6 +259,8 @@ def create_sales_order_from_shopify(order: dict, settings):
     # ── 12. Accounting dimensions ──────────────────────────────────────────────
     if settings.get("cost_center"):
         so_doc["cost_center"] = settings.cost_center
+    if settings.get("branch"):
+        so_doc["branch"] = settings.branch
 
     so = frappe.get_doc(so_doc)
 
