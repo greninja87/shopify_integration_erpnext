@@ -425,6 +425,17 @@ def _get_item_tax_template(item_doc, company: str):
     for r in rows:
         rate    = flt(r.get("tax_rate", 0))
         account = (r.get("tax_type") or "").upper()
+
+        # Only consider positive-rate Output Tax rows.
+        # India Compliance Item Tax Templates often contain RCM rows
+        # (e.g. "Output Tax IGST RCM") and Input Tax rows (e.g. "Input
+        # Tax IGST") in addition to the standard Output Tax rows.
+        # IC never applies RCM or Input Tax rows on a normal sales
+        # transaction, so including them would inflate the effective
+        # rate (e.g. 5% GST → 10% if Output+Input are both counted).
+        if rate <= 0 or "RCM" in account or "INPUT" in account:
+            continue
+
         raw_total += rate
         if "IGST" in account:
             inter_total += rate

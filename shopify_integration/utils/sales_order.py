@@ -521,6 +521,9 @@ def _absorb_paisa_on_submitted_doc(so, shopify_total: float):
         for r in rows:
             rate = flt(r.get("tax_rate", 0))
             account = (r.get("tax_type") or "").upper()
+            # Skip RCM and Input Tax rows — same logic as item.py
+            if rate <= 0 or "RCM" in account or "INPUT" in account:
+                continue
             raw += rate
             if "IGST" in account:
                 inter += rate
