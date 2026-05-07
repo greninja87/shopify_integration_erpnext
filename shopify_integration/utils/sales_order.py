@@ -533,12 +533,31 @@ def _absorb_paisa_on_submitted_doc(so, shopify_total: float):
         tax_rate_cache[template_name] = effective
         return effective
 
+    # Detect whether India Compliance applied CGST+SGST (intra-state, split
+    # rounding) or IGST (inter-state, single rounding).  This determines how
+    # we simulate the per-row tax so the absorber's search targets the actual
+    # ERPNext grand_total rather than a simulation that diverges by ₹0.01.
+    #
+    # For a split-tax SO (intra-state), ERPNext rounds each half separately:
+    #   CGST = round(amount × half_rate, 2)
+    #   SGST = round(amount × half_rate, 2)
+    # This can differ by ₹0.01 from round(amount × full_rate, 2).
+    # Without the split flag the absorber would keep a rate that its own
+    # simulation thinks is perfect but that ERPNext still computes as off.
+    _cgst_or_sgst_applied = any(
+        flt(t.tax_amount) > 0
+        and ("CGST" in (t.account_head or "").upper()
+             or "SGST" in (t.account_head or "").upper())
+        for t in so.taxes
+    )
+
     proxy_rows = []
     for row in so.items:
         proxy_rows.append({
-            "rate":      flt(row.rate),
-            "qty":       flt(row.qty),
-            "_tax_rate": tax_rate_for(row.item_tax_template or ""),
+            "rate":       flt(row.rate),
+            "qty":        flt(row.qty),
+            "_tax_rate":  tax_rate_for(row.item_tax_template or ""),
+            "_split_tax": _cgst_or_sgst_applied,
         })
 
     adjust_rows_to_match_total(proxy_rows, shopify_total)

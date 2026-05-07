@@ -271,7 +271,8 @@ def _create_address(
         # province_code = abbreviated code (e.g. "GJ").
         # India Compliance reads `gst_state` (full name) to determine
         # intra-state (CGST+SGST) vs inter-state (IGST) for B2C orders.
-        state_name = address.get("province", "")
+        # Normalise Shopify province to the exact name IC expects.
+        state_name = _normalise_gst_state(address.get("province", ""))
 
         addr_doc = frappe.get_doc({
             "doctype":           "Address",
@@ -490,6 +491,32 @@ def _create_contact(customer_name: str, contact_name: str, phone: str, email: st
         frappe.db.set_value("Customer", customer_name, "customer_primary_contact", contact.name)
     except Exception:
         frappe.log_error(frappe.get_traceback(), "Shopify: Contact Creation Failed")
+
+
+def _normalise_gst_state(province: str) -> str:
+    """
+    Map Shopify's province name to the exact string India Compliance stores in
+    the `gst_state` field.  IC derives intra-state vs inter-state by comparing
+    the customer address gst_state with the company's GSTIN state prefix, so a
+    mismatch silently causes the wrong tax template (IGST vs CGST+SGST).
+
+    Most state names are identical in Shopify and IC; only the edge cases where
+    the Shopify name diverges from the IC-registered canonical name are listed.
+    """
+    _PROVINCE_TO_GST_STATE = {
+        # Shopify sends the old undivided state name for the UT merger
+        "dadra and nagar haveli and daman and diu": "Dadra and Nagar Haveli",
+        "dadra & nagar haveli and daman & diu":     "Dadra and Nagar Haveli",
+        # Shopify may send abbreviated conjunctions
+        "jammu & kashmir":                          "Jammu and Kashmir",
+        "andaman & nicobar islands":                "Andaman and Nicobar Islands",
+        "andaman and nicobar":                      "Andaman and Nicobar Islands",
+        "d & nh":                                   "Dadra and Nagar Haveli",
+        "d&nh":                                     "Dadra and Nagar Haveli",
+    }
+    if not province:
+        return ""
+    return _PROVINCE_TO_GST_STATE.get(province.strip().lower(), province.strip())
 
 
 def _get_default_customer(settings) -> str:

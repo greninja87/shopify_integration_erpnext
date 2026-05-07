@@ -318,12 +318,28 @@ def adjust_rows_to_match_total(so_rows: list, target_inclusive_total: float):
 
 
 def _erpnext_row_inclusive(row: dict) -> float:
-    """Simulate ERPNext's per-row (amount + tax) the way validate() computes it."""
-    rate     = flt(row.get("rate"))
-    qty      = flt(row.get("qty"))
-    tax_rate = flt(row.get("_tax_rate") or 0)
-    amount   = round(rate * qty, 2)
-    tax      = round(amount * tax_rate / 100.0, 2)
+    """
+    Simulate ERPNext's per-row (amount + tax) the way validate() computes it.
+
+    When `_split_tax` is True, India Compliance has applied CGST + SGST as two
+    separate rows each at half the effective rate.  ERPNext rounds each row
+    independently, so we must simulate both halves to match the actual total.
+
+    Example — 5% GST on ₹12,380.95:
+        Single IGST:   round(12380.95 × 0.05, 2) = 619.05  → total 12999.00
+        Split CGST+SGST: round(12380.95 × 0.025, 2) × 2
+                        = 309.52 × 2 = 619.04 → total 12999.99  (₹0.01 diff)
+    """
+    rate      = flt(row.get("rate"))
+    qty       = flt(row.get("qty"))
+    tax_rate  = flt(row.get("_tax_rate") or 0)
+    split_tax = bool(row.get("_split_tax"))
+    amount    = round(rate * qty, 2)
+    if split_tax and tax_rate > 0:
+        half = tax_rate / 2.0
+        tax  = round(amount * half / 100.0, 2) + round(amount * half / 100.0, 2)
+    else:
+        tax = round(amount * tax_rate / 100.0, 2)
     return amount + tax
 
 
