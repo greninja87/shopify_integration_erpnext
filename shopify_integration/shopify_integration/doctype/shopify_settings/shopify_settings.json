@@ -71,6 +71,10 @@
     "column_break_si_settings",
     "sales_invoice_trigger",
     "auto_submit_sales_invoice",
+    "section_si_dn_timing",
+    "si_dn_timing",
+    "column_break_si_dn_timing",
+    "si_dn_delay_hours",
     "section_si_series",
     "si_naming_series",
 
@@ -422,7 +426,7 @@
       "fieldname": "section_si_settings",
       "fieldtype": "Section Break",
       "label": "Settings",
-      "description": "Automatically create a Sales Invoice after the Sales Order is processed. Works with or without Payment Entry.<br><br><b>After Payment Entry</b> — Invoice is created right after the Payment Entry succeeds. If Payment Entry is disabled, the Invoice is created immediately after Sales Order submission.<br><b>After Delivery Note</b> — A scheduler checks every hour for submitted Delivery Notes and creates the Invoice from the DN."
+      "description": "Automatically create a Sales Invoice after the Sales Order is processed. Works with or without Payment Entry.<br><br><b>After Payment Entry</b> — Invoice is created right after the Payment Entry succeeds. If Payment Entry is disabled, the Invoice is created immediately after Sales Order submission.<br><b>After Delivery Note</b> — Invoice is created from the Delivery Note. Use the <i>Delivery Note Timing</i> section below to choose between <b>Immediate</b> (on DN submit) or <b>Scheduled</b> (hourly, with optional delay)."
     },
     {
       "default": "0",
@@ -450,6 +454,34 @@
       "depends_on": "eval:doc.enable_sales_invoice",
       "description": "Uncheck to save Sales Invoices as Draft for manual review before submission."
     },
+    {
+      "fieldname": "section_si_dn_timing",
+      "fieldtype": "Section Break",
+      "label": "Delivery Note Timing",
+      "depends_on": "eval:doc.enable_sales_invoice && doc.sales_invoice_trigger == 'After Delivery Note'",
+      "description": "Controls <i>when</i> the Sales Invoice is created after a Delivery Note is submitted.<br><br><b>Immediate</b> — A background job is enqueued the moment the DN is submitted. The invoice appears within seconds.<br><b>Scheduled</b> — The hourly scheduler creates the invoice at the next run. Use <i>Delay After Submission</i> to impose a minimum wait before the scheduler acts."
+    },
+    {
+      "default": "Scheduled",
+      "fieldname": "si_dn_timing",
+      "fieldtype": "Select",
+      "label": "Invoice Creation Timing",
+      "options": "Scheduled\nImmediate",
+      "depends_on": "eval:doc.enable_sales_invoice && doc.sales_invoice_trigger == 'After Delivery Note'"
+    },
+    {
+      "fieldname": "column_break_si_dn_timing",
+      "fieldtype": "Column Break"
+    },
+    {
+      "default": "0",
+      "fieldname": "si_dn_delay_hours",
+      "fieldtype": "Int",
+      "label": "Delay After Submission (Hours)",
+      "depends_on": "eval:doc.enable_sales_invoice && doc.sales_invoice_trigger == 'After Delivery Note' && doc.si_dn_timing != 'Immediate'",
+      "description": "Minimum hours after Delivery Note submission before the scheduler creates the invoice. Set 0 to create at the next hourly run with no delay."
+    },
+
     {
       "fieldname": "section_si_series",
       "fieldtype": "Section Break",

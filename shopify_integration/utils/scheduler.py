@@ -22,7 +22,10 @@ import frappe
 def create_invoices_after_delivery_note():
     """
     Hourly scheduler entry point.  Processes all active stores configured for
-    'After Delivery Note' invoice creation.
+    'After Delivery Note' invoice creation with si_dn_timing == 'Scheduled'.
+
+    Stores set to 'Immediate' are excluded here — their SI is created by the
+    Delivery Note on_submit hook (create_si_from_dn_on_submit) instead.
     """
     active_stores = frappe.get_all(
         "Shopify Settings",
@@ -30,6 +33,7 @@ def create_invoices_after_delivery_note():
             "enable_sync": 1,
             "enable_sales_invoice": 1,
             "sales_invoice_trigger": "After Delivery Note",
+            "si_dn_timing": ["!=", "Immediate"],
         },
         pluck="name",
     )
@@ -54,8 +58,12 @@ def _process_store(settings):
       - Delivery Note is submitted (docstatus = 1)
       - At least one DN item links back to a submitted Sales Order whose
         shopify_store matches this settings record
+      - The DN was submitted at least si_dn_delay_hours hours ago
+        (dn.modified used as a proxy for submission time; 0 = no delay)
       - No submitted (or draft) Sales Invoice already references this DN
     """
+    delay_hours = int(settings.get("si_dn_delay_hours") or 0)
+
     dn_rows = frappe.db.sql(
         """
         SELECT DISTINCT dn.name AS dn_name
@@ -65,6 +73,7 @@ def _process_store(settings):
         WHERE dn.docstatus  = 1
           AND so.docstatus  = 1
           AND so.shopify_store = %(store)s
+          AND TIMESTAMPDIFF(HOUR, dn.modified, NOW()) >= %(delay_hours)s
           AND NOT EXISTS (
               SELECT 1
               FROM `tabSales Invoice Item` sii
@@ -73,7 +82,7 @@ def _process_store(settings):
                 AND si.docstatus != 2
           )
         """,
-        {"store": settings.shop_domain},
+        {"store": settings.shop_domain, "delay_hours": delay_hours},
         as_dict=True,
     )
 

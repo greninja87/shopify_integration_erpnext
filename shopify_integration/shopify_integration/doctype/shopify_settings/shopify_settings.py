@@ -53,9 +53,23 @@ class ShopifySettings(Document):
                 "<b>Enable Sales Invoice Creation</b> is on. "
                 "Choose <b>After Payment Entry</b> (invoice created immediately when "
                 "the order is processed) or <b>After Delivery Note</b> (invoice created "
-                "by the hourly scheduler after stock is dispatched).",
+                "from the DN — either immediately on submit or by the hourly scheduler).",
                 title="Sales Invoice Trigger Required",
             )
+
+        # Delay hours must be a non-negative integer.
+        if (
+            self.get("enable_sales_invoice")
+            and self.get("sales_invoice_trigger") == "After Delivery Note"
+            and self.get("si_dn_timing") != "Immediate"
+        ):
+            delay = self.get("si_dn_delay_hours") or 0
+            if delay < 0:
+                frappe.throw(
+                    "<b>Delay After Submission</b> cannot be negative. "
+                    "Set 0 to create at the next hourly scheduler run.",
+                    title="Invalid Delay Hours",
+                )
 
         # Gateway mapping rows: each row must have at least one matching key
         self._validate_gateway_mapping_rows()

@@ -38,7 +38,12 @@ doc_events = {
         # Clear Shopify Log reference before deletion so ERPNext link-validation
         # does not block Sales Order deletion.
         "on_trash": "shopify_integration.utils.sales_order.clear_shopify_log_on_trash",
-    }
+    },
+    "Delivery Note": {
+        # Immediate SI creation — enqueues a background job when si_dn_timing
+        # is set to "Immediate" in Shopify Settings.  No-ops for all other DNs.
+        "on_submit": "shopify_integration.utils.sales_invoice.create_si_from_dn_on_submit",
+    },
 }
 
 # ----------------------------------------------------------
