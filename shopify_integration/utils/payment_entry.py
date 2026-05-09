@@ -115,12 +115,27 @@ def create_payment_entry_from_shopify(so, order: dict, settings) -> str:
     #    NOTE: get_payment_entry() sets paid_amount = SO outstanding and may produce
     #    multiple references rows summing to the full SO total.  We immediately
     #    fix both the top-level amounts AND the references child table below.
-    pe = get_payment_entry(
-        dt="Sales Order",
-        dn=so.name,
-        party_amount=amount_paid,
-        bank_account=bank_account,
-    )
+    #
+    #    get_payment_entry() internally calls get_balance_on() which resolves
+    #    permissions from frappe.session.user — the global frappe.flags.ignore_permissions
+    #    flag is NOT checked on that code path.  In a webhook context the session
+    #    user is "Guest", causing a PermissionError on the bank Account read.
+    #
+    #    Safe fix: swap frappe.session.user to "Administrator" for the duration of
+    #    this call.  frappe.session is a plain thread-local Python object — assigning
+    #    .user has zero Redis / session side effects.  We restore in a finally block.
+    _prev_session_user = frappe.session.user
+    try:
+        if frappe.session.user in ("Guest", None, ""):
+            frappe.session.user = "Administrator"
+        pe = get_payment_entry(
+            dt="Sales Order",
+            dn=so.name,
+            party_amount=amount_paid,
+            bank_account=bank_account,
+        )
+    finally:
+        frappe.session.user = _prev_session_user
 
     # 4. Override paid-to + mode of payment + reference from Shopify data
     if mode_of_payment:
@@ -197,11 +212,18 @@ def create_payment_entry_from_shopify(so, order: dict, settings) -> str:
         pe.naming_series = settings.pe_naming_series
 
     # 6. Insert + (optionally) submit
+    #    pe.submit() calls check_permission() on the session user — same Guest
+    #    problem as step 3.  Apply the session user swap here too.
     pe.flags.ignore_permissions = True
-    pe.insert()
-
-    if settings.get("auto_submit_payment_entry"):
-        pe.submit()
+    _prev_session_user = frappe.session.user
+    try:
+        if frappe.session.user in ("Guest", None, ""):
+            frappe.session.user = "Administrator"
+        pe.insert()
+        if settings.get("auto_submit_payment_entry"):
+            pe.submit()
+    finally:
+        frappe.session.user = _prev_session_user
 
     frappe.db.commit()  # nosemgrep: frappe-manual-commit — runs in background job; PE must persist before SI creation
     return pe.name
