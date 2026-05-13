@@ -36,10 +36,12 @@ Object.assign(frappe.listview_settings['Delivery Note'], {
             return _erpnext_dn_indicator ? _erpnext_dn_indicator(doc) : undefined;
         }
 
-        // Shopify DN with SI enabled: show billing-aware status.
+        // Shopify DN with SI enabled: show "Shopify" label with color based on
+        // billing status so it's visually distinct from manual DNs while still
+        // communicating whether an invoice has been created.
         if (flt(doc.per_billed || 0) >= 100) {
-            return [__("Completed"), "green", "per_billed,=,100"];
+            return [__("Shopify"), "green", "shopify_order_id,is,set"];
         }
-        return [__("To Bill"), "orange", "per_billed,<,100"];
+        return [__("Shopify"), "orange", "shopify_order_id,is,set"];
     }
 });
