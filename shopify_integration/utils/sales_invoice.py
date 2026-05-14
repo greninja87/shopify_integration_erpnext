@@ -39,7 +39,7 @@ def is_sales_invoice_enabled() -> bool:
     """
     Return True if at least one Shopify Settings document has
     enable_sales_invoice = 1.  Called once per list-view load by
-    delivery_note_list.js to decide whether to show billing-aware indicators.
+    delivery_note_list.js to decide whether to show Shopify indicators.
     """
     return bool(frappe.db.exists("Shopify Settings", {"enable_sales_invoice": 1}))
 
