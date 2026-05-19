@@ -96,11 +96,7 @@ frappe.ui.form.on('Shopify Settings', {
         _apply_account_filters(frm);
     },
 
-    keep_draft_paid: function (frm) {
-        _maybe_disable_payment_entry(frm);
-    },
-
-    keep_draft_partial: function (frm) {
+    after_save: function (frm) {
         _maybe_disable_payment_entry(frm);
     }
 
@@ -118,6 +114,7 @@ function _maybe_disable_payment_entry(frm) {
             message: __('Payment Entry Creation has been disabled — it cannot run when both Paid and Partially Paid orders are kept as Draft.'),
             indicator: 'orange'
         }, 6);
+        frm.save();
     }
 }
 
