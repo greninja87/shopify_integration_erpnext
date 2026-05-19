@@ -20,10 +20,7 @@ import json
 import frappe
 from frappe.utils.password import get_decrypted_password
 from shopify_integration.utils.webhook import log_webhook, update_log_status
-from shopify_integration.utils.sales_order import (
-    create_sales_order_from_shopify,
-    send_failure_email,
-)
+from shopify_integration.utils.sales_order import create_sales_order_from_shopify
 from shopify_integration.shopify_integration.doctype.shopify_settings.shopify_settings import (
     get_settings_for_store,
 )

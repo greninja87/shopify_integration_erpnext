@@ -127,6 +127,15 @@ def retry_order(docname: str):
             "error_message": f"Retry failed: {error_msg}\n\n{traceback}",
         })
         frappe.db.commit()  # nosemgrep: frappe-manual-commit — after rollback; must persist error status in a new transaction
+
+        # Send failure email — settings may be None if store lookup failed above
+        if settings:
+            try:
+                from shopify_integration.utils.sales_order import send_failure_email
+                send_failure_email(settings, order_data, f"{error_msg}\n\n{traceback}")
+            except Exception:
+                frappe.log_error(frappe.get_traceback(), "Shopify: Failure Email Send Error")
+
         frappe.throw(f"Retry failed: {error_msg}")
 
     finally:
