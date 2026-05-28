@@ -113,9 +113,14 @@ def create_payment_entry_from_shopify(so, order: dict, settings) -> str:
         return ""
 
     # 3. Build base PE via ERPNext helper (handles party, party_account, etc.)
-    #    NOTE: get_payment_entry() sets paid_amount = SO outstanding and may produce
-    #    multiple references rows summing to the full SO total.  We immediately
-    #    fix both the top-level amounts AND the references child table below.
+    #
+    #    IMPORTANT: we do NOT pass party_amount so that ERPNext uses
+    #    rounded_total (not grand_total) for reference allocation — exactly
+    #    what happens when a user clicks "Create > Payment" from the SO form.
+    #    Passing party_amount forces ERPNext to skip the rounded_total lookup
+    #    (set_grand_total_and_outstanding_amount line 3279-3280) which can
+    #    produce a ₹0.01 mismatch when GST split rounding creates a gap
+    #    between grand_total and rounded_total.
     #
     #    get_payment_entry() internally calls get_balance_on() which resolves
     #    permissions from frappe.session.user — the global frappe.flags.ignore_permissions
@@ -132,7 +137,6 @@ def create_payment_entry_from_shopify(so, order: dict, settings) -> str:
         pe = get_payment_entry(
             dt="Sales Order",
             dn=so.name,
-            party_amount=amount_paid,
             bank_account=bank_account,
         )
     finally:
@@ -162,11 +166,6 @@ def create_payment_entry_from_shopify(so, order: dict, settings) -> str:
     #   payment_term is present on every kept row              (validation passes)
     #   SO is referenced                                       (advance_paid updated)
     #   SI finds this PE via the SO-reference lookup in get_advance_payment_entries
-    #
-    # We use the true amount paid for the top-level Payment Entry amounts.
-    # Any excess (e.g. from GST split rounding) becomes an unallocated advance.
-    pe.paid_amount     = flt(amount_paid)
-    pe.received_amount = flt(amount_paid)
 
     # We only allocate up to what's outstanding on the SO for the reference rows.
     remaining  = min(flt(amount_paid), flt(so_outstanding))
@@ -186,9 +185,30 @@ def create_payment_entry_from_shopify(so, order: dict, settings) -> str:
     pe.set("references", kept_refs)
     pe.set("deductions", [])    # clear any write-off / bridge rows ERPNext injected
 
+    # ── Set paid_amount from Shopify (source of truth) ──────────────────────
+    #
+    # Shopify's amount_paid (total_price − total_outstanding) is the real
+    # amount collected from the customer.  The PE must reflect that, not the
+    # SO total — so the PE stays Shopify-dependent, not SO-dependent.
+    #
+    # Since we no longer pass party_amount, ERPNext's get_payment_entry()
+    # builds references from rounded_total — which should match amount_paid
+    # for a fully-paid order.  The trimming above already caps allocation at
+    # min(amount_paid, so_outstanding), so total_allocated ≤ paid_amount.
+    #
+    # Sub-paisa safety net: if float drift causes total_allocated to differ
+    # from amount_paid by ≤ ₹0.01 (one paisa), align paid_amount to
+    # total_allocated so that difference_amount = 0 and submission passes.
+    # Gaps > ₹0.01 (genuine partial payments or ₹1 overages) are left
+    # as-is — the excess becomes an unallocated advance on the PE.
+    total_allocated = sum(flt(r.allocated_amount) for r in kept_refs)
+    pe.paid_amount     = flt(amount_paid)
+    pe.received_amount = flt(amount_paid)
+    if 0 < abs(flt(amount_paid) - total_allocated) <= 0.01:
+        pe.paid_amount     = total_allocated
+        pe.received_amount = total_allocated
+
     pe.set_amounts()
-    # Explicitly clear difference_amount just in case, though set_amounts() usually sets it to 0
-    # for a straight Receive PE in the same currency.
     pe.difference_amount = 0
 
     pe.reference_no   = (order.get("name") or order.get("order_number") or str(order.get("id", "")))[:140]
