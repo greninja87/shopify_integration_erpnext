@@ -199,7 +199,12 @@ def create_sales_order_from_shopify(order: dict, settings):
     #   When shipping == billing → reuse the billing address (mark it as shipping)
     order_shipping_addr = ""
     if shipping_addr:
-        if addresses_are_different(billing_addr, shipping_addr):
+        # B2B orders (gst_billing_addr set): the ERPNext billing address is the
+        # GST-registered address from the IC portal — NOT the Shopify billing_addr.
+        # Comparing Shopify billing vs Shopify shipping is therefore meaningless;
+        # always resolve shipping directly from Shopify's shipping_addr so the
+        # GST portal address is never silently reused as the shipping address.
+        if gst_billing_addr or addresses_are_different(billing_addr, shipping_addr):
             try:
                 order_shipping_addr = find_or_create_address_for_order(
                     customer_name=customer_name,

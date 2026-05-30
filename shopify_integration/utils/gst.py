@@ -151,14 +151,15 @@ def resolve_billing_from_gstin(gstin: str, customer_name: str) -> str | None:
 # ── Internal helpers ───────────────────────────────────────────────────────────
 
 def _ensure_address_linked(addr_name: str, customer_name: str):
-    """Add a Dynamic Link from Address to Customer if not already present.
+    """Add a Dynamic Link from Address to Customer if not already present,
+    and promote the GST address as the customer's preferred billing address.
 
     Uses the Document layer (get_doc → append → save) so Frappe correctly
     auto-generates a `name` for the child row.  frappe.db.insert() bypasses
     naming and would leave the row with a NULL name, causing a DB error.
     """
     # Fast-path: check before loading the full doc
-    exists = frappe.db.exists(
+    already_linked = frappe.db.exists(
         "Dynamic Link",
         {
             "parenttype":   "Address",
@@ -167,21 +168,34 @@ def _ensure_address_linked(addr_name: str, customer_name: str):
             "link_name":    customer_name,
         },
     )
-    if exists:
-        return
+    if not already_linked:
+        addr_doc = frappe.get_doc("Address", addr_name)
+        # Double-check in the loaded doc to guard against concurrent inserts
+        for link in addr_doc.get("links") or []:
+            if link.link_doctype == "Customer" and link.link_name == customer_name:
+                break
+        else:
+            addr_doc.append("links", {
+                "link_doctype": "Customer",
+                "link_name":    customer_name,
+            })
+            addr_doc.flags.ignore_permissions = True
+            addr_doc.save()
 
-    addr_doc = frappe.get_doc("Address", addr_name)
-    # Double-check in the loaded doc to guard against concurrent inserts
-    for link in addr_doc.get("links") or []:
-        if link.link_doctype == "Customer" and link.link_name == customer_name:
-            return
-
-    addr_doc.append("links", {
-        "link_doctype": "Customer",
-        "link_name":    customer_name,
-    })
-    addr_doc.flags.ignore_permissions = True
-    addr_doc.save()
+    # Promote this GST address as the preferred billing address for this customer.
+    # Explicitly set is_shipping_address=0 — the GST address is for tax/billing only;
+    # the Shopify delivery address is always used as the shipping address.
+    updates = {}
+    addr_flags = frappe.db.get_value(
+        "Address", addr_name, ["is_primary_address", "is_shipping_address"], as_dict=True
+    ) or {}
+    if not addr_flags.get("is_primary_address"):
+        updates["is_primary_address"] = 1
+    if addr_flags.get("is_shipping_address"):
+        updates["is_shipping_address"] = 0
+    if updates:
+        frappe.db.set_value("Address", addr_name, updates)
+    frappe.db.set_value("Customer", customer_name, "customer_primary_address", addr_name)
 
 
 def _fetch_from_ic_portal(gstin: str) -> dict | None:
@@ -235,16 +249,18 @@ def _create_gst_address(gstin: str, portal_data: dict, customer_name: str) -> st
         pincode = str(perm.get("pincode") or "")
 
         addr = frappe.get_doc({
-            "doctype":       "Address",
-            "address_title": legal_name,
-            "address_type":  "Billing",
-            "address_line1": line1,
-            "address_line2": line2,
-            "city":          city,
-            "state":         state,
-            "pincode":       pincode,
-            "country":       "India",
-            "gstin":         gstin,
+            "doctype":            "Address",
+            "address_title":      legal_name,
+            "address_type":       "Billing",
+            "address_line1":      line1,
+            "address_line2":      line2,
+            "city":               city,
+            "state":              state,
+            "pincode":            pincode,
+            "country":            "India",
+            "gstin":              gstin,
+            "is_primary_address": 1,  # preferred billing for B2B customers
+            "is_shipping_address": 0,  # shipping is always the Shopify delivery address
             "links": [{
                 "link_doctype": "Customer",
                 "link_name":    customer_name,
@@ -252,6 +268,7 @@ def _create_gst_address(gstin: str, portal_data: dict, customer_name: str) -> st
         })
         addr.flags.ignore_permissions = True
         addr.insert()
+        frappe.db.set_value("Customer", customer_name, "customer_primary_address", addr.name)
         frappe.db.commit()  # nosemgrep: frappe-manual-commit — runs in background job; address must persist before SO links it
         return addr.name
 

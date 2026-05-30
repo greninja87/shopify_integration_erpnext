@@ -112,6 +112,7 @@ def get_or_create_customer(
             settings=settings,
             contact_person_name=shopify_person_name,
             customer_type=gst_customer_type,
+            has_gstin=True,
         )
 
     # ── B2C path — name from Shopify, Individual type ────────────────────────
@@ -179,6 +180,7 @@ def _create_customer(
     billing_address, shipping_address, settings,
     contact_person_name="",
     customer_type="Individual",
+    has_gstin=False,
 ):
     """Create a new ERPNext Customer from Shopify data.
 
@@ -221,7 +223,10 @@ def _create_customer(
             customer_name=customer.name,
             shopify_address=billing_address,
             address_type="Billing",
-            is_primary=True,
+            # B2B (has_gstin): the GST-registered address will become the primary
+            # billing address after resolve_billing_from_gstin() runs in sales_order.py.
+            # Don't promote the Shopify billing address as primary here.
+            is_primary=not has_gstin,
             is_shipping=False,
         )
 
@@ -233,8 +238,10 @@ def _create_customer(
             is_primary=False,
             is_shipping=True,
         )
-    elif billing_addr_name:
-        # billing == shipping: mark the billing address as shipping too
+    elif billing_addr_name and not has_gstin:
+        # B2C only: billing == shipping → mark the one address as preferred for both.
+        # B2B: shipping is resolved independently from Shopify's shipping_addr in
+        # sales_order.py, so never stamp the Shopify billing address as shipping here.
         frappe.db.set_value("Address", billing_addr_name, "is_shipping_address", 1)
 
     # Create contact — use the Shopify customer's first+last name (passed in as
@@ -344,10 +351,16 @@ def find_or_create_address_for_order(
         existing = frappe.get_all(
             "Address",
             filters={"name": ["in", linked]},
-            fields=["name", "address_line1", "city", "pincode"],
+            fields=["name", "address_line1", "city", "pincode", "is_shipping_address"],
         )
         for addr in existing:
             if _shopify_matches_erpnext_address(shopify_address, addr):
+                # Ensure the preference flag reflects how this address is being used.
+                # A newly created address gets the flag via _create_address(); a found
+                # address must be stamped explicitly so the Customer form shows the
+                # correct preferred-shipping indicator.
+                if is_shipping and not addr.get("is_shipping_address"):
+                    frappe.db.set_value("Address", addr["name"], "is_shipping_address", 1)
                 return addr["name"]
 
     # No matching address found — create a new one.
