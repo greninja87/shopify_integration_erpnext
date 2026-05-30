@@ -778,11 +778,29 @@ def clear_shopify_fields_on_amend(doc, method=None):
     """
     Hook: Sales Order → before_insert.
 
-    ERPNext copies all fields from the original SO when amending, including
-    shopify_order_id. Keeping the same ID on the amended copy would cause
-    our duplicate check to block future retries if the amendment is cancelled.
-    The original cancelled SO still holds the Shopify reference.
+    Clears shopify_order_id / shopify_store in two cases:
+
+    1. Amend — ERPNext copies all fields when amending; the amended copy must
+       not carry the Shopify ID or our duplicate check would block future retries
+       once the amendment is cancelled.
+
+    2. Manual duplicate — when a salesperson uses the Duplicate button the same
+       fields are copied verbatim.  At before_insert time the document is not yet
+       in the DB, so if shopify_order_id already exists on another non-cancelled
+       SO it can only mean this is a copy, not a new webhook-created order.
+       Clearing the fields prevents two SOs from sharing the same Shopify ID.
     """
     if doc.get("amended_from"):
         doc.shopify_order_id = ""
         doc.shopify_store    = ""
+        return
+
+    if doc.get("shopify_order_id"):
+        already_exists = frappe.db.get_value(
+            "Sales Order",
+            {"shopify_order_id": doc.shopify_order_id, "docstatus": ["!=", 2]},
+            "name",
+        )
+        if already_exists:
+            doc.shopify_order_id = ""
+            doc.shopify_store    = ""
