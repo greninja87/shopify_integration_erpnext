@@ -778,21 +778,17 @@ def clear_shopify_fields_on_amend(doc, method=None):
     """
     Hook: Sales Order → before_insert.
 
-    Clears shopify_order_id / shopify_store in two cases:
+    Clears shopify_order_id / shopify_store only on manual duplicates.
 
-    1. Amend — ERPNext copies all fields when amending; the amended copy must
-       not carry the Shopify ID or our duplicate check would block future retries
-       once the amendment is cancelled.
+    Amended copies intentionally keep the Shopify fields — the original SO is
+    cancelled (docstatus=2) when amended, so the duplicate check (docstatus != 2)
+    correctly treats the amended copy as the active order for that Shopify order.
 
-    2. Manual duplicate — when a salesperson uses the Duplicate button the same
-       fields are copied verbatim.  At before_insert time the document is not yet
-       in the DB, so if shopify_order_id already exists on another non-cancelled
-       SO it can only mean this is a copy, not a new webhook-created order.
-       Clearing the fields prevents two SOs from sharing the same Shopify ID.
+    Manual duplicates (Duplicate button) must be cleared: at before_insert time
+    the new doc is not yet in the DB, so if shopify_order_id already exists on
+    any non-cancelled SO it can only mean this is a copy, not a new webhook order.
     """
     if doc.get("amended_from"):
-        doc.shopify_order_id = ""
-        doc.shopify_store    = ""
         return
 
     if doc.get("shopify_order_id"):
