@@ -79,6 +79,14 @@
     "section_si_series",
     "si_naming_series",
 
+    "section_cn_settings",
+    "enable_credit_note",
+    "column_break_cn_settings",
+    "credit_note_creation",
+    "auto_submit_credit_note",
+    "section_cn_series",
+    "cn_naming_series",
+
     "tab_notifications",
     "section_failure",
     "failure_email_to",
@@ -502,6 +510,55 @@
       "label": "Sales Invoice Series",
       "depends_on": "eval:doc.enable_sales_invoice",
       "description": "Naming series for Sales Invoices created from this store. Leave blank to use the default."
+    },
+
+    {
+      "fieldname": "section_cn_settings",
+      "fieldtype": "Section Break",
+      "label": "Credit Note",
+      "depends_on": "eval:doc.enable_sales_invoice",
+      "description": "When a Shopify refund webhook (<code>refunds/create</code>) arrives, create a Credit Note (return Sales Invoice) against the original Sales Invoice.<br><br><b>Auto</b> — Credit Note is created automatically in the background.<br><b>Manual</b> — The refund is logged; create the Credit Note yourself in ERPNext."
+    },
+    {
+      "default": "0",
+      "fieldname": "enable_credit_note",
+      "fieldtype": "Check",
+      "label": "Enable Credit Note Creation",
+      "depends_on": "eval:doc.enable_sales_invoice"
+    },
+    {
+      "fieldname": "column_break_cn_settings",
+      "fieldtype": "Column Break"
+    },
+    {
+      "default": "Auto",
+      "fieldname": "credit_note_creation",
+      "fieldtype": "Select",
+      "label": "Credit Note Creation",
+      "options": "\nAuto\nManual",
+      "depends_on": "eval:doc.enable_credit_note",
+      "description": "How to handle incoming Shopify refunds."
+    },
+    {
+      "default": "1",
+      "fieldname": "auto_submit_credit_note",
+      "fieldtype": "Check",
+      "label": "Auto-Submit Credit Note",
+      "depends_on": "eval:doc.enable_credit_note && doc.credit_note_creation == 'Auto'",
+      "description": "Uncheck to save Credit Notes as Draft for manual review before submission."
+    },
+    {
+      "fieldname": "section_cn_series",
+      "fieldtype": "Section Break",
+      "label": "Credit Note Naming Series",
+      "depends_on": "eval:doc.enable_credit_note && doc.credit_note_creation == 'Auto'"
+    },
+    {
+      "fieldname": "cn_naming_series",
+      "fieldtype": "Select",
+      "label": "Credit Note Series",
+      "depends_on": "eval:doc.enable_credit_note && doc.credit_note_creation == 'Auto'",
+      "description": "Naming series for Credit Notes created from this store. Leave blank to use the ERPNext default."
     },
 
     {

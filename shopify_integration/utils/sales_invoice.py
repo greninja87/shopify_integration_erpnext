@@ -54,6 +54,10 @@ def get_dn_shopify_invoice_status(dn_name: str) -> dict:
     auto-SI-after-DN enabled — the JS treats any falsy/empty result as "nothing
     to show".
     """
+    # Return DNs never get an auto-SI — nothing to show on the form.
+    if frappe.db.get_value("Delivery Note", dn_name, "is_return"):
+        return {}
+
     # Find SO linked from any DN item
     so_name = frappe.db.get_value(
         "Delivery Note Item",
@@ -116,6 +120,11 @@ def create_si_from_dn_on_submit(doc, method):
     Enqueues a background job (enqueue_after_commit=True) so the DN submit
     transaction commits before the SI job starts — safe and non-blocking.
     """
+    # Return DNs (stock returns) must never trigger auto-SI creation — they are
+    # handled separately as Credit Notes via the refunds/create webhook.
+    if doc.get("is_return"):
+        return
+
     # Resolve the linked Shopify SO via DN items (more reliable than reading
     # doc.shopify_store, which may not be populated on all DN header rows).
     so_name = None

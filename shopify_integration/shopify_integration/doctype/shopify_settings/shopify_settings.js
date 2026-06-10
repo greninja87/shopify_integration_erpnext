@@ -67,6 +67,7 @@ frappe.ui.form.on('Shopify Settings', {
         });
 
         // Populate Sales Invoice naming series from ERPNext meta
+        // (used for both si_naming_series and cn_naming_series — same DocType)
         frappe.call({
             method: 'shopify_integration.shopify_integration.doctype.shopify_settings.shopify_settings.get_naming_series',
             args: { doctype: 'Sales Invoice' },
@@ -76,6 +77,9 @@ frappe.ui.form.on('Shopify Settings', {
                     options.unshift('');
                     frm.set_df_property('si_naming_series', 'options', options);
                     frm.refresh_field('si_naming_series');
+                    // Credit Notes are return Sales Invoices — same naming series pool
+                    frm.set_df_property('cn_naming_series', 'options', options);
+                    frm.refresh_field('cn_naming_series');
                 }
             },
             error: function () {

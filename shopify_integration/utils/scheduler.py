@@ -71,6 +71,7 @@ def _process_store(settings):
         JOIN `tabDelivery Note Item` dni ON dni.parent = dn.name
         JOIN `tabSales Order` so ON so.name = dni.against_sales_order
         WHERE dn.docstatus  = 1
+          AND dn.is_return  = 0
           AND so.docstatus  = 1
           AND so.shopify_store = %(store)s
           AND TIMESTAMPDIFF(HOUR, dn.modified, NOW()) >= %(delay_hours)s

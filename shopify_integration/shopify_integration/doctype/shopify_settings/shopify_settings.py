@@ -57,6 +57,16 @@ class ShopifySettings(Document):
                 title="Sales Invoice Trigger Required",
             )
 
+        # Credit note creation mode must be set when credit notes are enabled.
+        if self.get("enable_credit_note") and not self.get("credit_note_creation"):
+            frappe.throw(
+                "<b>Credit Note Creation</b> must be set when "
+                "<b>Enable Credit Note Creation</b> is on. "
+                "Choose <b>Auto</b> (created automatically on Shopify refund) "
+                "or <b>Manual</b> (logged only; you create the Credit Note yourself).",
+                title="Credit Note Creation Mode Required",
+            )
+
         # Delay hours must be a non-negative integer.
         if (
             self.get("enable_sales_invoice")

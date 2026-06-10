@@ -130,6 +130,48 @@ def shopify_webhook():
             return {"status": "ignored", "reason": "store not configured or sync disabled"}
 
         # ── Route by topic ─────────────────────────────────────────────────────
+        if topic == "refunds/create":
+            shopify_order_id = str(order_data.get("order_id", ""))
+            refund_id        = str(order_data.get("id", ""))
+
+            if settings.get("enable_sales_invoice") and settings.get("enable_credit_note"):
+                if settings.get("credit_note_creation") == "Auto":
+                    job_id = f"shopify_refund_{refund_id}"
+                    frappe.enqueue(
+                        "shopify_integration.utils.credit_note._create_credit_note_background",
+                        queue="default",
+                        timeout=120,
+                        refund_data=order_data,
+                        store_name=settings.name,
+                        log_name=log_name,
+                        job_name=job_id,
+                        enqueue_after_commit=True,
+                    )
+                    update_log_status(
+                        log_name=log_name,
+                        shopify_order_id=shopify_order_id,
+                        status="Received",
+                        error="Enqueued for credit note creation.",
+                    )
+                else:
+                    # Manual mode — log it so the user knows to act
+                    update_log_status(
+                        log_name=log_name,
+                        shopify_order_id=shopify_order_id,
+                        status="Skipped",
+                        error="Credit Note creation is set to Manual — create the Credit Note yourself in ERPNext against the Sales Invoice for this order.",
+                    )
+            else:
+                update_log_status(
+                    log_name=log_name,
+                    shopify_order_id=shopify_order_id,
+                    status="Skipped",
+                    error="Credit Note creation is not enabled for this store.",
+                )
+
+            frappe.db.commit()  # nosemgrep: frappe-manual-commit — must commit before returning HTTP 200 to Shopify
+            return {"status": "ok", "store": shop_domain, "topic": topic}
+
         if topic == "orders/create":
             # PHASE 1 & 2: Asynchronous Execution & Lock Protection
             # Enqueue the processing instead of running it synchronously. This ensures we respond
