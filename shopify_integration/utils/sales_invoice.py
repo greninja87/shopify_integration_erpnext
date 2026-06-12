@@ -112,6 +112,77 @@ def get_dn_shopify_invoice_status(dn_name: str) -> dict:
     }
 
 
+@frappe.whitelist()
+def create_si_from_dn_manual(dn_name: str) -> dict:
+    """
+    Whitelist: manually trigger Sales Invoice creation for a submitted Shopify
+    Delivery Note.  Used as a fallback from the DN form when auto-creation has
+    failed or not yet run.
+
+    Returns:
+      {"queued": True}               — job enqueued, check back in a few seconds
+      {"already_exists": True, "si_name": "..."}  — SI already there
+    Raises frappe.ValidationError for invalid states.
+    """
+    dn_vals = frappe.db.get_value(
+        "Delivery Note", dn_name, ["docstatus", "is_return"], as_dict=True
+    )
+    if not dn_vals:
+        frappe.throw(f"Delivery Note {dn_name} not found.")
+    if dn_vals.docstatus != 1:
+        frappe.throw("The Delivery Note must be submitted before a Sales Invoice can be created.")
+    if dn_vals.is_return:
+        frappe.throw("Return Delivery Notes do not generate Sales Invoices.")
+
+    so_name = frappe.db.get_value(
+        "Delivery Note Item",
+        {"parent": dn_name, "against_sales_order": ["!=", ""]},
+        "against_sales_order",
+    )
+    if not so_name:
+        frappe.throw("No linked Sales Order found on this Delivery Note — cannot determine Shopify store.")
+
+    shopify_store = frappe.db.get_value("Sales Order", so_name, "shopify_store")
+    if not shopify_store:
+        frappe.throw("This Delivery Note is not linked to a Shopify order.")
+
+    settings_name = frappe.db.get_value(
+        "Shopify Settings",
+        {
+            "shop_domain": shopify_store,
+            "enable_sync": 1,
+            "enable_sales_invoice": 1,
+            "sales_invoice_trigger": "After Delivery Note",
+        },
+        "name",
+    )
+    if not settings_name:
+        frappe.throw(
+            "No active Shopify Settings found with Sales Invoice → After Delivery Note enabled "
+            "for this store. Check Shopify Settings → Sales Invoice tab."
+        )
+
+    _existing = frappe.db.sql(
+        """
+        SELECT si.name FROM `tabSales Invoice Item` sii
+        JOIN `tabSales Invoice` si ON si.name = sii.parent
+        WHERE sii.delivery_note = %s AND si.docstatus != 2 AND si.is_return = 0
+        LIMIT 1
+        """,
+        dn_name,
+    )
+    if _existing:
+        return {"already_exists": True, "si_name": _existing[0][0]}
+
+    frappe.enqueue(
+        "shopify_integration.utils.sales_invoice._create_si_for_dn_immediate",
+        dn_name=dn_name,
+        store_name=settings_name,
+        queue="short",
+    )
+    return {"queued": True}
+
+
 # ── Doc-event: Delivery Note on_submit ────────────────────────────────────────
 
 def create_si_from_dn_on_submit(doc, method):
@@ -171,10 +242,9 @@ def _create_si_for_dn_immediate(dn_name: str, store_name: str):
             f"Shopify: immediate Sales Invoice {si_name} created from DN {dn_name}"
         )
     except Exception:
-        frappe.log_error(
-            frappe.get_traceback(),
-            f"Shopify: Immediate Sales Invoice from DN Failed — {dn_name}",
-        )
+        tb = frappe.get_traceback()
+        frappe.log_error(tb, f"Shopify: Immediate Sales Invoice from DN Failed — {dn_name}")
+        _send_si_failure_email(settings, "Delivery Note", dn_name, tb)
 
 
 # ── SI creation functions ──────────────────────────────────────────────────────
@@ -191,6 +261,28 @@ def create_sales_invoice_from_so(so, settings, pe_name: str = None) -> str:
     from erpnext.selling.doctype.sales_order.sales_order import (
         make_sales_invoice as so_to_si,
     )
+
+    # Idempotency guard: if a non-cancelled SI already exists for this SO
+    # (e.g. from a prior run or a manual retry), return it instead of creating
+    # a duplicate.  The scheduler path has an equivalent NOT EXISTS SQL check;
+    # this mirrors that protection for the "After Payment Entry" path.
+    _existing = frappe.db.sql(
+        """
+        SELECT si.name
+        FROM `tabSales Invoice Item` sii
+        JOIN `tabSales Invoice` si ON si.name = sii.parent
+        WHERE sii.sales_order = %s
+          AND si.docstatus != 2
+          AND si.is_return  = 0
+        LIMIT 1
+        """,
+        so.name,
+    )
+    if _existing:
+        frappe.logger().info(
+            f"Shopify: Sales Invoice {_existing[0][0]} already exists for SO {so.name} — skipping"
+        )
+        return _existing[0][0]
 
     # ERPNext's make_sales_invoice calls get_mapped_doc which calls
     # check_permission() before ignore_permissions is applied.  In a webhook
@@ -254,6 +346,28 @@ def create_sales_invoice_from_dn(dn_name: str, settings) -> str:
         make_sales_invoice as dn_to_si,
     )
 
+    # Idempotency guard: mirrors the NOT EXISTS check in the scheduler SQL.
+    # The immediate on_submit path (enqueued job) can fire more than once
+    # if the DN is somehow submitted twice, so guard here rather than relying
+    # solely on the enqueue job_name deduplication.
+    _existing = frappe.db.sql(
+        """
+        SELECT si.name
+        FROM `tabSales Invoice Item` sii
+        JOIN `tabSales Invoice` si ON si.name = sii.parent
+        WHERE sii.delivery_note = %s
+          AND si.docstatus != 2
+          AND si.is_return  = 0
+        LIMIT 1
+        """,
+        dn_name,
+    )
+    if _existing:
+        frappe.logger().info(
+            f"Shopify: Sales Invoice {_existing[0][0]} already exists for DN {dn_name} — skipping"
+        )
+        return _existing[0][0]
+
     _prev_user = frappe.session.user
     try:
         if frappe.session.user in ("Guest", None, ""):
@@ -294,3 +408,51 @@ def _trigger_e_compliance(si_name: str, settings) -> None:
         return
     from shopify_integration.utils.e_compliance import trigger_e_compliance_for_si
     trigger_e_compliance_for_si(si_name, settings)
+
+
+def _send_si_failure_email(settings, reference_type: str, reference_name: str, error_message: str) -> None:
+    """
+    Send a notification email when Sales Invoice auto-creation fails.
+    Mirrors the PE failure email pattern in sales_order.py.
+    No-ops when failure_email_to is not configured in settings.
+    """
+    to_emails = (settings.get("failure_email_to") or "").strip()
+    if not to_emails:
+        return
+
+    shop = settings.get("shop_domain") or settings.get("name") or "Shopify"
+    cc_emails = (settings.get("failure_email_cc") or "").strip()
+    cc_list = [e.strip() for e in cc_emails.split(",") if e.strip()] if cc_emails else []
+    subject = f"[Shopify] Sales Invoice Failed — {reference_type} {reference_name} ({shop})"
+
+    message = f"""
+    <p>The Shopify Integration could not create a <b>Sales Invoice</b> automatically.</p>
+    <p>Please create it manually in ERPNext using the steps below.</p>
+    <table border="0" cellpadding="4" style="font-family:Arial;font-size:13px;border-collapse:collapse;">
+      <tr><td style="padding:4px 12px 4px 0;"><b>Reference</b></td><td>{reference_type}: <b>{reference_name}</b></td></tr>
+      <tr><td style="padding:4px 12px 4px 0;"><b>Store</b></td><td>{shop}</td></tr>
+    </table>
+    <br>
+    <p><b>How to create the Sales Invoice manually:</b></p>
+    <ol style="font-family:Arial;font-size:13px;line-height:1.8;">
+      <li>Open the <b>{reference_type}</b> <code>{reference_name}</code> in ERPNext.</li>
+      <li>Click the <b>Shopify</b> button group &rarr; <b>Create Sales Invoice</b>.<br>
+          <em>(This button appears automatically on submitted Shopify Delivery Notes.)</em></li>
+      <li>If the button is not visible, create it manually via <b>Create &rarr; Sales Invoice</b>.</li>
+    </ol>
+    <p><b>Failure reason:</b></p>
+    <pre style="background:#fef2f2;padding:10px;border-left:4px solid #ef4444;font-size:12px;white-space:pre-wrap;">{error_message[:2000]}</pre>
+    <p style="color:#6b7280;font-size:12px;">
+      See ERPNext &rarr; Error Log for the full traceback.
+    </p>
+    """
+    try:
+        frappe.sendmail(
+            recipients=[e.strip() for e in to_emails.split(",") if e.strip()],
+            cc=cc_list,
+            subject=subject,
+            message=message,
+            delayed=False,
+        )
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), "Shopify: SI Failure Email Send Error")

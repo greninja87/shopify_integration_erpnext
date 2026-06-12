@@ -72,8 +72,31 @@ def shopify_webhook():
         # ── Always log the event FIRST so there is always an audit row ─────────
         # This must happen before the HMAC check so that even rejected webhooks
         # appear in Shopify Log and can be retried once the secret is corrected.
+        #
+        # For non-order topics (e.g. refunds/create), order_data["id"] is the
+        # sub-resource ID (refund ID), not the Shopify order ID.  Pass the real
+        # order ID explicitly so the log is searchable by Shopify order.
+        _log_order_id = ""
+        _log_order_name = ""
+        if topic == "refunds/create":
+            # Refund payloads: "id" = refund ID, "order_id" = the actual order ID.
+            # "name" field (e.g. "#1042") doesn't exist on refund payloads — look it
+            # up from the Sales Order so the log row is human-readable.
+            _log_order_id = str(order_data.get("order_id", ""))
+            if _log_order_id:
+                _log_order_name = frappe.db.get_value(
+                    "Sales Order",
+                    {"shopify_order_id": _log_order_id},
+                    "po_no",  # SO stores Shopify order name (#1042) in po_no
+                ) or ""
+
         settings = get_settings_for_store(shop_domain)
-        log_name = log_webhook(topic, shop_domain, order_data, status="Received")
+        log_name = log_webhook(
+            topic, shop_domain, order_data,
+            status="Received",
+            shopify_order_id=_log_order_id,
+            shopify_order_name=_log_order_name,
+        )
 
         # ── HMAC signature verification ────────────────────────────────────────
         # Shopify signs every webhook with HMAC-SHA256 using the webhook secret.

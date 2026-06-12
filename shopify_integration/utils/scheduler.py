@@ -101,10 +101,10 @@ def _create_si_for_dn(dn_name: str, settings):
             f"Shopify scheduler: created Sales Invoice {si_name} from DN {dn_name}"
         )
     except Exception:
-        frappe.log_error(
-            frappe.get_traceback(),
-            f"Shopify: Sales Invoice from DN Failed — {dn_name}",
-        )
+        tb = frappe.get_traceback()
+        frappe.log_error(tb, f"Shopify: Sales Invoice from DN Failed — {dn_name}")
+        from shopify_integration.utils.sales_invoice import _send_si_failure_email
+        _send_si_failure_email(settings, "Delivery Note", dn_name, tb)
 
 
 def delete_old_shopify_logs():

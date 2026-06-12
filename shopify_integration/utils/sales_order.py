@@ -449,13 +449,13 @@ def create_sales_order_from_shopify(order: dict, settings):
         try:
             from shopify_integration.utils.sales_invoice import (
                 create_sales_invoice_from_so,
+                _send_si_failure_email,
             )
             create_sales_invoice_from_so(so, settings, pe_name=pe_name)
         except Exception:
-            frappe.log_error(
-                frappe.get_traceback(),
-                f"Shopify: Sales Invoice Failed — {so.name}",
-            )
+            tb = frappe.get_traceback()
+            frappe.log_error(tb, f"Shopify: Sales Invoice Failed — {so.name}")
+            _send_si_failure_email(settings, "Sales Order", so.name, tb)
 
     frappe.db.commit()  # nosemgrep: frappe-manual-commit — background job; SO must persist before PE/SI creation in same job
     # Successful SO creation does NOT write to Error Log or Shopify Log.

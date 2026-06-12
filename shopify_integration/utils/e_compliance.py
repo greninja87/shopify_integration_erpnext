@@ -34,6 +34,7 @@ def trigger_e_compliance_for_si(si_name: str, settings) -> None:
             si_name=si_name,
             queue="default",
             timeout=120,
+            job_name=f"shopify_einvoice_{si_name}",
             enqueue_after_commit=True,
         )
 
@@ -43,6 +44,7 @@ def trigger_e_compliance_for_si(si_name: str, settings) -> None:
             si_name=si_name,
             queue="default",
             timeout=120,
+            job_name=f"shopify_ewaybill_{si_name}",
             enqueue_after_commit=True,
         )
 

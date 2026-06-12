@@ -57,6 +57,15 @@ class ShopifySettings(Document):
                 title="Sales Invoice Trigger Required",
             )
 
+        # Credit note requires Sales Invoice to be enabled first.
+        if self.get("enable_credit_note") and not self.get("enable_sales_invoice"):
+            frappe.throw(
+                "<b>Enable Sales Invoice Creation</b> must be turned on (Sales Invoice tab) "
+                "before Credit Note creation can be enabled. Credit Notes are return Sales Invoices "
+                "— there must be a Sales Invoice to return against.",
+                title="Sales Invoice Required for Credit Notes",
+            )
+
         # Credit note creation mode must be set when credit notes are enabled.
         if self.get("enable_credit_note") and not self.get("credit_note_creation"):
             frappe.throw(
@@ -67,10 +76,19 @@ class ShopifySettings(Document):
                 title="Credit Note Creation Mode Required",
             )
 
-        # e-Invoice / e-Waybill require a submitted SI — warn when auto-submit is off.
+        # e-Compliance requires Sales Invoice to be enabled.
         _e_compliance_on = (
             self.get("enable_e_invoice") or self.get("enable_e_waybill")
         )
+        if _e_compliance_on and not self.get("enable_sales_invoice"):
+            frappe.throw(
+                "<b>Enable Sales Invoice Creation</b> must be turned on (Sales Invoice tab) "
+                "before e-Invoice / e-Waybill can be enabled. These features generate compliance "
+                "documents from the Sales Invoice after it is submitted.",
+                title="Sales Invoice Required for e-Compliance",
+            )
+
+        # e-Invoice / e-Waybill require a submitted SI — warn when auto-submit is off.
         if _e_compliance_on and not self.get("auto_submit_sales_invoice"):
             frappe.msgprint(
                 "e-Invoice / e-Waybill generation requires a <b>submitted</b> Sales Invoice. "

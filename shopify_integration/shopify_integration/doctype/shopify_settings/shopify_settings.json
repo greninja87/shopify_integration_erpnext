@@ -79,6 +79,7 @@
     "section_si_series",
     "si_naming_series",
 
+    "tab_returns",
     "section_cn_settings",
     "enable_credit_note",
     "column_break_cn_settings",
@@ -87,19 +88,19 @@
     "section_cn_series",
     "cn_naming_series",
 
+    "tab_compliance",
     "section_e_compliance",
     "enable_e_invoice",
     "column_break_e_compliance",
     "enable_e_waybill",
 
-    "tab_notifications",
+    "tab_advanced",
     "section_failure",
     "failure_email_to",
     "column_break_failure",
     "failure_email_cc",
+    "section_log_management",
     "shopify_log_retention_days",
-
-    "tab_field_mapping",
     "section_field_mapping",
     "field_mapping"
   ],
@@ -190,7 +191,7 @@
     {
       "fieldname": "tab_order_defaults",
       "fieldtype": "Tab Break",
-      "label": "Order Defaults"
+      "label": "Orders"
     },
     {
       "fieldname": "section_naming",
@@ -358,7 +359,7 @@
     {
       "fieldname": "tab_payment_entry",
       "fieldtype": "Tab Break",
-      "label": "Payment Entry"
+      "label": "Payments"
     },
     {
       "fieldname": "section_pe_settings",
@@ -502,7 +503,6 @@
       "depends_on": "eval:doc.enable_sales_invoice && doc.sales_invoice_trigger == 'After Delivery Note' && doc.si_dn_timing != 'Immediate'",
       "description": "Minimum hours after Delivery Note submission before the scheduler creates the invoice. Set 0 to create at the next hourly run with no delay."
     },
-
     {
       "fieldname": "section_si_series",
       "fieldtype": "Section Break",
@@ -518,18 +518,23 @@
     },
 
     {
+      "fieldname": "tab_returns",
+      "fieldtype": "Tab Break",
+      "label": "Returns"
+    },
+    {
       "fieldname": "section_cn_settings",
       "fieldtype": "Section Break",
       "label": "Credit Note",
-      "depends_on": "eval:doc.enable_sales_invoice",
-      "description": "When a Shopify refund webhook (<code>refunds/create</code>) arrives, create a Credit Note (return Sales Invoice) against the original Sales Invoice.<br><br><b>Auto</b> — Credit Note is created automatically in the background.<br><b>Manual</b> — The refund is logged; create the Credit Note yourself in ERPNext."
+      "description": "When a Shopify refund webhook (<code>refunds/create</code>) arrives, create a Credit Note (return Sales Invoice) against the original Sales Invoice.<br><br><b>Auto</b> — Credit Note is created automatically in the background.<br><b>Manual</b> — The refund is logged; create the Credit Note yourself in ERPNext.<br><br><b>Prerequisite:</b> Sales Invoice creation must be enabled on the <b>Sales Invoice</b> tab."
     },
     {
       "default": "0",
       "fieldname": "enable_credit_note",
       "fieldtype": "Check",
       "label": "Enable Credit Note Creation",
-      "depends_on": "eval:doc.enable_sales_invoice"
+      "depends_on": "eval:doc.enable_sales_invoice",
+      "description": "Requires Sales Invoice creation to be enabled."
     },
     {
       "fieldname": "column_break_cn_settings",
@@ -555,7 +560,7 @@
     {
       "fieldname": "section_cn_series",
       "fieldtype": "Section Break",
-      "label": "Credit Note Naming Series",
+      "label": "Naming Series",
       "depends_on": "eval:doc.enable_credit_note && doc.credit_note_creation == 'Auto'"
     },
     {
@@ -567,11 +572,15 @@
     },
 
     {
+      "fieldname": "tab_compliance",
+      "fieldtype": "Tab Break",
+      "label": "Compliance"
+    },
+    {
       "fieldname": "section_e_compliance",
       "fieldtype": "Section Break",
-      "label": "E-Compliance (India GST)",
-      "depends_on": "eval:doc.enable_sales_invoice",
-      "description": "Requires the <b>India Compliance</b> app. After the Sales Invoice is submitted, automatically trigger e-Invoice and/or e-Waybill generation via the IRP portal.<br><br>Each document is processed in a separate background job — a portal error or timeout never blocks or reverses the Sales Invoice.<br><br><b>Prerequisite:</b> <i>Auto-Submit Sales Invoice</i> must be enabled — e-Invoice and e-Waybill can only be generated for submitted documents.<br><br>India Compliance handles per-company eligibility internally (applicable companies list, turnover threshold, B2B/B2C) — ineligible invoices are skipped silently."
+      "label": "e-Invoice & e-Waybill (India GST)",
+      "description": "Requires the <b>India Compliance</b> app. After the Sales Invoice is submitted, automatically trigger e-Invoice and/or e-Waybill generation via the IRP portal.<br><br>Each document is processed in a separate background job — a portal error or timeout never blocks or reverses the Sales Invoice.<br><br><b>Prerequisites:</b><br>1. Sales Invoice creation must be enabled on the <b>Sales Invoice</b> tab.<br>2. <i>Auto-Submit Sales Invoice</i> must be enabled — e-Invoice and e-Waybill can only be generated for submitted documents.<br><br>India Compliance handles per-company eligibility internally (applicable companies list, turnover threshold, B2B/B2C) — ineligible invoices are skipped silently."
     },
     {
       "default": "0",
@@ -595,15 +604,15 @@
     },
 
     {
-      "fieldname": "tab_notifications",
+      "fieldname": "tab_advanced",
       "fieldtype": "Tab Break",
-      "label": "Notifications"
+      "label": "Advanced"
     },
     {
       "fieldname": "section_failure",
       "fieldtype": "Section Break",
       "label": "Failure Alerts",
-      "description": "Email addresses to notify when automation fails. Covers two scenarios:<br>1. <b>Sales Order creation failure</b> — any error during order processing.<br>2. <b>Payment Entry failure</b> — when the Sales Order was created successfully but payment processing failed and requires manual attention."
+      "description": "Email addresses to notify when automation fails. Covers three scenarios:<br>1. <b>Sales Order creation failure</b> — any error during order processing.<br>2. <b>Payment Entry failure</b> — Sales Order created but payment failed; requires manual attention.<br>3. <b>Sales Invoice failure</b> — Sales Order or Delivery Note processed but invoice creation failed; requires manual attention."
     },
     {
       "fieldname": "failure_email_to",
@@ -622,17 +631,17 @@
       "description": "Comma-separated list of addresses to CC."
     },
     {
+      "fieldname": "section_log_management",
+      "fieldtype": "Section Break",
+      "label": "Log Management",
+      "description": "Shopify Logs are created for every incoming webhook. Use the retention setting to automatically clean up old logs and keep the database lean."
+    },
+    {
       "fieldname": "shopify_log_retention_days",
       "fieldtype": "Int",
       "label": "Delete Shopify Logs After (Days)",
       "description": "Automatically delete Shopify Logs older than this many days. Leave blank or 0 to keep all logs.",
       "default": "0"
-    },
-
-    {
-      "fieldname": "tab_field_mapping",
-      "fieldtype": "Tab Break",
-      "label": "Field Mapping"
     },
     {
       "fieldname": "section_field_mapping",
@@ -652,7 +661,7 @@
   "is_single": 0,
   "issingle": 0,
   "links": [],
-  "modified": "2026-04-24 00:00:00.000000",
+  "modified": "2026-06-12 00:00:00.000000",
   "modified_by": "Administrator",
   "module": "Shopify Integration",
   "name": "Shopify Settings",
