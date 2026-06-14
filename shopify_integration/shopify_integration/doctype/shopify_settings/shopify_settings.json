@@ -600,7 +600,7 @@
       "fieldtype": "Check",
       "label": "Generate e-Waybill",
       "depends_on": "eval:doc.enable_sales_invoice",
-      "description": "Calls <code>generate_e_waybill()</code> from India Compliance after the Sales Invoice is submitted. Generates Part A of the e-Waybill — update Part B (transporter / vehicle details) manually once the shipment is assigned."
+      "description": "Calls <code>generate_e_waybill()</code> from India Compliance after the Sales Invoice is submitted.<br><br><b>After Delivery Note trigger:</b> The Delivery Note is already created before the SI, so transporter details (Vehicle No, LR No, Transporter ID) are available. If those fields are filled on the DN, India Compliance includes Part B automatically — no manual step needed.<br><br><b>After Payment Entry trigger:</b> The SI is created before any Delivery Note, so the shipment hasn't been dispatched yet. Part B (transporter / vehicle details) must be updated manually on the Sales Invoice once the shipment is assigned."
     },
 
     {
