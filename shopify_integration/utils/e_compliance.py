@@ -20,6 +20,8 @@ Background jobs (called by RQ worker):
   _generate_e_waybill(si_name)
 """
 
+import time
+
 import frappe
 
 
@@ -107,16 +109,37 @@ def _generate_e_invoice(si_name: str) -> None:
         )
         return
 
-    try:
-        generate_e_invoice(si_name, throw=False)
-        frappe.logger().info(
-            f"Shopify: e-Invoice generation triggered for Sales Invoice {si_name}"
-        )
-    except Exception:
-        frappe.log_error(
-            frappe.get_traceback(),
-            f"Shopify: e-Invoice Generation Failed — {si_name}",
-        )
+    _MAX_RETRIES = 3
+    for _attempt in range(_MAX_RETRIES):
+        try:
+            generate_e_invoice(si_name, throw=False)
+            frappe.logger().info(
+                f"Shopify: e-Invoice generation triggered for Sales Invoice {si_name}"
+            )
+            break
+        except frappe.QueryDeadlockError:
+            if _attempt >= _MAX_RETRIES - 1:
+                frappe.log_error(
+                    frappe.get_traceback(),
+                    f"Shopify: e-Invoice Generation Failed (deadlock) — {si_name}",
+                )
+                break
+            frappe.db.rollback()
+            time.sleep(0.5 * (_attempt + 1))
+            # IRP call may have succeeded before the deadlock hit db_set.
+            # Re-read irn — if now set, India Compliance wrote it in another
+            # transaction; nothing more to do.
+            if frappe.db.get_value("Sales Invoice", si_name, "irn"):
+                frappe.logger().info(
+                    f"Shopify: e-Invoice deadlock resolved for {si_name} — IRN now present"
+                )
+                break
+        except Exception:
+            frappe.log_error(
+                frappe.get_traceback(),
+                f"Shopify: e-Invoice Generation Failed — {si_name}",
+            )
+            break
 
 
 def _generate_e_waybill(si_name: str) -> None:
@@ -153,13 +176,37 @@ def _generate_e_waybill(si_name: str) -> None:
         )
         return
 
-    try:
-        generate_e_waybill(doctype="Sales Invoice", docname=si_name)
-        frappe.logger().info(
-            f"Shopify: e-Waybill generation triggered for Sales Invoice {si_name}"
-        )
-    except Exception:
-        frappe.log_error(
-            frappe.get_traceback(),
-            f"Shopify: e-Waybill Generation Failed — {si_name}",
-        )
+    _MAX_RETRIES = 3
+    for _attempt in range(_MAX_RETRIES):
+        try:
+            generate_e_waybill(doctype="Sales Invoice", docname=si_name)
+            frappe.logger().info(
+                f"Shopify: e-Waybill generation triggered for Sales Invoice {si_name}"
+            )
+            break
+        except frappe.QueryDeadlockError:
+            if _attempt >= _MAX_RETRIES - 1:
+                frappe.log_error(
+                    frappe.get_traceback(),
+                    f"Shopify: e-Waybill Generation Failed (deadlock) — {si_name}",
+                )
+                break
+            frappe.db.rollback()
+            time.sleep(0.5 * (_attempt + 1))
+            # The IRP call may have succeeded before the deadlock hit db_set.
+            # If an E Waybill Log now exists, the result was committed in another
+            # transaction — safe to stop retrying.
+            if frappe.db.exists(
+                "E Waybill Log",
+                {"reference_name": si_name, "doctype_name": "Sales Invoice"},
+            ):
+                frappe.logger().info(
+                    f"Shopify: e-Waybill deadlock resolved for {si_name} — E Waybill Log now exists"
+                )
+                break
+        except Exception:
+            frappe.log_error(
+                frappe.get_traceback(),
+                f"Shopify: e-Waybill Generation Failed — {si_name}",
+            )
+            break
