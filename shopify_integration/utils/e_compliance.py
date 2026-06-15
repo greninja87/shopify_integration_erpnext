@@ -55,11 +55,24 @@ def _generate_e_invoice(si_name: str) -> None:
     """
     Background job: generate an e-Invoice for a submitted Sales Invoice.
 
-    Calls India Compliance's generate_e_invoice() with throw=False so invoices
-    that are ineligible (company not enrolled, B2C customer, below threshold)
-    exit silently without writing to the Error Log.  Real portal errors are
-    caught and logged separately.
+    e-Invoice is only applicable to B2B transactions (customer has a GSTIN).
+    We check gst_category on the SI before calling India Compliance so we
+    never create an Integration Request log for ineligible B2C invoices.
     """
+    si_data = frappe.db.get_value(
+        "Sales Invoice", si_name, ["gst_category", "billing_address_gstin"], as_dict=True
+    )
+    if not si_data:
+        return
+
+    # e-Invoice is only for B2B (registered buyers with GSTIN).
+    # B2C Large, B2C Small, and Unregistered are all ineligible.
+    if (si_data.gst_category or "") not in ("B2B", "SEZ With Payment", "SEZ Without Payment", "Deemed Export"):
+        frappe.logger().info(
+            f"Shopify: e-Invoice skipped for {si_name} — gst_category is '{si_data.gst_category}' (not B2B)"
+        )
+        return
+
     try:
         from india_compliance.gst_india.utils.e_invoice import generate_e_invoice
     except ImportError:
@@ -86,14 +99,29 @@ def _generate_e_waybill(si_name: str) -> None:
     """
     Background job: generate an e-Waybill for a submitted Sales Invoice.
 
-    Generates Part A of the e-Waybill (shipment details).  Part B (transporter /
-    vehicle details) must be updated manually via the e-Waybill menu on the SI
-    form once the shipment is assigned.
+    e-Waybill is mandatory when taxable value of goods > ₹50,000 and goods
+    are being transported.  It applies to both B2B and B2C transactions above
+    that threshold — India Compliance validates eligibility internally.
 
-    India Compliance checks e-waybill eligibility internally (value threshold,
-    inter/intra-state, etc.) — ineligible documents raise an exception which is
-    caught and logged.
+    We pre-check the grand_total so we don't hit the IRP portal for small
+    invoices that are clearly below the ₹50,000 threshold.
     """
+    si_data = frappe.db.get_value(
+        "Sales Invoice", si_name, ["grand_total", "currency"], as_dict=True
+    )
+    if not si_data:
+        return
+
+    # Skip IRP call for invoices clearly below the ₹50,000 threshold.
+    # India Compliance will still enforce the exact taxable-value check;
+    # this is just a cheap early exit for small Shopify orders.
+    if (si_data.currency or "INR") == "INR" and (si_data.grand_total or 0) < 50000:
+        frappe.logger().info(
+            f"Shopify: e-Waybill skipped for {si_name} — grand_total "
+            f"₹{si_data.grand_total} is below ₹50,000 threshold"
+        )
+        return
+
     try:
         from india_compliance.gst_india.utils.e_waybill import generate_e_waybill
     except ImportError:
