@@ -58,9 +58,10 @@ def _process_store(settings):
       - Delivery Note is submitted (docstatus = 1)
       - At least one DN item links back to a submitted Sales Order whose
         shopify_store matches this settings record
-      - The DN's posting_date + posting_time is at least si_dn_delay_hours ago
-        (posting_date/time is stable — unlike modified, it does not reset when
-        transporter details or e-Waybill fields are updated post-submission)
+      - An Activity Log 'Submit' entry for the DN exists and is at least
+        si_dn_delay_hours old — this is the true submission timestamp,
+        unaffected by any post-submit edits (transporter details, e-Waybill
+        fields, posting time corrections, etc.)
       - No submitted (or draft) Sales Invoice already references this DN
     """
     delay_hours = int(settings.get("si_dn_delay_hours") or 0)
@@ -75,7 +76,13 @@ def _process_store(settings):
           AND dn.is_return  = 0
           AND so.docstatus  = 1
           AND so.shopify_store = %(store)s
-          AND TIMESTAMPDIFF(HOUR, TIMESTAMP(dn.posting_date, dn.posting_time), NOW()) >= %(delay_hours)s
+          AND EXISTS (
+              SELECT 1 FROM `tabActivity Log` al
+              WHERE al.reference_doctype = 'Delivery Note'
+                AND al.reference_name = dn.name
+                AND al.operation = 'Submit'
+                AND TIMESTAMPDIFF(HOUR, al.creation, NOW()) >= %(delay_hours)s
+          )
           AND NOT EXISTS (
               SELECT 1
               FROM `tabSales Invoice Item` sii

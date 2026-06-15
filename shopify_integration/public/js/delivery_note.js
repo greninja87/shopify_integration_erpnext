@@ -10,7 +10,7 @@ frappe.ui.form.on('Delivery Note', {
             let msg;
 
             if (!isSubmitted) {
-                // Draft DN — just inform the user what will happen on submit
+                // Draft DN — inform the user what will happen on submit
                 if (info.si_timing === 'Immediate') {
                     msg = __('<b>Shopify Order:</b> The Sales Invoice will be created automatically when this Delivery Note is submitted.');
                 } else if (info.delay_hours > 0) {
@@ -21,11 +21,11 @@ frappe.ui.form.on('Delivery Note', {
             } else {
                 // Submitted DN, SI not yet created — pending or failed
                 if (info.si_timing === 'Immediate') {
-                    msg = __('<b>Shopify Order:</b> Sales Invoice auto-creation may be pending or has failed. Use <b>Shopify &rarr; Create Sales Invoice</b> below to create it now.');
+                    msg = __('<b>Shopify Order:</b> Sales Invoice auto-creation may be pending or has failed. Use <b>Create &rarr; Sales Invoice</b> to create it manually.');
                 } else if (info.delay_hours > 0) {
-                    msg = __('<b>Shopify Order:</b> Sales Invoice will be auto-generated {0} hour(s) after submission. Use <b>Shopify &rarr; Create Sales Invoice</b> to create it immediately.', [info.delay_hours]);
+                    msg = __('<b>Shopify Order:</b> Sales Invoice will be auto-generated {0} hour(s) after submission. Use <b>Create &rarr; Sales Invoice</b> to create it immediately.', [info.delay_hours]);
                 } else {
-                    msg = __('<b>Shopify Order:</b> Sales Invoice auto-creation is pending (next scheduler run). Use <b>Shopify &rarr; Create Sales Invoice</b> to create it now.');
+                    msg = __('<b>Shopify Order:</b> Sales Invoice auto-creation is pending (next scheduler run). Use <b>Create &rarr; Sales Invoice</b> to create it now.');
                 }
             }
 
@@ -34,33 +34,6 @@ frappe.ui.form.on('Delivery Note', {
                 '<div style="padding-right:40px;display:block;line-height:1.5;">' + msg + '</div>',
                 'yellow'
             );
-
-            if (isSubmitted) {
-                frm.add_custom_button(__('Create Sales Invoice'), function() {
-                    frappe.dom.freeze(__('Queuing Sales Invoice creation...'));
-                    frappe.xcall(
-                        'shopify_integration.utils.sales_invoice.create_si_from_dn_manual',
-                        { dn_name: frm.doc.name }
-                    ).then(function(result) {
-                        frappe.dom.unfreeze();
-                        if (result.already_exists) {
-                            frappe.msgprint({
-                                title: __('Sales Invoice Already Exists'),
-                                message: __('Sales Invoice <b>{0}</b> already exists for this Delivery Note.', [result.si_name]),
-                                indicator: 'blue',
-                            });
-                            frm.reload_doc();
-                        } else if (result.queued) {
-                            frappe.show_alert({
-                                message: __('Sales Invoice creation has been queued. Reload in a few seconds.'),
-                                indicator: 'green',
-                            }, 6);
-                        }
-                    }).catch(function() {
-                        frappe.dom.unfreeze();
-                    });
-                }, __('Shopify'));
-            }
         });
     }
 });
