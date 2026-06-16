@@ -329,8 +329,22 @@ def create_sales_invoice_from_so(so, settings, pe_name: str = None) -> str:
 
     if settings.get("auto_submit_sales_invoice"):
         si.flags.ignore_permissions = True
-        si.submit()
-        _trigger_e_compliance(si.name, settings)
+        _MAX_SUBMIT_RETRIES = 3
+        try:
+            for _attempt in range(_MAX_SUBMIT_RETRIES):
+                try:
+                    si.submit()
+                    break
+                except frappe.QueryDeadlockError:
+                    if _attempt >= _MAX_SUBMIT_RETRIES - 1:
+                        raise
+                    frappe.db.rollback()
+                    time.sleep(0.4 * (_attempt + 1))
+                    si.reload()
+            _trigger_e_compliance(si.name, settings)
+        except Exception:
+            _cleanup_draft_si(si.name)
+            raise
 
     frappe.db.commit()  # nosemgrep: frappe-manual-commit — runs in background job; SI must persist for advance allocation
     return si.name
@@ -398,23 +412,56 @@ def create_sales_invoice_from_dn(dn_name: str, settings) -> str:
     if settings.get("auto_submit_sales_invoice"):
         si.flags.ignore_permissions = True
         _MAX_SUBMIT_RETRIES = 3
-        for _attempt in range(_MAX_SUBMIT_RETRIES):
-            try:
-                si.submit()
-                break
-            except frappe.QueryDeadlockError:
-                if _attempt >= _MAX_SUBMIT_RETRIES - 1:
-                    raise
-                frappe.db.rollback()
-                time.sleep(0.4 * (_attempt + 1))
-                si.reload()
-        _trigger_e_compliance(si.name, settings)
+        try:
+            for _attempt in range(_MAX_SUBMIT_RETRIES):
+                try:
+                    si.submit()
+                    break
+                except frappe.QueryDeadlockError:
+                    if _attempt >= _MAX_SUBMIT_RETRIES - 1:
+                        raise
+                    frappe.db.rollback()
+                    time.sleep(0.4 * (_attempt + 1))
+                    si.reload()
+            _trigger_e_compliance(si.name, settings)
+        except Exception:
+            _cleanup_draft_si(si.name)
+            raise
 
     frappe.db.commit()  # nosemgrep: frappe-manual-commit — runs in scheduler/background job; SI must persist independently
     return si.name
 
 
 # ── Private helpers ────────────────────────────────────────────────────────────
+
+def _cleanup_draft_si(si_name: str) -> None:
+    """
+    Delete a committed draft SI (docstatus=0) after a failed submit.
+
+    Without this, the draft satisfies the NOT EXISTS guard in the scheduler SQL
+    (si.docstatus != 2 matches docstatus=0) and permanently prevents the DN
+    from being billed on any future scheduler run.
+
+    Logs an Error Log entry if deletion fails so the operator can delete manually.
+    """
+    try:
+        frappe.db.rollback()  # discard any partial state from the failed submit
+        if frappe.db.get_value("Sales Invoice", si_name, "docstatus") == 0:
+            frappe.delete_doc(
+                "Sales Invoice", si_name,
+                force=True,
+                ignore_permissions=True,
+            )
+            frappe.db.commit()  # nosemgrep: frappe-manual-commit — cleanup after draft SI deletion
+            frappe.logger().info(
+                f"Shopify: deleted orphaned draft Sales Invoice {si_name} — DN is now unblocked"
+            )
+    except Exception:
+        frappe.log_error(
+            frappe.get_traceback(),
+            f"Shopify: Could not delete draft Sales Invoice {si_name} — delete it manually to unblock the DN",
+        )
+
 
 def _trigger_e_compliance(si_name: str, settings) -> None:
     """Enqueue e-Invoice / e-Waybill jobs if either flag is on in settings."""
