@@ -67,12 +67,28 @@ def _generate_e_invoice(si_name: str) -> None:
     Background job: generate an e-Invoice for a submitted Sales Invoice.
 
     Guards:
-    - Skips B2C invoices (gst_category not in B2B / SEZ / Deemed Export) — IRP
-      rejects these and India Compliance would create a spurious Integration Request.
+    - Skips categories that are definitively ineligible for e-Invoice under Indian
+      GST law (B2C, composition dealers, consumers).  Everything else is forwarded
+      to India Compliance's generate_e_invoice(throw=False), which enforces its own
+      eligibility rules — so new IC categories (e.g. "Overseas") work automatically
+      without code changes here.
     - Skips if an IRN is already set on the SI, meaning India Compliance's own
       auto_generate_e_invoice hook already ran.  This prevents duplicate IRP calls
       when both Shopify Settings and GST Settings auto-generation are enabled.
     """
+    # Categories that are definitively NOT eligible for e-Invoice.
+    # Inverting to a blocklist (vs. an allowlist) means any new eligible IC
+    # category works automatically without updating this file.
+    #   • Unregistered / Consumer → B2C; IRP rejects outright.
+    #   • Registered Composition → composition dealers are exempt from e-invoicing.
+    #   • UIN Holders → embassies/UN bodies; not required to generate e-Invoice.
+    _INELIGIBLE = frozenset({
+        "Unregistered",
+        "Registered Composition",
+        "Consumer",
+        "UIN Holders",
+    })
+
     si_data = frappe.db.get_value(
         "Sales Invoice",
         si_name,
@@ -82,10 +98,8 @@ def _generate_e_invoice(si_name: str) -> None:
     if not si_data:
         return
 
-    # Only B2B transactions are eligible for e-Invoice.
-    if (si_data.gst_category or "") not in (
-        "B2B", "SEZ With Payment", "SEZ Without Payment", "Deemed Export"
-    ):
+    category = (si_data.gst_category or "").strip()
+    if not category or category in _INELIGIBLE:
         frappe.logger().info(
             f"Shopify: e-Invoice skipped for {si_name} — "
             f"gst_category '{si_data.gst_category}' is not eligible"
