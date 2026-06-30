@@ -196,6 +196,21 @@ def create_sales_order_from_shopify(order: dict, settings):
 
     customer_billing_address = gst_billing_addr or ""
 
+    # If address resolution failed entirely (create failed AND no existing linked
+    # address was found), surface a clear error now rather than letting the SO
+    # fail later with a cryptic "shipping_address_name" MandatoryError.
+    # This also gives the operator a meaningful message to act on: fix the address
+    # in ERPNext (link a correct Address to the customer) and retry the Shopify Log.
+    if not customer_billing_address and billing_addr:
+        frappe.throw(
+            f"Could not resolve a billing address for Shopify order {shopify_order_name} "
+            f"(customer: {customer_name}). "
+            "Check Error Log → 'Shopify: Address Creation Failed' for the root cause. "
+            "Fix: open the Customer in ERPNext, manually add the correct billing address, "
+            "then retry this Shopify Log.",
+            frappe.ValidationError,
+        )
+
     # Shipping:
     #   When shipping != billing → find or create from this order's shipping_addr
     #   When shipping == billing → reuse the billing address (mark it as shipping)

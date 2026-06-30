@@ -516,16 +516,26 @@ def _normalise_gst_state(province: str) -> str:
     Most state names are identical in Shopify and IC; only the edge cases where
     the Shopify name diverges from the IC-registered canonical name are listed.
     """
+    # India Compliance uses the post-2020 merged UT name for state code 26.
+    # All Shopify variants — old standalone name, combined name, abbreviations —
+    # must map to exactly this string or the Address insert fails gst_state validation.
+    _DNHDD = "Dadra and Nagar Haveli and Daman and Diu"
+
     _PROVINCE_TO_GST_STATE = {
-        # Shopify sends the old undivided state name for the UT merger
-        "dadra and nagar haveli and daman and diu": "Dadra and Nagar Haveli",
-        "dadra & nagar haveli and daman & diu":     "Dadra and Nagar Haveli",
-        # Shopify may send abbreviated conjunctions
-        "jammu & kashmir":                          "Jammu and Kashmir",
-        "andaman & nicobar islands":                "Andaman and Nicobar Islands",
-        "andaman and nicobar":                      "Andaman and Nicobar Islands",
-        "d & nh":                                   "Dadra and Nagar Haveli",
-        "d&nh":                                     "Dadra and Nagar Haveli",
+        # Shopify sends the OLD standalone UT name (pre-merger) — the most common case
+        "dadra and nagar haveli":               _DNHDD,
+        "daman and diu":                        _DNHDD,
+        "daman & diu":                          _DNHDD,
+        # Shopify may send the combined post-merger name
+        "dadra and nagar haveli and daman and diu": _DNHDD,
+        "dadra & nagar haveli and daman & diu":     _DNHDD,
+        # Abbreviated forms
+        "d & nh":                               _DNHDD,
+        "d&nh":                                 _DNHDD,
+        # Other abbreviated conjunctions
+        "jammu & kashmir":                      "Jammu and Kashmir",
+        "andaman & nicobar islands":            "Andaman and Nicobar Islands",
+        "andaman and nicobar":                  "Andaman and Nicobar Islands",
     }
     if not province:
         return ""

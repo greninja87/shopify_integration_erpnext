@@ -39,7 +39,10 @@ _STATE_CODE_MAP = {
     "16": "Tripura", "17": "Meghalaya", "18": "Assam",
     "19": "West Bengal", "20": "Jharkhand", "21": "Odisha",
     "22": "Chhattisgarh", "23": "Madhya Pradesh", "24": "Gujarat",
-    "25": "Daman and Diu", "26": "Dadra and Nagar Haveli", "27": "Maharashtra",
+    # Codes 25 (Daman and Diu) and 26 (Dadra and NH) merged in 2020.
+    # IC's gst_state field uses the combined name for both codes.
+    "25": "Dadra and Nagar Haveli and Daman and Diu",
+    "26": "Dadra and Nagar Haveli and Daman and Diu", "27": "Maharashtra",
     "28": "Andhra Pradesh", "29": "Karnataka", "30": "Goa",
     "31": "Lakshadweep", "32": "Kerala", "33": "Tamil Nadu",
     "34": "Puducherry", "35": "Andaman and Nicobar Islands",
