@@ -323,28 +323,41 @@ def create_sales_invoice_from_so(so, settings, pe_name: str = None) -> str:
     # linked to this Sales Invoice on submit.
     si.allocate_advances_automatically = 1
 
+    # ── Permission workaround: account_perm_check on insert/submit (ERPNext v15) ──
+    # Same limitation as the so_to_si() mapper call above: insert()/submit() run
+    # validate() → set_payment_schedule() → get_party_account_currency() →
+    # account_perm_check(account), which resolves permission from
+    # frappe.session.user and ignores si.flags.ignore_permissions. Swap the
+    # session user to Administrator for the duration (see sales_order.py for
+    # the full explanation of this upstream ERPNext v15 regression).
     si.flags.ignore_permissions = True
-    si.insert()
-    frappe.db.commit()  # nosemgrep: frappe-manual-commit — isolates insert from submit transaction so deadlock retries are safe
+    _prev_user = frappe.session.user
+    try:
+        if frappe.session.user in ("Guest", None, ""):
+            frappe.session.user = "Administrator"
+        si.insert()
+        frappe.db.commit()  # nosemgrep: frappe-manual-commit — isolates insert from submit transaction so deadlock retries are safe
 
-    if settings.get("auto_submit_sales_invoice"):
-        si.flags.ignore_permissions = True
-        _MAX_SUBMIT_RETRIES = 3
-        try:
-            for _attempt in range(_MAX_SUBMIT_RETRIES):
-                try:
-                    si.submit()
-                    break
-                except frappe.QueryDeadlockError:
-                    if _attempt >= _MAX_SUBMIT_RETRIES - 1:
-                        raise
-                    frappe.db.rollback()
-                    time.sleep(0.4 * (_attempt + 1))
-                    si.reload()
-            _trigger_e_compliance(si.name, settings)
-        except Exception:
-            _cleanup_draft_si(si.name)
-            raise
+        if settings.get("auto_submit_sales_invoice"):
+            si.flags.ignore_permissions = True
+            _MAX_SUBMIT_RETRIES = 3
+            try:
+                for _attempt in range(_MAX_SUBMIT_RETRIES):
+                    try:
+                        si.submit()
+                        break
+                    except frappe.QueryDeadlockError:
+                        if _attempt >= _MAX_SUBMIT_RETRIES - 1:
+                            raise
+                        frappe.db.rollback()
+                        time.sleep(0.4 * (_attempt + 1))
+                        si.reload()
+                _trigger_e_compliance(si.name, settings)
+            except Exception:
+                _cleanup_draft_si(si.name)
+                raise
+    finally:
+        frappe.session.user = _prev_user
 
     frappe.db.commit()  # nosemgrep: frappe-manual-commit — runs in background job; SI must persist for advance allocation
     return si.name
@@ -405,28 +418,37 @@ def create_sales_invoice_from_dn(dn_name: str, settings) -> str:
     # linked to the Sales Order is automatically allocated to this SI.
     si.allocate_advances_automatically = 1
 
+    # Permission workaround: account_perm_check on insert/submit — see the
+    # matching block in create_sales_invoice_from_so() above for the full
+    # explanation of this upstream ERPNext v15 regression.
     si.flags.ignore_permissions = True
-    si.insert()
-    frappe.db.commit()  # nosemgrep: frappe-manual-commit — isolates insert from submit transaction so deadlock retries are safe
+    _prev_user = frappe.session.user
+    try:
+        if frappe.session.user in ("Guest", None, ""):
+            frappe.session.user = "Administrator"
+        si.insert()
+        frappe.db.commit()  # nosemgrep: frappe-manual-commit — isolates insert from submit transaction so deadlock retries are safe
 
-    if settings.get("auto_submit_sales_invoice"):
-        si.flags.ignore_permissions = True
-        _MAX_SUBMIT_RETRIES = 3
-        try:
-            for _attempt in range(_MAX_SUBMIT_RETRIES):
-                try:
-                    si.submit()
-                    break
-                except frappe.QueryDeadlockError:
-                    if _attempt >= _MAX_SUBMIT_RETRIES - 1:
-                        raise
-                    frappe.db.rollback()
-                    time.sleep(0.4 * (_attempt + 1))
-                    si.reload()
-            _trigger_e_compliance(si.name, settings)
-        except Exception:
-            _cleanup_draft_si(si.name)
-            raise
+        if settings.get("auto_submit_sales_invoice"):
+            si.flags.ignore_permissions = True
+            _MAX_SUBMIT_RETRIES = 3
+            try:
+                for _attempt in range(_MAX_SUBMIT_RETRIES):
+                    try:
+                        si.submit()
+                        break
+                    except frappe.QueryDeadlockError:
+                        if _attempt >= _MAX_SUBMIT_RETRIES - 1:
+                            raise
+                        frappe.db.rollback()
+                        time.sleep(0.4 * (_attempt + 1))
+                        si.reload()
+                _trigger_e_compliance(si.name, settings)
+            except Exception:
+                _cleanup_draft_si(si.name)
+                raise
+    finally:
+        frappe.session.user = _prev_user
 
     frappe.db.commit()  # nosemgrep: frappe-manual-commit — runs in scheduler/background job; SI must persist independently
     return si.name

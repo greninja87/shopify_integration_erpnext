@@ -113,12 +113,23 @@ def create_credit_note_from_shopify_refund(refund_data: dict, settings) -> str:
         for item in cn.items:
             item.cost_center = settings.cost_center
 
+    # Permission workaround: account_perm_check on insert/submit — insert()/
+    # submit() run validate() → set_payment_schedule() → account_perm_check(),
+    # which resolves permission from frappe.session.user and ignores
+    # cn.flags.ignore_permissions (upstream ERPNext v15 regression — see the
+    # detailed explanation in sales_order.py).
     cn.flags.ignore_permissions = True
-    cn.insert()
+    _prev_user = frappe.session.user
+    try:
+        if frappe.session.user in ("Guest", None, ""):
+            frappe.session.user = "Administrator"
+        cn.insert()
 
-    if settings.get("auto_submit_credit_note"):
-        cn.flags.ignore_permissions = True
-        cn.submit()
+        if settings.get("auto_submit_credit_note"):
+            cn.flags.ignore_permissions = True
+            cn.submit()
+    finally:
+        frappe.session.user = _prev_user
 
     frappe.db.commit()  # nosemgrep: frappe-manual-commit — runs in background job; CN must persist independently
     return cn.name

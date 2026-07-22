@@ -399,21 +399,40 @@ def create_sales_order_from_shopify(order: dict, settings):
 
     # Insert — if the configured payment terms template generates duplicate due
     # dates, clear it and retry so the SO is not blocked.
+    #
+    # ── Permission workaround: account_perm_check on insert (ERPNext v15) ─────
+    # so.insert() runs validate() → set_payment_schedule() → get_party_account_currency()
+    # → get_party_account() → account_perm_check(account), which calls
+    # frappe.has_permission("Account", ..., account) against frappe.session.user.
+    # This does NOT honour so.flags.ignore_permissions (same limitation as the
+    # set_missing_values() call above — see the comment there). ERPNext added
+    # this check in accounts/party.py (upstream PR frappe/erpnext#56745,
+    # shipped in a v15 patch release) as a security hardening fix, and it now
+    # fires on every insert, not just set_missing_values(). Whether triggered
+    # by a live webhook (Guest session) or a manual Retry Order click (a real
+    # desk user who may not have Accounts-module read access), the session
+    # user must be swapped to Administrator for the duration of the insert.
+    _prev_session_user = frappe.session.user
     try:
-        so.insert()
-    except frappe.ValidationError as e:
-        if "duplicate due dates" in str(e).lower():
-            frappe.log_error(
-                f"Payment terms template '{so.payment_terms_template}' caused duplicate "
-                f"due dates for Shopify order {shopify_order_name}. "
-                "Retrying without payment terms.",
-                "Shopify: Payment Terms Warning"
-            )
-            so.payment_terms_template = ""
-            so.payment_schedule = []
+        if frappe.session.user in ("Guest", None, ""):
+            frappe.session.user = "Administrator"
+        try:
             so.insert()
-        else:
-            raise
+        except frappe.ValidationError as e:
+            if "duplicate due dates" in str(e).lower():
+                frappe.log_error(
+                    f"Payment terms template '{so.payment_terms_template}' caused duplicate "
+                    f"due dates for Shopify order {shopify_order_name}. "
+                    "Retrying without payment terms.",
+                    "Shopify: Payment Terms Warning"
+                )
+                so.payment_terms_template = ""
+                so.payment_schedule = []
+                so.insert()
+            else:
+                raise
+    finally:
+        frappe.session.user = _prev_session_user
 
     # Commit the draft SO before submitting.  Without this, a QueryDeadlockError
     # during submit causes frappe.db.rollback() to undo the insert as well —
@@ -429,7 +448,14 @@ def create_sales_order_from_shopify(order: dict, settings):
         diff = round(flt(shopify_total) - flt(so.grand_total), 2)
         if diff != 0:
             _absorb_paisa_on_submitted_doc(so, shopify_total)
-            so.save(ignore_permissions=True)
+            # save() re-runs validate() → account_perm_check — same swap as insert() above.
+            _prev_session_user = frappe.session.user
+            try:
+                if frappe.session.user in ("Guest", None, ""):
+                    frappe.session.user = "Administrator"
+                so.save(ignore_permissions=True)
+            finally:
+                frappe.session.user = _prev_session_user
 
     # ── 17. Submit or keep Draft ──────────────────────────────────────────────
     should_keep_draft = (
@@ -443,17 +469,24 @@ def create_sales_order_from_shopify(order: dict, settings):
         # orders processing concurrently touch the same item-warehouse bin,
         # MySQL optimistic locking raises error 1020.  The contention clears
         # within milliseconds — three attempts with a short backoff is enough.
-        _MAX_SUBMIT_RETRIES = 3
-        for _attempt in range(_MAX_SUBMIT_RETRIES):
-            try:
-                so.submit()
-                break
-            except frappe.QueryDeadlockError:
-                if _attempt >= _MAX_SUBMIT_RETRIES - 1:
-                    raise
-                frappe.db.rollback()
-                time.sleep(0.4 * (_attempt + 1))  # 0.4 s, 0.8 s
-                so.reload()
+        # submit() re-runs validate() → account_perm_check — same swap as insert() above.
+        _prev_session_user = frappe.session.user
+        try:
+            if frappe.session.user in ("Guest", None, ""):
+                frappe.session.user = "Administrator"
+            _MAX_SUBMIT_RETRIES = 3
+            for _attempt in range(_MAX_SUBMIT_RETRIES):
+                try:
+                    so.submit()
+                    break
+                except frappe.QueryDeadlockError:
+                    if _attempt >= _MAX_SUBMIT_RETRIES - 1:
+                        raise
+                    frappe.db.rollback()
+                    time.sleep(0.4 * (_attempt + 1))  # 0.4 s, 0.8 s
+                    so.reload()
+        finally:
+            frappe.session.user = _prev_session_user
 
     # ── 18. Payment Entry (optional — controlled by Shopify Settings) ─────────
     # Creates a Payment Entry against the submitted SO for paid/partially_paid
