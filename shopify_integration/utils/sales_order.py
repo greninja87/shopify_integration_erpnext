@@ -37,6 +37,12 @@ from shopify_integration.utils.item import (
 )
 
 
+# Beyond this many rupees, a Shopify-total vs Sales-Order-total difference is a
+# data problem (Shopify charged tax on top of the price), not rounding drift.
+# Crossing it triggers an Error Log entry AND a failure email.
+TOTAL_MISMATCH_TOLERANCE = 0.05
+
+
 # Maps Shopify financial_status → settings field name for payment terms
 PAYMENT_TERMS_MAP = {
     "paid":           "payment_terms_paid",
@@ -140,7 +146,11 @@ def create_sales_order_from_shopify(order: dict, settings):
         items.append(shipping_row)
 
     # ── 6. Reconcile totals so ERPNext grand_total == Shopify total_price ─────
-    adjust_rows_to_match_total(items, shopify_total)
+    # A material residual here means Shopify's total_price cannot be explained by
+    # the line items at all (typically Shopify charged tax on top of a price this
+    # app treats as tax-inclusive).  The SO is still created — but the residual is
+    # re-checked after insert and reported by email in step 18b.
+    pre_insert_residual = adjust_rows_to_match_total(items, shopify_total)
 
     # ── 7. Payment terms ───────────────────────────────────────────────────────
     terms_field   = PAYMENT_TERMS_MAP.get(financial_status, "payment_terms_pending")
@@ -444,6 +454,7 @@ def create_sales_order_from_shopify(order: dict, settings):
     # India Compliance splits 18% into 9%+9% and each rounds independently),
     # nudge the last row one more time and re-save.  This keeps SO grand_total
     # exactly equal to Shopify total_price.
+    total_mismatch = 0.0
     if shopify_total > 0:
         diff = round(flt(shopify_total) - flt(so.grand_total), 2)
         if diff != 0:
@@ -456,6 +467,11 @@ def create_sales_order_from_shopify(order: dict, settings):
                 so.save(ignore_permissions=True)
             finally:
                 frappe.session.user = _prev_session_user
+
+        # Re-check AFTER the absorber ran.  This diff used to be computed, acted
+        # on, and never verified — so an unreconcilable order produced a Sales
+        # Order for the wrong amount with no error raised anywhere.
+        total_mismatch = round(flt(shopify_total) - _so_payable_total(so), 2)
 
     # ── 17. Submit or keep Draft ──────────────────────────────────────────────
     should_keep_draft = (
@@ -505,6 +521,24 @@ def create_sales_order_from_shopify(order: dict, settings):
             tb = frappe.get_traceback()
             frappe.log_error(tb, f"Shopify: Payment Entry Failed — {so.name}")
             _send_payment_entry_failure_email(settings, order, so.name, tb)
+
+    # ── 18b. Total / payment mismatch alarm ──────────────────────────
+    # Runs on every order, including drafts and PE-disabled setups.  This is the
+    # single place that guarantees "money collected != Sales Order value" is never
+    # silent.  Never allowed to break the flow.
+    try:
+        _check_total_and_payment_mismatch(
+            so, order, settings,
+            pe_name=pe_name,
+            shopify_total=shopify_total,
+            total_mismatch=total_mismatch,
+            pre_insert_residual=pre_insert_residual,
+        )
+    except Exception:
+        frappe.log_error(
+            frappe.get_traceback(),
+            f"Shopify: Mismatch Check Failed — {so.name}",
+        )
 
     # ── 19. Sales Invoice — "After Payment Entry" flow (Option B) ─────────────
     # Trigger conditions (both must be true):
@@ -704,11 +738,33 @@ def _apply_field_mapping(so, order: dict, settings):
 
 
 def _get_nested_value(data: dict, path: str):
-    """Traverse a dot-separated path through a nested dict."""
+    """
+    Traverse a dot-separated path through the Shopify payload.
+
+    Dict keys are looked up by name; a numeric segment indexes into a list, so
+    values that live inside arrays are reachable from a Field Mapping row:
+
+        discount_applications.0.title  -> manual / staff-applied discount code
+        discount_codes.0.code          -> coupon-code discount
+        shipping_lines.0.title         -> shipping method name
+        note_attributes.0.value        -> cart attribute
+
+    Negative indices work too (`.-1.` for the last element).
+
+    Returns None when a key is missing, an index is out of range, or the path
+    tries to walk past a scalar.  _apply_field_mapping treats None as "leave
+    the target field alone", so an unmatched path is a no-op rather than an
+    error.
+    """
     val = data
     for key in path.split("."):
         if isinstance(val, dict):
             val = val.get(key)
+        elif isinstance(val, list) and key.lstrip("-").isdigit():
+            idx = int(key)
+            if not (-len(val) <= idx < len(val)):
+                return None
+            val = val[idx]
         else:
             return None
     return val
@@ -768,6 +824,238 @@ def send_failure_email(settings, order: dict, error_message: str):
         )
     except Exception:
         frappe.log_error(frappe.get_traceback(), "Shopify: Failure Email Send Error")
+
+
+# ── Total / payment mismatch detection ────────────────────────────
+
+def _so_payable_total(so) -> float:
+    """
+    The figure ERPNext actually settles a Payment Entry against:
+    rounded_total when rounding is enabled, else grand_total.
+    Mirrors the same derivation used in payment_entry.py.
+    """
+    return flt(so.get("rounded_total")) or flt(so.get("grand_total"))
+
+
+def _check_total_and_payment_mismatch(
+    so, order: dict, settings, pe_name: str,
+    shopify_total: float, total_mismatch: float,
+    pre_insert_residual: float = 0.0,
+):
+    """
+    Alarm when the money Shopify collected does not equal what the Sales Order
+    (and therefore the Payment Entry) is worth.
+
+    Two independent gaps are checked:
+
+      1. total_gap   = Shopify total_price - Sales Order payable total
+         Non-zero means the SO was written for the wrong amount.  The dominant
+         cause is a Shopify product with "Charge tax on this product" enabled
+         while store prices are GST-inclusive: Shopify adds GST on top, while
+         this app backs GST out of that same price.
+
+      2. payment_gap = Shopify amount paid - Payment Entry paid_amount
+         Non-zero means part of the received money was never recorded.
+
+    Either gap crossing TOTAL_MISMATCH_TOLERANCE writes an Error Log entry and
+    sends a failure email.  This function never raises.
+    """
+    so_total  = _so_payable_total(so)
+    total_gap = round(flt(total_mismatch), 2)
+
+    # What Shopify says it collected, using the same derivation the Payment
+    # Entry uses, so the two numbers are directly comparable.
+    try:
+        from shopify_integration.utils.payment_entry import _get_amount_paid
+        shopify_paid = flt(_get_amount_paid(order))
+    except Exception:
+        shopify_paid = round(
+            flt(order.get("total_price")) - flt(order.get("total_outstanding")), 2
+        )
+
+    pe_paid = 0.0
+    if pe_name:
+        pe_paid = flt(frappe.db.get_value("Payment Entry", pe_name, "paid_amount"))
+
+    # Only meaningful when a PE was actually created.
+    payment_gap = round(shopify_paid - pe_paid, 2) if pe_name else 0.0
+
+    if (abs(total_gap) <= TOTAL_MISMATCH_TOLERANCE
+            and abs(payment_gap) <= TOTAL_MISMATCH_TOLERANCE):
+        return
+
+    # ── Root-cause diagnostics ──────────────────────────────────
+    # `taxes_included` is a top-level boolean on the Shopify order payload.
+    # False + a non-zero total_tax is the signature of the tax-on-top case.
+    taxes_included = order.get("taxes_included")
+    shopify_tax    = flt(order.get("total_tax") or 0)
+    tax_on_top     = (taxes_included is False and shopify_tax > 0)
+
+    # Lead with the plain ERPNext-side statement: how the Payment Entry
+    # compares to the Sales Order.  That is the discrepancy the accounts team
+    # actually sees in ERPNext, so it belongs first.
+    pe_vs_so = round(pe_paid - so_total, 2) if pe_name else 0.0
+    if pe_name and pe_vs_so > TOTAL_MISMATCH_TOLERANCE:
+        lead = (
+            f"Payment Entry {pe_name} ({pe_paid:.2f}) is MORE than Sales Order "
+            f"{so.name} ({so_total:.2f}) in ERPNext - difference {pe_vs_so:.2f}. "
+        )
+    elif pe_name and pe_vs_so < -TOTAL_MISMATCH_TOLERANCE:
+        lead = (
+            f"Payment Entry {pe_name} ({pe_paid:.2f}) is LESS than Sales Order "
+            f"{so.name} ({so_total:.2f}) in ERPNext - difference "
+            f"{abs(pe_vs_so):.2f}. "
+        )
+    else:
+        lead = (
+            f"Shopify total ({flt(shopify_total):.2f}) does not match Sales "
+            f"Order {so.name} ({so_total:.2f}) in ERPNext. "
+        )
+
+    if tax_on_top:
+        likely_cause = (
+            lead +
+            "Shopify charged tax on top of the product price (total_tax = "
+            f"{shopify_tax:.2f}). Check whether this item was supposed to be "
+            "taxable in Shopify."
+        )
+    elif abs(total_gap) > TOTAL_MISMATCH_TOLERANCE:
+        likely_cause = (
+            lead +
+            "Shopify total_price does not equal the sum of "
+            "(price x qty - discount) over the line items plus shipping. Check "
+            "whether this item was supposed to be taxable in Shopify, and check "
+            "the payload for order-level discounts, tips, duties, gift cards or "
+            "refunds that this app does not currently map."
+        )
+    else:
+        likely_cause = (
+            lead +
+            "Sales Order total matches Shopify, but the Payment Entry amount "
+            "differs from what Shopify collected. Check the payment schedule / "
+            "payment terms template on the Sales Order."
+        )
+
+    detail = (
+        f"Shopify order      : {order.get('name')} (id {order.get('id')})\n"
+        f"Sales Order        : {so.name}\n"
+        f"Payment Entry      : {pe_name or '(none created)'}\n"
+        f"\n"
+        f"Shopify total_price      : {flt(shopify_total):.2f}\n"
+        f"Sales Order payable total: {so_total:.2f}\n"
+        f"  -> total_gap           : {total_gap:.2f}\n"
+        f"\n"
+        f"Shopify amount paid      : {shopify_paid:.2f}\n"
+        f"Payment Entry paid_amount: {pe_paid:.2f}\n"
+        f"  -> payment_gap         : {payment_gap:.2f}\n"
+        f"  -> PE minus Sales Order: {pe_vs_so:.2f}\n"
+        f"\n"
+        f"Shopify taxes_included   : {taxes_included}\n"
+        f"Shopify total_tax        : {shopify_tax:.2f}\n"
+        f"Rounding residual (pre-insert): {flt(pre_insert_residual):.2f}\n"
+        f"\n"
+        f"Likely cause: {likely_cause}"
+    )
+
+    frappe.log_error(detail, "Shopify: Payment / Order Total Mismatch")
+    _send_total_mismatch_email(
+        settings, order, so, pe_name,
+        shopify_total=flt(shopify_total),
+        so_total=so_total,
+        shopify_paid=shopify_paid,
+        pe_paid=pe_paid,
+        total_gap=total_gap,
+        payment_gap=payment_gap,
+        pe_vs_so=pe_vs_so,
+        taxes_included=taxes_included,
+        shopify_tax=shopify_tax,
+        likely_cause=likely_cause,
+    )
+
+
+def _send_total_mismatch_email(
+    settings, order: dict, so, pe_name: str,
+    shopify_total: float, so_total: float,
+    shopify_paid: float, pe_paid: float,
+    total_gap: float, payment_gap: float, pe_vs_so: float,
+    taxes_included, shopify_tax: float, likely_cause: str,
+):
+    """
+    Email the admin when payment received and Sales Order total disagree.
+    Reuses failure_email_to / failure_email_cc from Shopify Settings.
+    """
+    to_emails = (settings.get("failure_email_to") or "").strip()
+    if not to_emails:
+        return
+
+    order_name = order.get("name", "Unknown")
+    shop       = settings.get("shop_domain") or settings.get("store_name") or "Shopify"
+    cc_emails  = (settings.get("failure_email_cc") or "").strip()
+    cc_list    = [e.strip() for e in cc_emails.split(",") if e.strip()] if cc_emails else []
+    worst      = total_gap if abs(total_gap) >= abs(payment_gap) else payment_gap
+    subject    = (
+        f"[Shopify] Payment / Order total MISMATCH for {order_name} "
+        f"(off by \u20b9{abs(worst):.2f}) \u2014 {shop}"
+    )
+
+    def _row(label, value, highlight=False):
+        style = "color:#b91c1c;font-weight:bold;" if highlight else ""
+        return (f'<tr><td>{label}</td>'
+                f'<td style="text-align:right;{style}">&#8377;{value:,.2f}</td></tr>')
+
+    message = f"""
+    <p><b>Payment received and the Sales Order total do not match.</b>
+    Figures and likely cause below.</p>
+
+    <table border="0" cellpadding="5" style="font-family:Arial;font-size:13px;border-collapse:collapse;">
+      <tr><td><b>Shopify Order</b></td><td>{order_name}</td></tr>
+      <tr><td><b>Store</b></td><td>{shop}</td></tr>
+      <tr><td><b>Sales Order</b></td><td>{so.name}</td></tr>
+      <tr><td><b>Payment Entry</b></td><td>{pe_name or '<i>none created</i>'}</td></tr>
+      <tr><td><b>Customer</b></td><td>{so.customer}</td></tr>
+    </table>
+
+    <h4 style="margin-bottom:4px;">Order total</h4>
+    <table border="0" cellpadding="5" style="font-family:Arial;font-size:13px;border-collapse:collapse;">
+      {_row('Shopify total_price', shopify_total)}
+      {_row('Sales Order total', so_total)}
+      {_row('Difference', total_gap, highlight=abs(total_gap) > TOTAL_MISMATCH_TOLERANCE)}
+    </table>
+
+    <h4 style="margin-bottom:4px;">Payment</h4>
+    <table border="0" cellpadding="5" style="font-family:Arial;font-size:13px;border-collapse:collapse;">
+      {_row('Shopify amount paid', shopify_paid)}
+      {_row('Payment Entry recorded', pe_paid)}
+      {_row('Not recorded (Shopify minus PE)', payment_gap, highlight=abs(payment_gap) > TOTAL_MISMATCH_TOLERANCE)}
+      {_row('Sales Order total', so_total)}
+      {_row('Payment Entry minus Sales Order', pe_vs_so, highlight=abs(pe_vs_so) > TOTAL_MISMATCH_TOLERANCE)}
+    </table>
+
+    <h4 style="margin-bottom:4px;">Shopify tax flags</h4>
+    <table border="0" cellpadding="5" style="font-family:Arial;font-size:13px;border-collapse:collapse;">
+      <tr><td>taxes_included</td><td style="text-align:right;">{taxes_included}</td></tr>
+      <tr><td>total_tax</td><td style="text-align:right;">&#8377;{shopify_tax:,.2f}</td></tr>
+    </table>
+
+    <p><b>Likely cause</b></p>
+    <pre style="background:#fef2f2;padding:10px;border-left:4px solid #ef4444;font-size:12px;white-space:pre-wrap;">{likely_cause}</pre>
+
+    <p style="color:#6b7280;font-size:12px;">
+      Check whether this item was supposed to be taxable in Shopify, and fix
+      the product's tax setting there if it was not. The full payload is on
+      the Shopify Log.
+    </p>
+    """
+    try:
+        frappe.sendmail(
+            recipients=[e.strip() for e in to_emails.split(",") if e.strip()],
+            cc=cc_list,
+            subject=subject,
+            message=message,
+            delayed=False,
+        )
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), "Shopify: Mismatch Email Send Error")
 
 
 # ── Payment Entry failure email ───────────────────────────────────────────────

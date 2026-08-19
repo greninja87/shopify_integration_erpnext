@@ -167,6 +167,30 @@ def create_payment_entry_from_shopify(so, order: dict, settings) -> str:
     #   SO is referenced                                       (advance_paid updated)
     #   SI finds this PE via the SO-reference lookup in get_advance_payment_entries
 
+    # Shopify collected more than the SO is worth → the excess becomes an
+    # unallocated advance on this PE (by design, see the note below).  That is
+    # never allowed to be silent: log it so it is visible even when this PE is
+    # created outside the normal webhook flow.
+    # sales_order._check_total_and_payment_mismatch() also emails the admin.
+    shortfall = round(flt(amount_paid) - flt(so_outstanding), 2)
+    if shortfall > 0.05:
+        frappe.log_error(
+            "\n".join([
+                f"Shopify order {order.get('name')} collected "
+                f"{flt(amount_paid):.2f} but Sales Order {so.name} has only "
+                f"{flt(so_outstanding):.2f} outstanding "
+                f"(grand_total {flt(so.grand_total):.2f}).",
+                "",
+                f"{shortfall:.2f} will sit as an UNALLOCATED advance on the "
+                f"Payment Entry rather than against this order.",
+                "",
+                "Root cause is almost always a Sales Order total that does not "
+                "match Shopify's total_price. Check whether this item was "
+                "supposed to be taxable in Shopify.",
+            ]),
+            "Shopify: Payment Exceeds Sales Order Total",
+        )
+
     # We only allocate up to what's outstanding on the SO for the reference rows.
     remaining  = min(flt(amount_paid), flt(so_outstanding))
     kept_refs  = []

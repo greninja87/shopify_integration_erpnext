@@ -36,6 +36,13 @@ import frappe
 from frappe.utils import flt
 
 
+# Residual (₹) we are willing to accept from the rounding absorber.
+# Paise-level drift from double-rounding is normal and gets absorbed.  Anything
+# larger than this is NOT rounding — it means Shopify's total_price genuinely
+# disagrees with the line items, and the caller must raise an alarm.
+ROUNDING_ABSORB_TOLERANCE = 0.05
+
+
 # ── Public API ─────────────────────────────────────────────────────────────────
 
 def map_line_items(
@@ -187,7 +194,7 @@ def map_line_items(
 
 # ── Rounding reconciliation (items + shipping together) ───────────────────────
 
-def adjust_rows_to_match_total(so_rows: list, target_inclusive_total: float):
+def adjust_rows_to_match_total(so_rows: list, target_inclusive_total: float) -> float:
     """
     Mutate `so_rows` (list of dicts that each have `rate`, `qty`, `_tax_rate`)
     so that the sum of GST-inclusive line totals, as ERPNext would compute
@@ -215,7 +222,7 @@ def adjust_rows_to_match_total(so_rows: list, target_inclusive_total: float):
          we preserve original rates + log a warning.
     """
     if not so_rows or target_inclusive_total <= 0:
-        return
+        return 0.0
 
     target = round(flt(target_inclusive_total), 2)
     original_rates = [flt(r.get("rate")) for r in so_rows]
@@ -228,7 +235,7 @@ def adjust_rows_to_match_total(so_rows: list, target_inclusive_total: float):
             r["rate"] = orig
 
     if round(calc_total() - target, 2) == 0:
-        return
+        return 0.0
 
     # Safety: we only ever want to nudge rates by a small paise-level amount.
     # If Shopify's total_price disagrees with the sum of (price × qty − discount)
@@ -306,24 +313,65 @@ def adjust_rows_to_match_total(so_rows: list, target_inclusive_total: float):
             if best and best[0] == 0:
                 break
 
-    # Apply the winning combination; reset everything else to original.
+    # ── Apply the winning combination, or refuse it ────────────────────
+    # This absorber exists to kill paise-level rounding drift, nothing more.
+    # When the best achievable residual is still material, Shopify's total_price
+    # cannot be explained by (price × qty − discount) at all — the usual cause is
+    # a Shopify product with "Charge tax on this product" enabled on a store that
+    # is NOT tax-inclusive, so Shopify added tax ON TOP of a price this app
+    # treats as tax-inclusive.  A few paise of nudging cannot fix that, and
+    # applying a partial nudge silently corrupts an otherwise-correct rate.
+    # So: restore the original rates and hand the residual back to the caller.
     restore()
-    if best is not None:
+    residual = abs(round(calc_total() - target, 2))
+
+    if best is not None and best[0] <= ROUNDING_ABSORB_TOLERANCE:
         for idx, new_rate in best[1]:
             so_rows[idx]["rate"] = new_rate
-
-    # Log at DEBUG — rounding adjustments are expected normal behaviour
-    # (every Shopify order with GST will hit this path).  Using log_error()
-    # here would flood the ERPNext Error Log with non-error entries.
-    try:
-        frappe.logger("shopify_integration").debug(
-            f"Shopify rounding absorbed: target={target}, "
-            f"final_calc={calc_total():.2f}, "
-            f"adjustments={best[1] if best else None}, "
-            f"residual_diff={best[0] if best else None}"
+        residual = best[0]
+        # Log at DEBUG — rounding adjustments are expected normal behaviour
+        # (every Shopify order with GST will hit this path).  Using log_error()
+        # here would flood the ERPNext Error Log with non-error entries.
+        try:
+            frappe.logger("shopify_integration").debug(
+                f"Shopify rounding absorbed: target={target}, "
+                f"final_calc={calc_total():.2f}, "
+                f"adjustments={best[1]}, residual_diff={residual}"
+            )
+        except Exception:
+            pass
+    else:
+        # Original rates preserved on purpose — see the comment above.
+        rows_dump = [
+            {
+                "rate":     flt(r.get("rate")),
+                "qty":      flt(r.get("qty")),
+                "tax_rate": flt(r.get("_tax_rate") or 0),
+            }
+            for r in so_rows
+        ]
+        best_txt = f"{best[0]:.2f}" if best is not None else "n/a"
+        frappe.log_error(
+            "\n".join([
+                f"Shopify total_price ({target:.2f}) cannot be reconciled with "
+                f"the line items by paise-level rounding.",
+                f"  Computed inclusive total          : {calc_total():.2f}",
+                f"  Residual difference               : {residual:.2f}",
+                f"  Best within +/-{MAX_PAISE_PER_ROW} paise per row : {best_txt}",
+                "",
+                "Original rates preserved (no partial nudge applied).",
+                "",
+                "Most likely cause: the Shopify store is NOT tax-inclusive - the "
+                "product has 'Charge tax on this product' enabled, so Shopify "
+                "added tax on top of the price this app back-calculates tax "
+                "OUT of.",
+                "",
+                f"Rows: {rows_dump}",
+            ]),
+            "Shopify: Total Reconciliation Failed",
         )
-    except Exception:
-        pass
+
+    return residual
 
 
 def _erpnext_row_inclusive(row: dict) -> float:
