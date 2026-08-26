@@ -42,7 +42,21 @@ doc_events = {
     "Delivery Note": {
         # Immediate SI creation — enqueues a background job when si_dn_timing
         # is set to "Immediate" in Shopify Settings.  No-ops for all other DNs.
-        "on_submit": "shopify_integration.utils.sales_invoice.create_si_from_dn_on_submit",
+        #
+        # Immediate Shopify fulfillment — enqueues a background job when
+        # dn_fulfillment_timing is "Immediate".  No-ops for Manual/Scheduled
+        # stores and for every non-Shopify DN.  Both hooks are enqueue-only, so
+        # neither can slow down or fail a Delivery Note submission.
+        "on_submit": [
+            "shopify_integration.utils.sales_invoice.create_si_from_dn_on_submit",
+            "shopify_integration.utils.fulfillment.fulfil_on_dn_submit",
+        ],
+        # Cancelling a DN whose order was already fulfilled in Shopify leaves the
+        # two systems disagreeing.  Depending on the store's
+        # "On Delivery Note Cancel" setting this either cancels the Shopify
+        # fulfillment or logs the divergence loudly.  Enqueued after commit, so
+        # Shopify can never block the cancellation of a stock document.
+        "on_cancel": "shopify_integration.utils.fulfillment.handle_dn_cancel",
     },
 }
 
@@ -54,6 +68,11 @@ scheduler_events = {
         # "After Delivery Note" mode: find submitted DNs that have no SI yet
         # and create Sales Invoices for them.
         "shopify_integration.utils.scheduler.create_invoices_after_delivery_note",
+        # "Scheduled" fulfillment mode: fulfil Shopify orders for DNs submitted
+        # more than dn_fulfillment_delay_hours ago.  The delay is the window in
+        # which a wrong DN can be cancelled before Shopify is ever told.
+        # No-ops entirely while no store has enable_fulfillment set.
+        "shopify_integration.utils.scheduler.fulfil_submitted_delivery_notes",
     ],
     "daily": [
         # Delete Shopify Logs older than `shopify_log_retention_days` days.

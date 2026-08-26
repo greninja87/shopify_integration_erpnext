@@ -102,6 +102,11 @@ def map_line_items(
 
         raw.append({
             "title":          title,
+            # Shopify's own line_item.id.  Kept because order fulfillment has to
+            # target a specific line: one order can carry the same SKU on two
+            # line items (different discounts or line properties) and SKU alone
+            # cannot tell a fulfillment which of them shipped.
+            "line_item_id":   str(line.get("id") or ""),
             "qty":            qty,
             "unit_price":     unit_price,
             "item_total":     item_total,
@@ -179,6 +184,7 @@ def map_line_items(
         so_items.append({
             "item_code": item["item_code"],
             "item_name": item["item_name"],
+            "custom_shopify_line_item_id": r["line_item_id"],
             "qty":       qty,
             "rate":      rate,
             "price_list_rate": price_list_rate,

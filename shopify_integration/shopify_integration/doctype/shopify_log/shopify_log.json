@@ -15,6 +15,13 @@
     "erpnext_sales_order",
     "section_break_payload",
     "payload",
+    "section_break_correction",
+    "payload_correction_status",
+    "corrected_payload",
+    "correction_reason",
+    "column_break_correction",
+    "corrected_by",
+    "corrected_at",
     "section_break_error",
     "error_message"
   ],
@@ -84,6 +91,51 @@
       "description": "Full JSON received from Shopify"
     },
     {
+      "fieldname": "section_break_correction",
+      "fieldtype": "Section Break",
+      "label": "Corrected Payload",
+      "collapsible": 1,
+      "description": "Set when the original Shopify payload contained bad data (a wrong pincode, a malformed address) and was corrected so the order could be retried. The original Payload above is never modified — it stays as the record of what Shopify actually sent."
+    },
+    {
+      "fieldname": "payload_correction_status",
+      "fieldtype": "Data",
+      "label": "Correction",
+      "read_only": 1,
+      "in_list_view": 0,
+      "description": "Blank when the log is being replayed exactly as Shopify sent it."
+    },
+    {
+      "fieldname": "corrected_payload",
+      "fieldtype": "Long Text",
+      "label": "Corrected Payload",
+      "read_only": 1,
+      "description": "Used instead of Payload when Retry Order runs. Edit it with the 'Edit Payload' button — the field stays read-only so corrections always go through the validated path and are attributed."
+    },
+    {
+      "fieldname": "correction_reason",
+      "fieldtype": "Small Text",
+      "label": "Reason for Correction",
+      "read_only": 1
+    },
+    {
+      "fieldname": "column_break_correction",
+      "fieldtype": "Column Break"
+    },
+    {
+      "fieldname": "corrected_by",
+      "fieldtype": "Link",
+      "options": "User",
+      "label": "Corrected By",
+      "read_only": 1
+    },
+    {
+      "fieldname": "corrected_at",
+      "fieldtype": "Datetime",
+      "label": "Corrected At",
+      "read_only": 1
+    },
+    {
       "fieldname": "section_break_error",
       "fieldtype": "Section Break",
       "label": "Error Details"
@@ -98,7 +150,7 @@
   "index_web_pages_for_search": 0,
   "is_submittable": 0,
   "links": [],
-  "modified": "2026-04-17 00:00:00.000000",
+  "modified": "2026-08-26 00:00:00.000000",
   "modified_by": "Administrator",
   "module": "Shopify Integration",
   "name": "Shopify Log",

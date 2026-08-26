@@ -1,2 +1,4 @@
 # Add patches here
 shopify_integration.patches.add_activity_log_index
+shopify_integration.patches.add_payment_entry_gateway_fields
+shopify_integration.patches.add_fulfillment_fields

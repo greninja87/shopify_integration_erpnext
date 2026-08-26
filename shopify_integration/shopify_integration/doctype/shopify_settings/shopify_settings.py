@@ -113,6 +113,10 @@ class ShopifySettings(Document):
                     title="Invalid Delay Hours",
                 )
 
+        # Fulfillment config sanity checks.
+        if self.get("enable_fulfillment"):
+            self._validate_fulfillment()
+
         # Gateway mapping rows: each row must have at least one matching key
         self._validate_gateway_mapping_rows()
 
@@ -160,6 +164,82 @@ class ShopifySettings(Document):
                     f"'{acc.account_type or 'blank'}' — must be Bank or Cash."
                 )
 
+
+    def _validate_fulfillment(self):
+        """
+        Block save when fulfillment is enabled but cannot possibly work, and warn
+        about the two settings that reach real customers.
+
+        Catching these here means the problem surfaces at config time rather than
+        at 2 AM when a Delivery Note is submitted.
+        """
+        # An Admin API token is not optional for fulfillment — there is no
+        # webhook path that can mark an order fulfilled.
+        if not self.get("admin_api_access_token"):
+            frappe.throw(
+                "<b>Admin API Access Token</b> (Connection tab) is required when "
+                "<b>Enable Order Fulfillment</b> is on. Fulfillment is only "
+                "possible through the Shopify Admin API — there is no webhook "
+                "that can do it.<br><br>The token also needs the fulfillment "
+                "scopes: <code>write_merchant_managed_fulfillment_orders</code> "
+                "(and <code>write_third_party_fulfillment_orders</code> if any "
+                "orders route to a 3PL) plus the <b>fulfill_and_ship_orders</b> "
+                "permission. A <code>read_orders</code>-only token will fail with "
+                "HTTP 403.",
+                title="Admin API Token Required for Fulfillment",
+            )
+
+        if not self.get("dn_fulfillment_timing"):
+            frappe.throw(
+                "<b>Fulfil Shopify Order</b> must be set when "
+                "<b>Enable Order Fulfillment</b> is on. Choose <b>Manual</b>, "
+                "<b>Immediate</b>, or <b>Scheduled</b>.",
+                title="Fulfillment Timing Required",
+            )
+
+        delay = self.get("dn_fulfillment_delay_hours") or 0
+        if self.get("dn_fulfillment_timing") == "Scheduled" and delay < 0:
+            frappe.throw(
+                "<b>Delay After Submission</b> cannot be negative. "
+                "Set 0 to fulfil at the next hourly scheduler run.",
+                title="Invalid Fulfillment Delay",
+            )
+
+        # Immediate + notify means a mis-submitted Delivery Note emails the
+        # customer before anyone can cancel it.  Allowed, but not silently.
+        if (
+            self.get("dn_fulfillment_timing") == "Immediate"
+            and self.get("notify_customer_on_fulfillment")
+        ):
+            frappe.msgprint(
+                "Fulfillment is set to <b>Immediate</b> with customer emails "
+                "<b>on</b>. A Delivery Note submitted in error will email the "
+                "customer a shipping confirmation before you can cancel it. "
+                "Use <b>Scheduled</b> with a delay if you want a window to catch "
+                "mistakes.",
+                indicator="orange",
+                title="No Window to Catch Mistakes",
+                alert=True,
+            )
+
+        # A tracking number with no recognisable courier and no URL renders as
+        # plain text in Shopify — the customer gets a number they cannot click.
+        if (
+            self.get("dn_tracking_number_field")
+            and not self.get("dn_tracking_company_field")
+            and not self.get("default_tracking_company")
+            and not self.get("dn_tracking_url_field")
+        ):
+            frappe.msgprint(
+                "A <b>Tracking Number Field</b> is set but no tracking company "
+                "or URL. Shopify can only make a tracking number clickable when "
+                "it recognises the courier name or is given a URL — otherwise the "
+                "customer sees an unclickable number. Set <b>Default Tracking "
+                "Company</b> or <b>Tracking URL Field</b>.",
+                indicator="orange",
+                title="Tracking Number Without a Carrier",
+                alert=True,
+            )
 
     def _validate_gateway_mapping_rows(self):
         """Each gateway mapping row must have either shopify_gateway or tag_contains

@@ -23,6 +23,12 @@ Gateway matching (first match wins):
   2. Shopify Gateway: case-insensitive exact match against payment_gateway_names[0].
   3. Fallback: default Mode of Payment + Bank Account from Shopify Settings.
 
+After the PE is inserted (and optionally submitted), the payment gateway's own
+transaction id is captured onto custom_gateway_reference — see
+gateway_reference.py.  That is a separate concern with its own failure
+containment: it can never affect the PE, and it no-ops entirely when the store
+has no Shopify Admin API token configured.
+
 Failures here NEVER block SO creation — the caller wraps this in try/except.
 """
 
@@ -273,6 +279,30 @@ def create_payment_entry_from_shopify(so, order: dict, settings) -> str:
         frappe.session.user = _prev_session_user
 
     frappe.db.commit()  # nosemgrep: frappe-manual-commit — runs in background job; PE must persist before SI creation
+
+    # 7. Gateway payment reference (custom_gateway_reference)
+    #
+    #    The gateway's own transaction id (PayU txnid etc.) is not in the
+    #    webhook payload — it lives on the Shopify order's TRANSACTION records
+    #    and has to be pulled from the Admin API.  Doing it here rather than in
+    #    sales_order.py is deliberate: the caller there treats any exception
+    #    from this function as "Payment Entry failed" and emails the admin, so a
+    #    reference lookup must never be able to escape past a PE that exists.
+    #
+    #    capture_for_order() is documented never to raise; the try/except is a
+    #    second belt on top of that, including the import itself.
+    #
+    #    No-ops when the store has no Admin API access token configured.
+    try:
+        from shopify_integration.utils.gateway_reference import capture_for_order
+
+        capture_for_order(pe.name, order, settings)
+    except Exception:
+        frappe.log_error(
+            frappe.get_traceback(),
+            f"Shopify: Gateway Reference Capture Failed — {pe.name}",
+        )
+
     return pe.name
 
 

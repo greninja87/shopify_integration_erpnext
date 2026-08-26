@@ -169,6 +169,12 @@ def create_sales_order_from_shopify(order: dict, settings):
             "rate":              item["rate"],       # tax-exclusive, already reconciled
             "uom":               item["uom"],
             "item_tax_template": item.get("_tax_template") or "",
+            # Shopify line_item.id, set by map_line_items().  Blank on the
+            # shipping row, which has no Shopify line item.  Populated even while
+            # fulfillment is disabled, so the feature works accurately from day
+            # one if it is ever switched on — orders synced without it can only
+            # fall back to SKU matching.
+            "custom_shopify_line_item_id": item.get("custom_shopify_line_item_id") or "",
             "price_list_rate":    price_list_rate,
             "discount_percentage": 0,
             "discount_amount":     0,

@@ -189,3 +189,156 @@ def delete_old_shopify_logs():
         if deleted:
             frappe.db.commit()  # nosemgrep: frappe-manual-commit — batch deletion needs intermediate commits per store
             frappe.logger().info(f"Shopify: deleted {deleted} old logs for store {store['name']}")
+
+
+# ── Shopify order fulfillment ─────────────────────────────────────────────────
+
+def fulfil_submitted_delivery_notes():
+    """
+    Hourly scheduler entry point for Shopify order fulfillment.
+
+    Processes stores with:
+      - enable_sync = 1
+      - enable_fulfillment = 1
+      - dn_fulfillment_timing = "Scheduled"
+
+    Stores set to "Immediate" are excluded here — their fulfillment is fired by
+    the Delivery Note on_submit hook.  Stores set to "Manual" are excluded
+    entirely; only the button and the bulk action act on those.
+
+    The delay window is the point of this mode: a Delivery Note submitted in
+    error can be cancelled before Shopify is ever told, so the customer never
+    gets a shipping email for a shipment that did not happen.
+
+    The store lookup comes FIRST and returns silently when nothing is enabled.
+    Fulfillment ships disabled, so on the common install this job must be a
+    no-op that says nothing — checking for the custom fields before checking
+    whether anyone wants them would write an Error Log entry every hour on
+    every site that never turns the feature on.
+    """
+    active_stores = frappe.get_all(
+        "Shopify Settings",
+        filters={
+            "enable_sync": 1,
+            "enable_fulfillment": 1,
+            "dn_fulfillment_timing": "Scheduled",
+        },
+        pluck="name",
+    )
+    if not active_stores:
+        return
+
+    from shopify_integration.utils.fulfillment import _dn_has_state_fields
+
+    if not _dn_has_state_fields():
+        frappe.log_error(
+            "Shopify fulfillment scheduler skipped: fulfillment is enabled but "
+            "Delivery Note is missing the fulfillment state fields. "
+            "Run `bench --site <site> migrate`.",
+            "Shopify: Fulfillment Scheduler Skipped (Not Migrated)",
+        )
+        return
+
+    for store_name in active_stores:
+        try:
+            settings = frappe.get_doc("Shopify Settings", store_name)
+            _fulfil_store_delivery_notes(settings)
+        except Exception:
+            frappe.log_error(
+                frappe.get_traceback(),
+                f"Shopify: Fulfillment Scheduler Error for store {store_name}",
+            )
+
+
+def _fulfil_store_delivery_notes(settings):
+    """
+    For one store: find submitted Delivery Notes past the delay window that have
+    not been fulfilled in Shopify yet, and fulfil each.
+
+    Selection:
+      - Delivery Note submitted, not a return
+      - links to a submitted Sales Order from this store with a Shopify order id
+      - no Shopify fulfillment id recorded yet
+      - not currently claimed by another worker (status Pending, claimed within
+        STALE_CLAIM_MINUTES) — a claim left behind by a killed worker is retried
+      - submitted at least dn_fulfillment_delay_hours ago
+
+    Delay measurement reuses the Activity Log approach from _process_store():
+    Frappe stores timestamps in the site timezone while MariaDB NOW() on Frappe
+    Cloud is UTC, so the cutoffs are computed in Python and compared against the
+    stored values.  Using NOW() here would silently add the UTC offset (5.5h for
+    IST) to every configured delay.
+    """
+    from frappe.utils import add_to_date, now_datetime
+
+    from shopify_integration.utils.fulfillment import (
+        STALE_CLAIM_MINUTES,
+        STATUS_PENDING,
+        _fulfil_background,
+    )
+
+    delay_hours = int(settings.get("dn_fulfillment_delay_hours") or 0)
+
+    now = now_datetime()
+    submit_cutoff   = add_to_date(now, hours=-delay_hours)
+    creation_cutoff = add_to_date(now, hours=-(delay_hours + 2))
+    stale_cutoff    = add_to_date(now, minutes=-STALE_CLAIM_MINUTES)
+
+    dn_rows = frappe.db.sql(
+        """
+        SELECT DISTINCT dn.name AS dn_name
+        FROM `tabDelivery Note` dn
+        JOIN `tabDelivery Note Item` dni ON dni.parent = dn.name
+        JOIN `tabSales Order` so ON so.name = dni.against_sales_order
+        WHERE dn.docstatus = 1
+          AND dn.is_return = 0
+          AND so.docstatus = 1
+          AND so.shopify_store = %(store)s
+          AND IFNULL(so.shopify_order_id, '') != ''
+          AND IFNULL(dn.custom_shopify_fulfillment_id, '') = ''
+          AND (
+              IFNULL(dn.custom_shopify_fulfillment_status, '') != %(pending)s
+              OR IFNULL(dn.custom_shopify_fulfilled_at, '1900-01-01') <= %(stale_cutoff)s
+          )
+          AND (
+              EXISTS (
+                  SELECT 1 FROM `tabActivity Log` al
+                  WHERE al.reference_doctype = 'Delivery Note'
+                    AND al.reference_name = dn.name
+                    AND al.operation = 'Submit'
+                    AND al.creation <= %(submit_cutoff)s
+              )
+              OR (
+                  NOT EXISTS (
+                      SELECT 1 FROM `tabActivity Log` al2
+                      WHERE al2.reference_doctype = 'Delivery Note'
+                        AND al2.reference_name = dn.name
+                        AND al2.operation = 'Submit'
+                  )
+                  AND dn.creation <= %(creation_cutoff)s
+              )
+          )
+        ORDER BY dn.name
+        """,
+        {
+            "store": settings.shop_domain,
+            "pending": STATUS_PENDING,
+            "stale_cutoff": stale_cutoff,
+            "submit_cutoff": submit_cutoff,
+            "creation_cutoff": creation_cutoff,
+        },
+        as_dict=True,
+    )
+
+    for row in dn_rows:
+        try:
+            _fulfil_background(
+                row["dn_name"], store_name=settings.name, triggered_by="scheduled"
+            )
+        except Exception:
+            # _fulfil_background swallows its own failures; this is a backstop so
+            # one bad Delivery Note cannot end the store's batch.
+            frappe.log_error(
+                frappe.get_traceback(),
+                f"Shopify: Scheduled Fulfillment Failed — {row['dn_name']}",
+            )

@@ -11,9 +11,16 @@ const _erpnext_dn_indicator = frappe.listview_settings['Delivery Note'].get_indi
 //   true  = at least one store has SI enabled → show Shopify indicators
 let _shopify_si_active = null;
 
+// Same three-state cache for fulfillment, so the bulk action is only added
+// when at least one store actually has fulfillment turned on.
+let _shopify_fulfillment_active = null;
+
 Object.assign(frappe.listview_settings['Delivery Note'], {
     // status and is_return are needed to detect Return / Return Issued / Closed
-    add_fields: ["shopify_order_id", "per_billed", "status", "is_return"],
+    add_fields: [
+        "shopify_order_id", "per_billed", "status", "is_return",
+        "custom_shopify_fulfillment_id", "custom_shopify_fulfillment_status",
+    ],
 
     onload: function(listview) {
         // Single server call — checks if any Shopify store has SI enabled.
@@ -27,6 +34,19 @@ Object.assign(frappe.listview_settings['Delivery Note'], {
                 // When false, ERPNext defaults already show correctly.
                 if (was_unset && _shopify_si_active) {
                     listview.refresh();
+                }
+            }
+        });
+
+        // Bulk "Fulfil in Shopify" action, added only when some store has
+        // fulfillment enabled — otherwise the menu stays exactly as ERPNext
+        // ships it.
+        frappe.call({
+            method: 'shopify_integration.utils.fulfillment.is_fulfillment_enabled',
+            callback: function(r) {
+                _shopify_fulfillment_active = !!(r.message);
+                if (_shopify_fulfillment_active) {
+                    shopify_add_bulk_fulfil_action(listview);
                 }
             }
         });
@@ -72,3 +92,68 @@ Object.assign(frappe.listview_settings['Delivery Note'], {
         return     [__('Shopify'), 'orange', 'shopify_order_id,is,set'];
     }
 });
+
+
+// ── Bulk "Fulfil in Shopify" ──────────────────────────────────────────────────
+
+function shopify_add_bulk_fulfil_action(listview) {
+    listview.page.add_actions_menu_item(__('Fulfil in Shopify'), function() {
+        const selected = listview.get_checked_items();
+        if (!selected.length) {
+            frappe.msgprint(__('Select one or more Delivery Notes first.'));
+            return;
+        }
+
+        // Filter client-side to what can plausibly be fulfilled, and tell the
+        // user exactly what is being skipped rather than silently dropping it.
+        // The server re-checks every one of these — this is courtesy, not trust.
+        const eligible = [];
+        const skipped = { draft: 0, returns: 0, already: 0, not_shopify: 0 };
+
+        selected.forEach(function(doc) {
+            if (!doc.shopify_order_id)                  { skipped.not_shopify++; return; }
+            if (cint(doc.is_return))                    { skipped.returns++;     return; }
+            if (cint(doc.docstatus) !== 1)              { skipped.draft++;       return; }
+            if (doc.custom_shopify_fulfillment_id)      { skipped.already++;     return; }
+            eligible.push(doc.name);
+        });
+
+        const notes = [];
+        if (skipped.already)      notes.push(__('{0} already fulfilled', [skipped.already]));
+        if (skipped.draft)        notes.push(__('{0} not submitted', [skipped.draft]));
+        if (skipped.returns)      notes.push(__('{0} return note(s)', [skipped.returns]));
+        if (skipped.not_shopify)  notes.push(__('{0} not from Shopify', [skipped.not_shopify]));
+
+        if (!eligible.length) {
+            frappe.msgprint({
+                title: __('Nothing to Fulfil'),
+                message: notes.length
+                    ? __('Skipped: {0}.', [notes.join(', ')])
+                    : __('None of the selected Delivery Notes can be fulfilled.'),
+                indicator: 'orange'
+            });
+            return;
+        }
+
+        let body = '<p>' + __('Mark {0} order(s) as fulfilled in Shopify?', [eligible.length]) + '</p>';
+        if (notes.length) {
+            body += '<p class="text-muted">' + __('Skipped: {0}.', [notes.join(', ')]) + '</p>';
+        }
+        body += '<p class="text-muted">'
+             + __("Runs in the background, paced to Shopify's rate limit. Customer shipping emails follow each store's own setting.")
+             + '</p>';
+
+        frappe.confirm(body, function() {
+            frappe.xcall(
+                'shopify_integration.utils.fulfillment.fulfil_bulk',
+                { dn_names: eligible }
+            ).then(function(result) {
+                frappe.show_alert({
+                    message: (result && result.message) || __('Queued'),
+                    indicator: 'blue'
+                });
+                listview.clear_checked_items();
+            });
+        });
+    }, true);
+}
