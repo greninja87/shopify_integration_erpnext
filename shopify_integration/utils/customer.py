@@ -493,7 +493,16 @@ def _create_contact(customer_name: str, contact_name: str, phone: str, email: st
             "links": [{"link_doctype": "Customer", "link_name": customer_name}],
         })
         if phone:
-            contact.append("phone_nos", {"phone": phone, "is_primary_phone": 1})
+            # Both flags are required — Frappe's Contact controller derives the
+            # top-level `phone` field from is_primary_phone and the top-level
+            # `mobile_no` field from is_primary_mobile_no independently. Setting
+            # only is_primary_phone leaves Contact.mobile_no blank, breaking any
+            # integration (e.g. the Zoho Desk widget) that filters on mobile_no.
+            contact.append("phone_nos", {
+                "phone": phone,
+                "is_primary_phone": 1,
+                "is_primary_mobile_no": 1,
+            })
         if email:
             contact.append("email_ids", {"email_id": email, "is_primary": 1})
 
