@@ -54,7 +54,8 @@ Go to **ERPNext → Shopify Integration → Shopify Settings** and create a reco
 | Company | ERPNext Company to create orders under |
 | Warehouse | Default warehouse for SO items |
 | Enable Sync | Master on/off switch |
-| Admin API Access Token | *Optional.* Needed only for the Gateway Payment Reference lookup — see below |
+| Admin API Access Token | *Optional.* Legacy custom apps only — see Gateway Payment Reference below |
+| Client ID / Client Secret | *Optional.* Dev Dashboard apps use these instead of a token |
 
 ### 2. Register the Webhook in Shopify
 
@@ -81,21 +82,54 @@ Enable **Enable Payment Entry Creation** and configure:
 Shopify records the gateway's transaction id on the order's **transaction** record, not on
 the order. It is absent from the `orders/create` and `orders/paid` webhook payloads — no
 `transactions` array, `reference` and `source_identifier` are `null`, `note_attributes` is
-empty. So it has to be pulled from the Admin API, which needs a token.
+empty. So it has to be pulled from the Admin API, which needs credentials.
 
-**Setup:**
+**The app needs the `read_orders` scope** — and only that. It covers Shopify's
+`OrderTransaction` object, which is what this reads. No other scope is required.
 
-1. Shopify Admin → **Settings → Apps and sales channels → Develop apps** → your app →
-   **Configuration → Admin API integration**, grant the **`read_orders`** scope.
-2. **API credentials** → reveal the **Admin API access token** (`shpat_…`).
-3. Paste it into ERPNext → Shopify Settings → **Connection → Shopify Admin API →
-   Admin API Access Token**. Leave **REST API Version** blank unless you need to pin a
-   version other than the app default (`2026-01`).
+Which credentials you use depends on how your Shopify app was created.
 
-Once the token is set, every new order's Payment Entry gets
+#### A — Dev Dashboard app (anything created now)
+
+Legacy custom apps could no longer be created after **1 January 2026**, so a new app is
+built in the Dev Dashboard and issues **no static token** — there is nothing to copy out
+of the UI.
+
+1. https://dev.shopify.com/dashboard → your app → **App settings → Credentials**
+2. Copy the **Client ID** and **Client Secret**
+3. ERPNext → Shopify Settings → **Connection → Shopify Admin API** → paste both
+
+The app exchanges them for an access token via the **client credentials grant**, caches it,
+and re-mints it before it expires. Tokens live 24 hours; you never touch them again.
+
+> **Same-organization only.** The client credentials grant can only reach a store in the
+> *same Shopify organization* as the app. A store under a separate Shopify account needs
+> its **own app** in its own organization, and its own Shopify Settings record. A
+> cross-organization token cannot be obtained this way.
+
+#### B — Legacy custom app (created in the Shopify admin before 1 Jan 2026)
+
+1. Shopify Admin → **Settings → Apps and sales channels → Apps** → your app →
+   **API credentials**
+2. Copy the **Admin API access token** (`shpat_…`) — Shopify reveals it **once**
+3. Paste it into **Admin API Access Token**
+
+Non-expiring until the app is uninstalled. If both this and a Client ID/Secret pair are
+filled in, the static token wins.
+
+Either way, leave **REST API Version** blank unless you need to pin something other than
+the app default (`2026-01`).
+
+Once credentials are set, every new order's Payment Entry gets
 **Gateway Payment Reference** (`custom_gateway_reference`) filled in from the order's
 transactions, plus **Payment Gateway** (`custom_gateway_name`) identifying the portal —
-e.g. `Cards, UPI, NB by PayU India`. Leave the token blank and the lookups simply don't run.
+e.g. `Cards, UPI, NB by PayU India`. Leave the credentials blank and the lookups simply
+don't run.
+
+**Half-filled credentials are refused at save time.** A Client ID with no Secret (or the
+reverse) cannot mint a token, and every lookup would skip silently — leaving a blank
+reference with nothing in the Error Log to explain it. Shopify Settings blocks that
+instead.
 
 **What it does not touch:** `reference_no` still holds the Shopify order name (`#6282`) and
 is never modified by this feature. Writes use `update_modified=False`, so filling the field
@@ -125,7 +159,14 @@ bench --site <site> execute shopify_integration.utils.gateway_reference.backfill
 
 Optionally restrict to one store with `'store': 'mystore.myshopify.com'`. Requests are paced
 to Shopify's 2 req/sec REST limit and retried on HTTP 429, so a few hundred entries take a
-few minutes — from the UI, enqueue it as a background job instead:
+few minutes
+
+> **The 60-day ceiling.** `read_orders` only reaches orders from roughly the last 60 days.
+> The backfill walks *oldest first*, so on a long history it will fail on exactly the orders
+> you most want. Nothing breaks — each miss logs and the field stays blank — but you will
+> not get the older references without the **`read_all_orders`** scope, which requires a
+> written request to Shopify and their approval. Run with `dry_run: 1` first to see how many
+> entries are pending before spending the calls — from the UI, enqueue it as a background job instead:
 
 ```bash
 bench --site <site> execute shopify_integration.utils.gateway_reference.enqueue_backfill --kwargs "{'limit': 500}"
@@ -372,7 +413,9 @@ by the failed attempt.
 | `You cannot unset 'Read Only' for field Payload` | Frappe blocks it — `payload` is read-only in the DocType | Use **Fix Payload → Edit Payload** instead; never edit the audit field |
 | Retry keeps failing on a pincode | Retry replays the *stored* payload, not a fresh copy | **Fix Payload → Re-fetch from Shopify**, or **Edit Payload** |
 | `Gateway Reference Field Missing` | App upgraded but not migrated | Run `bench --site <site> migrate` |
-| `Gateway Reference API Error` (401/403) | Admin API token invalid or missing `read_orders` | Regenerate the token in Shopify Admin and re-paste it |
+| `Gateway Reference API Error` (401/403) | Token invalid/expired, or app missing `read_orders` | Check the credentials; a cached minted token is evicted automatically so the next call re-mints |
+| `Shopify rejected the client credentials` | Wrong Client ID/Secret, **or the store is in a different Shopify organization** | Verify both values; a store in another account needs its own app |
+| `Incomplete Admin API Credentials` on save | Only one of Client ID / Client Secret filled in | Supply both, or clear both |
 | `Gateway Reference Empty` | Gateway returned no reference for that transaction | Nothing to fix — the field is correctly left blank |
 | Fulfillment HTTP 403 | Token lacks the fulfillment scopes | Add `write_merchant_managed_fulfillment_orders` + `fulfill_and_ship_orders`, regenerate, re-paste |
 | `Fulfillment Field Missing` / `not migrated` | App upgraded but not migrated | Run `bench --site <site> migrate` |

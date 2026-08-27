@@ -7,13 +7,21 @@ transaction id is one of them (see gateway_reference.py), so this module exists
 to make exactly that class of read possible, with the safety rails a background
 job needs.
 
-Configuration (Shopify Settings → Connection → Shopify Admin API):
-    admin_api_access_token  Password  Admin API access token (shpat_…)
-    api_version             Data      REST version, defaults to 2026-01
+Configuration (Shopify Settings → Connection → Shopify Admin API) — supply
+EITHER a static token OR a Client ID/Secret pair:
 
-The token needs the `read_orders` scope.  Create it in Shopify Admin →
-Settings → Apps and sales channels → Develop apps → your app →
-API credentials → Admin API access token.
+    admin_api_access_token   Password  static token from a legacy custom app
+    admin_api_client_id      Data      Dev Dashboard app Client ID
+    admin_api_client_secret  Password  Dev Dashboard app Client Secret
+    api_version              Data      REST version, defaults to 2026-01
+
+Either way the app needs the `read_orders` scope, which covers the
+OrderTransaction object the gateway reference reads.
+
+Legacy custom apps (Shopify admin → Apps → Develop apps) could no longer be
+created after 1 Jan 2026 and issue a non-expiring token you paste once.  A Dev
+Dashboard app instead gives you a Client ID and Secret, which this module
+exchanges for a 24-hour token and caches — see the Credentials section below.
 
 Rate limiting
 -------------
@@ -57,13 +65,39 @@ class ShopifyAPIError(Exception):
 
 
 # ── Credentials ────────────────────────────────────────────────────────────────
+#
+# Two ways a store can authenticate, checked in this order:
+#
+#   1. A static Admin API access token (admin_api_access_token).
+#      Legacy custom apps created in the Shopify admin before 1 Jan 2026 issue
+#      one of these.  It does not expire until the app is uninstalled, so it is
+#      read straight from Settings and used as-is.
+#
+#   2. Client ID + Client Secret (admin_api_client_id / admin_api_client_secret)
+#      exchanged for a token via the client credentials grant.  This is what a
+#      Dev Dashboard app gives you: there is no token to copy out of the
+#      dashboard, and legacy custom apps can no longer be created.
+#
+#      That token lives 24 hours (expires_in is always 86399), so it is minted
+#      on demand and cached until shortly before it lapses.  Minting per call
+#      would add a round trip to every request for no benefit.
+#
+#      Restriction worth knowing: the client credentials grant only reaches
+#      stores in the SAME Shopify organization as the app.  A store under a
+#      separate account needs its own app and its own Settings record — a
+#      cross-organization token is not obtainable this way.
 
-def get_admin_api_token(settings) -> str:
+# Refresh this many seconds before the token actually expires, so a request
+# already in flight is never the one that discovers it went stale.
+_TOKEN_REFRESH_MARGIN = 300
+
+
+def _static_token(settings) -> str:
     """
-    Decrypted Admin API access token for a store, or "" when not configured.
+    The stored Admin API access token, or "".
 
-    admin_api_access_token is a Password fieldtype — reading it off the doc
-    returns masked asterisks, so it must go through get_decrypted_password().
+    Password fieldtypes read back as masked asterisks off the doc, so this has
+    to go through get_decrypted_password().
     """
     if not settings or not settings.get("name"):
         return ""
@@ -75,14 +109,180 @@ def get_admin_api_token(settings) -> str:
             ) or ""
         ).strip()
     except Exception:
-        # A missing field on an older install must not raise — the caller
-        # treats "" as "feature not configured" and skips silently.
+        # A missing field on an un-migrated install must not raise — callers
+        # treat "" as "not configured" and skip.
         return ""
 
 
+def _client_credentials(settings) -> tuple:
+    """(client_id, client_secret), either possibly ""."""
+    if not settings or not settings.get("name"):
+        return "", ""
+    client_id = (settings.get("admin_api_client_id") or "").strip()
+    try:
+        client_secret = (
+            get_decrypted_password(
+                "Shopify Settings", settings.name, "admin_api_client_secret",
+                raise_exception=False,
+            ) or ""
+        ).strip()
+    except Exception:
+        client_secret = ""
+    return client_id, client_secret
+
+
+def _token_cache_key(settings) -> str:
+    return "shopify_admin_api_token::%s" % settings.get("name")
+
+
+def invalidate_cached_token(settings):
+    """
+    Drop the cached token for a store.
+
+    Called when Shopify rejects it (401/403).  Without this, a rotated Client
+    Secret or a revoked token would keep failing for up to 24 hours while we
+    kept handing back a cached value Shopify no longer accepts.
+    """
+    if not settings or not settings.get("name"):
+        return
+    try:
+        frappe.cache().delete_value(_token_cache_key(settings))
+    except Exception:
+        pass  # cache trouble must never break a request
+
+
+def _mint_client_credentials_token(settings, client_id: str, client_secret: str) -> str:
+    """
+    Exchange Client ID + Secret for a 24-hour Admin API access token.
+
+        POST https://{shop}/admin/oauth/access_token
+        Content-Type: application/x-www-form-urlencoded
+        grant_type=client_credentials&client_id=...&client_secret=...
+
+    Response carries access_token, scope and expires_in.  The token is cached
+    until _TOKEN_REFRESH_MARGIN seconds before it expires.
+
+    :raises ShopifyAPIError: on any failure.  The secret never appears in an
+                             error message or a log line.
+    """
+    import requests
+
+    shop_domain = (settings.get("shop_domain") or "").strip()
+    if not shop_domain:
+        raise ShopifyAPIError("Shopify Settings has no shop_domain.")
+
+    url = "https://%s/admin/oauth/access_token" % shop_domain
+    payload = {
+        "grant_type": "client_credentials",
+        "client_id": client_id,
+        "client_secret": client_secret,
+    }
+
+    _throttle()
+    try:
+        response = requests.post(
+            url, data=payload, headers={"Accept": "application/json"}, timeout=_TIMEOUT
+        )
+    except Exception as exc:
+        raise ShopifyAPIError("Could not reach Shopify to mint an access token: %s" % exc)
+
+    status = response.status_code
+
+    if status in (400, 401, 403):
+        # Deliberately does not echo the response body: Shopify sometimes
+        # reflects request parameters, and the secret must not reach a log.
+        raise ShopifyAPIError(
+            "Shopify rejected the client credentials for store '%s' (HTTP %s). "
+            "Check the Client ID and Client Secret in Shopify Settings, and that "
+            "this store is in the SAME Shopify organization as the app — the "
+            "client credentials grant cannot reach a store in another "
+            "organization." % (shop_domain, status),
+            status,
+        )
+
+    if status >= 400:
+        raise ShopifyAPIError("Minting an access token failed with HTTP %s." % status, status)
+
+    try:
+        body = response.json() or {}
+    except Exception as exc:
+        raise ShopifyAPIError("Token response was not JSON: %s" % exc)
+
+    token = (body.get("access_token") or "").strip()
+    if not token:
+        raise ShopifyAPIError("Shopify returned no access_token.")
+
+    # expires_in is documented as always 86399, but read it rather than
+    # hardcoding a lifetime we would not notice changing.
+    try:
+        expires_in = int(body.get("expires_in") or 0)
+    except (TypeError, ValueError):
+        expires_in = 0
+    ttl = max(60, (expires_in or 86399) - _TOKEN_REFRESH_MARGIN)
+
+    try:
+        frappe.cache().set_value(_token_cache_key(settings), token, expires_in_sec=ttl)
+    except Exception:
+        # Operating without the cache still works; it just re-mints per call.
+        frappe.log_error(
+            "Could not cache the Shopify access token for '%s'. Requests will "
+            "still work, but a token will be minted per call."
+            % settings.get("name"),
+            "Shopify: Token Cache Unavailable",
+        )
+
+    frappe.logger().info(
+        "Shopify: minted an Admin API token for '%s' (valid %ss, cached %ss, "
+        "scopes: %s)"
+        % (settings.get("name"), expires_in or 86399, ttl, body.get("scope") or "unknown")
+    )
+    return token
+
+
+def get_admin_api_token(settings) -> str:
+    """
+    A usable Admin API access token for this store, or "" when the store has no
+    credentials configured at all.
+
+    Prefers a static token; otherwise returns the cached minted token, minting a
+    fresh one when the cache is empty.
+
+    :raises ShopifyAPIError: when credentials ARE configured but no token can be
+                             obtained.  "" means "not configured", so a caller
+                             can tell "feature off" from "feature broken".
+    """
+    static = _static_token(settings)
+    if static:
+        return static
+
+    client_id, client_secret = _client_credentials(settings)
+    if not (client_id and client_secret):
+        return ""
+
+    try:
+        cached = frappe.cache().get_value(_token_cache_key(settings))
+    except Exception:
+        cached = None
+    if cached:
+        return cached.decode() if isinstance(cached, bytes) else str(cached)
+
+    return _mint_client_credentials_token(settings, client_id, client_secret)
+
+
 def has_admin_api_credentials(settings) -> bool:
-    """True when this store can make Admin API calls."""
-    return bool(settings and settings.get("shop_domain") and get_admin_api_token(settings))
+    """
+    Whether this store is configured to call the Admin API.
+
+    Configuration check only — deliberately never mints a token.  Callers use
+    this as a cheap "is the feature on?" test on paths that run once per order,
+    and an HTTP round trip there would be indefensible.
+    """
+    if not settings or not (settings.get("shop_domain") or "").strip():
+        return False
+    if _static_token(settings):
+        return True
+    client_id, client_secret = _client_credentials(settings)
+    return bool(client_id and client_secret)
 
 
 def get_api_version(settings) -> str:
@@ -174,9 +374,12 @@ def get(settings, path: str, params: dict = None) -> dict:
             raise ShopifyAPIError(f"GET {path} returned HTTP {status}.", status)
 
         if status in (401, 403):
+            # Drop any cached minted token so the next call re-mints rather than
+            # replaying a token Shopify has stopped accepting.
+            invalidate_cached_token(settings)
             raise ShopifyAPIError(
-                f"GET {path} returned HTTP {status} — the Admin API access token is "
-                f"invalid or is missing the read_orders scope. "
+                f"GET {path} returned HTTP {status} — the Admin API token is "
+                f"invalid, expired, or missing the read_orders scope. "
                 f"Check Shopify Settings → Connection → Shopify Admin API.",
                 status,
             )

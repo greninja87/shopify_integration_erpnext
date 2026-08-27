@@ -37,6 +37,10 @@ META_FIELDS = {"Payment Entry": set()}
 COMMITS = []
 # (doctype, docname, fieldname) -> plaintext, read back by get_decrypted_password
 PASSWORDS = {}
+# key -> value, standing in for frappe.cache()
+CACHE = {}
+# key -> expires_in_sec passed to set_value, so a test can assert the TTL
+CACHE_TTL = {}
 
 
 def reset():
@@ -47,6 +51,8 @@ def reset():
     SQL_RESULTS.clear()
     COMMITS.clear()
     PASSWORDS.clear()
+    CACHE.clear()
+    CACHE_TTL.clear()
     META_FIELDS.clear()
     META_FIELDS["Payment Entry"] = {
         "custom_gateway_reference",
@@ -75,6 +81,21 @@ def _add_to_date(date=None, years=0, months=0, weeks=0, days=0, hours=0,
         weeks=weeks, days=days + years * 365 + months * 30,
         hours=hours, minutes=minutes, seconds=seconds,
     )
+
+
+class _Cache:
+    """Stand-in for frappe.cache(); records TTLs but does not expire on its own."""
+
+    def set_value(self, key, value, expires_in_sec=None, **kwargs):
+        CACHE[key] = value
+        CACHE_TTL[key] = expires_in_sec
+
+    def get_value(self, key, **kwargs):
+        return CACHE.get(key)
+
+    def delete_value(self, key, **kwargs):
+        CACHE.pop(key, None)
+        CACHE_TTL.pop(key, None)
 
 
 # ── The fake ──────────────────────────────────────────────────────────────────
@@ -164,6 +185,7 @@ def install():
     frappe.throw = _throw
     frappe.has_permission = lambda *a, **k: True
     frappe.session = types.SimpleNamespace(user="Administrator")
+    frappe.cache = lambda: _Cache()
 
     frappe.db = types.SimpleNamespace(
         get_value=_db_get_value,
@@ -213,17 +235,21 @@ def install():
 class FakeSettings:
     """Stand-in for a Shopify Settings document."""
 
-    def __init__(self, name="Test Store", shop_domain="notdrones.myshopify.com", token="shpat_x"):
+    def __init__(self, name="Test Store", shop_domain="notdrones.myshopify.com",
+                 token="shpat_x", client_id="", client_secret=""):
         self.name = name
         self._values = {
             "name": name,
             "shop_domain": shop_domain,
             "api_version": "2026-01",
+            # Client ID is a plain Data field, so it lives on the doc...
+            "admin_api_client_id": client_id,
         }
-        # admin_api_access_token is a Password field in the real doctype, so
-        # production code reads it via get_decrypted_password rather than off
-        # the doc.  Register it where the fake serves that call from.
+        # ...while the token and the secret are Password fields, which production
+        # code reads via get_decrypted_password rather than off the doc. Register
+        # them where the fake serves that call from.
         PASSWORDS[("Shopify Settings", name, "admin_api_access_token")] = token
+        PASSWORDS[("Shopify Settings", name, "admin_api_client_secret")] = client_secret
 
     def get(self, key, default=None):
         return self._values.get(key, default)

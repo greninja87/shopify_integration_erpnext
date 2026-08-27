@@ -22,6 +22,8 @@
     "dispatch_address",
     "section_admin_api",
     "admin_api_access_token",
+    "admin_api_client_id",
+    "admin_api_client_secret",
     "column_break_admin_api",
     "api_version",
     "tab_order_defaults",
@@ -204,13 +206,25 @@
       "fieldtype": "Section Break",
       "label": "Shopify Admin API",
       "collapsible": 1,
-      "description": "Optional. Needed only for data that Shopify does not send in webhooks — currently the payment gateway's transaction id, fetched from the order's transactions and stored on the Payment Entry as Gateway Payment Reference. Leave blank to disable those lookups."
+      "description": "Needed for anything Shopify does not send in a webhook — currently the payment gateway's transaction id (stored on the Payment Entry as Gateway Payment Reference) and re-fetching a Shopify Log payload.<br><br>Fill in <b>either</b> an Admin API Access Token (legacy custom apps, created in the Shopify admin before 1 Jan 2026) <b>or</b> Client ID + Client Secret (Dev Dashboard apps, which issue no static token). Leave both blank to disable these lookups."
     },
     {
       "fieldname": "admin_api_access_token",
       "fieldtype": "Password",
       "label": "Admin API Access Token",
-      "description": "Admin API access token (shpat_…) with the <b>read_orders</b> scope. Shopify Admin → Settings → Apps and sales channels → Develop apps → your app → API credentials."
+      "description": "Static token (shpat_...) from a legacy custom app. Non-expiring. Dev Dashboard apps do not have one — use Client ID + Client Secret below instead. Takes precedence when both are filled in."
+    },
+    {
+      "fieldname": "admin_api_client_id",
+      "fieldtype": "Data",
+      "label": "Client ID",
+      "description": "From the Dev Dashboard: your app -> App settings -> Credentials. Used with the Client Secret to mint a 24-hour access token automatically. Only works for a store in the <b>same Shopify organization</b> as the app."
+    },
+    {
+      "fieldname": "admin_api_client_secret",
+      "fieldtype": "Password",
+      "label": "Client Secret",
+      "description": "From the same Credentials panel. Never leaves this field; it is exchanged server-side for a short-lived token."
     },
     {
       "fieldname": "column_break_admin_api",

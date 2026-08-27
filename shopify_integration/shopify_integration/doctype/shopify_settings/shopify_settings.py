@@ -113,6 +113,10 @@ class ShopifySettings(Document):
                     title="Invalid Delay Hours",
                 )
 
+        # Admin API credentials: a half-filled pair silently disables every
+        # lookup, which is the kind of thing that gets debugged for an hour.
+        self._validate_admin_api_credentials()
+
         # Fulfillment config sanity checks.
         if self.get("enable_fulfillment"):
             self._validate_fulfillment()
@@ -122,6 +126,40 @@ class ShopifySettings(Document):
 
         # Field mapping: block sensitive ERPNext fields from being overwritten
         self._validate_field_mappings()
+
+    def _validate_admin_api_credentials(self):
+        """
+        Catch a half-filled Client ID / Client Secret pair.
+
+        Both are needed to mint a token.  With only one, has_admin_api_credentials()
+        returns False and every Admin API lookup skips silently by design — so the
+        symptom is a blank Gateway Payment Reference with nothing in the Error Log
+        to explain it.  Better to say so at save time.
+        """
+        client_id = self.get("admin_api_client_id")
+        client_secret = self.get("admin_api_client_secret")
+
+        if bool(client_id) != bool(client_secret):
+            missing = "Client Secret" if client_id else "Client ID"
+            frappe.throw(
+                f"<b>{missing}</b> is missing. The Admin API needs <b>both</b> "
+                f"Client ID and Client Secret to obtain an access token. "
+                f"With only one filled in, every Admin API lookup is skipped "
+                f"silently and the Gateway Payment Reference stays blank.",
+                title="Incomplete Admin API Credentials",
+            )
+
+        # Both styles filled in is legal but the token wins, so say which.
+        if self.get("admin_api_access_token") and client_id and client_secret:
+            frappe.msgprint(
+                "Both an <b>Admin API Access Token</b> and a <b>Client ID / "
+                "Secret</b> pair are set. The static token takes precedence and "
+                "the client credentials will not be used. Clear the token if you "
+                "want the Client ID / Secret to apply.",
+                indicator="orange",
+                title="Two Sets of Credentials",
+                alert=True,
+            )
 
     def _validate_payment_accounts(self):
         """Refuse to save if any configured Bank / Cash account is:
@@ -173,20 +211,25 @@ class ShopifySettings(Document):
         Catching these here means the problem surfaces at config time rather than
         at 2 AM when a Delivery Note is submitted.
         """
-        # An Admin API token is not optional for fulfillment — there is no
-        # webhook path that can mark an order fulfilled.
-        if not self.get("admin_api_access_token"):
+        # Admin API credentials are not optional for fulfillment — no webhook
+        # path can mark an order fulfilled.  Either credential style will do.
+        _has_token = bool(self.get("admin_api_access_token"))
+        _has_client = bool(
+            self.get("admin_api_client_id") and self.get("admin_api_client_secret")
+        )
+        if not (_has_token or _has_client):
             frappe.throw(
-                "<b>Admin API Access Token</b> (Connection tab) is required when "
+                "Admin API credentials (Connection tab) are required when "
                 "<b>Enable Order Fulfillment</b> is on. Fulfillment is only "
                 "possible through the Shopify Admin API — there is no webhook "
-                "that can do it.<br><br>The token also needs the fulfillment "
-                "scopes: <code>write_merchant_managed_fulfillment_orders</code> "
-                "(and <code>write_third_party_fulfillment_orders</code> if any "
-                "orders route to a 3PL) plus the <b>fulfill_and_ship_orders</b> "
-                "permission. A <code>read_orders</code>-only token will fail with "
-                "HTTP 403.",
-                title="Admin API Token Required for Fulfillment",
+                "that can do it.<br><br>Supply either an <b>Admin API Access "
+                "Token</b> or a <b>Client ID + Client Secret</b> pair.<br><br>"
+                "The app also needs the fulfillment scopes: "
+                "<code>write_merchant_managed_fulfillment_orders</code> (and "
+                "<code>write_third_party_fulfillment_orders</code> if any orders "
+                "route to a 3PL). A <code>read_orders</code>-only app will fail "
+                "with HTTP 403.",
+                title="Admin API Credentials Required for Fulfillment",
             )
 
         if not self.get("dn_fulfillment_timing"):
