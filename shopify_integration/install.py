@@ -248,31 +248,29 @@ def create_delivery_note_custom_fields():
 
 # ── Payment Entry custom fields ────────────────────────────────────────────────
 
-def _pe_shopify_anchor() -> str:
+def _section_boundary_anchor(doctype: str, preferred: list, fallback: str) -> str:
     """
-    Find a safe insert_after anchor for the Shopify section in Payment Entry.
+    An insert_after anchor that will NOT split an existing section.
 
-    Two requirements:
+    A Section Break inserted mid-section reparents every following field until
+    the next break, so standard fields end up rendered inside our collapsible
+    section and disappear from where they belong.  Having picked the first
+    available field from `preferred`, walk forward to the last field before the
+    next Section/Tab Break: our section then begins exactly on a section
+    boundary and no existing field moves.
 
-      1. Land near the existing reference fields (Cheque/Reference No + Date),
-         because the gateway reference is read alongside them during
-         reconciliation.
-
-      2. Do NOT split an existing section.  A Section Break inserted mid-section
-         reparents every following field until the next break — so once a
-         preferred anchor is found, we walk forward to the last field before the
-         next Section/Tab Break.  Our section then begins exactly on a section
-         boundary and no ERPNext field moves.
+    :param preferred: candidate anchors, most-preferred first
+    :param fallback:  used when none of the candidates exist on the doctype
     """
-    meta = frappe.get_meta("Payment Entry")
+    meta = frappe.get_meta(doctype)
 
     anchor = ""
-    for fieldname in ["reference_date", "reference_no", "clearance_date", "remarks"]:
+    for fieldname in preferred:
         if meta.get_field(fieldname):
             anchor = fieldname
             break
     if not anchor:
-        return "remarks"  # last resort; present on every ERPNext version
+        return fallback
 
     fields = [df.fieldname for df in meta.fields]
     types  = {df.fieldname: df.fieldtype for df in meta.fields}
@@ -281,13 +279,27 @@ def _pe_shopify_anchor() -> str:
     except ValueError:
         return anchor
 
-    # Walk forward to the field just before the next Section/Tab Break.
     for i in range(idx + 1, len(fields)):
         if types.get(fields[i]) in ("Section Break", "Tab Break"):
             return fields[i - 1]
         anchor = fields[i]
 
     return anchor
+
+
+def _pe_shopify_anchor() -> str:
+    """
+    Anchor for the Shopify section in Payment Entry.
+
+    Lands near the existing reference fields (Cheque/Reference No + Date),
+    because the gateway reference is read alongside them during reconciliation,
+    then moves to the section boundary so nothing is reparented.
+    """
+    return _section_boundary_anchor(
+        "Payment Entry",
+        ["reference_date", "reference_no", "clearance_date", "remarks"],
+        "remarks",  # present on every ERPNext version
+    )
 
 
 def create_payment_entry_custom_fields():
@@ -379,16 +391,19 @@ def create_sales_order_item_custom_fields():
 
 def _dn_fulfillment_anchor() -> str:
     """
-    Insert the fulfillment section after the existing Shopify section on Delivery
-    Note when it is there, so all Shopify state sits together.  Falls back the
-    same way create_delivery_note_custom_fields() does.
+    Anchor for the fulfillment section on Delivery Note.
+
+    Prefers to sit just after the existing Shopify section so all Shopify state
+    is together, but goes through _section_boundary_anchor: returning
+    `shopify_store` directly would insert a Section Break in the middle of that
+    section and reparent every standard Delivery Note field that follows it.
     """
-    meta = frappe.get_meta("Delivery Note")
-    for fieldname in ["shopify_store", "shopify_order_id", "shopify_section",
-                      "inter_company_order_reference", "source", "tc_name"]:
-        if meta.get_field(fieldname):
-            return fieldname
-    return "amendment_date"
+    return _section_boundary_anchor(
+        "Delivery Note",
+        ["shopify_store", "shopify_order_id", "shopify_section",
+         "inter_company_order_reference", "source", "tc_name"],
+        "amendment_date",
+    )
 
 
 def create_delivery_note_fulfillment_custom_fields():

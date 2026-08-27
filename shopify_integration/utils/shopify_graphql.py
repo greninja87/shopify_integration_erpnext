@@ -41,6 +41,7 @@ import frappe
 
 from shopify_integration.utils.shopify_api import (
     ShopifyAPIError,
+    invalidate_cached_token,
     _BACKOFF_BASE,
     _MAX_ATTEMPTS,
     _MAX_SLEEP,
@@ -165,6 +166,11 @@ def execute(settings, query: str, variables: dict = None, operation: str = "") -
             raise ShopifyAPIError(f"{label} returned HTTP {status}.", status)
 
         if status in (401, 403):
+            # Same eviction as shopify_api.get(): drop any cached minted token so
+            # the next call re-mints.  Without this a rotated Client Secret would
+            # keep failing here for the life of the cache entry (~24h) while REST
+            # recovered on its very next call.
+            invalidate_cached_token(settings)
             raise ShopifyAPIError(
                 f"{label} returned HTTP {status} — the Admin API access token is "
                 f"invalid or lacks the required scopes. Fulfillment needs "

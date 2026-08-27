@@ -111,11 +111,17 @@ class _Meta:
         return {"fieldname": fieldname} if fieldname in self._fields else None
 
 
-def _db_get_value(doctype, filters, fieldname=None, **kwargs):
+def _db_get_value(doctype, filters, fieldname=None, as_dict=False, **kwargs):
     if isinstance(filters, str):
-        doc = DB.get(doctype, {}).get(filters, {})
+        if filters not in DB.get(doctype, {}):
+            return None            # real frappe returns None for a missing doc
+        doc = DB[doctype][filters]
         if isinstance(fieldname, (list, tuple)):
-            return types.SimpleNamespace(**{f: doc.get(f) for f in fieldname})
+            picked = {f: doc.get(f) for f in fieldname}
+            # Real frappe returns a frappe._dict (a dict subclass) when
+            # as_dict=True, so callers use .get() on it. Returning a
+            # SimpleNamespace here made the stub disagree with production.
+            return dict(picked) if as_dict else types.SimpleNamespace(**picked)
         return doc.get(fieldname)
     # dict filters — first doc whose fields all match
     for name, doc in DB.get(doctype, {}).items():

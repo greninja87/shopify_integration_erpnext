@@ -273,6 +273,7 @@ def _fulfil_store_delivery_notes(settings):
 
     from shopify_integration.utils.fulfillment import (
         STALE_CLAIM_MINUTES,
+        STATUS_FAILED,
         STATUS_PENDING,
         _fulfil_background,
     )
@@ -297,8 +298,21 @@ def _fulfil_store_delivery_notes(settings):
           AND IFNULL(so.shopify_order_id, '') != ''
           AND IFNULL(dn.custom_shopify_fulfillment_id, '') = ''
           AND (
-              IFNULL(dn.custom_shopify_fulfillment_status, '') != %(pending)s
-              OR IFNULL(dn.custom_shopify_fulfilled_at, '1900-01-01') <= %(stale_cutoff)s
+              -- Whitelist, not "anything except Pending": a Delivery Note whose
+              -- order was already fulfilled in Shopify ends up Fulfilled with a
+              -- BLANK id, and an exclusion rule would re-select it every hour
+              -- forever, spending a GraphQL query each time.
+              --
+              -- Spelled out rather than `IN %(tuple)s`: tuple expansion is a
+              -- driver behaviour, and this query only ever runs against a real
+              -- database, so the unambiguous form is worth the extra line.
+              IFNULL(dn.custom_shopify_fulfillment_status, '') = ''
+              OR IFNULL(dn.custom_shopify_fulfillment_status, '') = %(failed)s
+              -- ...plus a Pending claim abandoned by a killed worker.
+              OR (
+                  IFNULL(dn.custom_shopify_fulfillment_status, '') = %(pending)s
+                  AND IFNULL(dn.custom_shopify_fulfilled_at, '1900-01-01') <= %(stale_cutoff)s
+              )
           )
           AND (
               EXISTS (
@@ -322,6 +336,7 @@ def _fulfil_store_delivery_notes(settings):
         """,
         {
             "store": settings.shop_domain,
+            "failed": STATUS_FAILED,
             "pending": STATUS_PENDING,
             "stale_cutoff": stale_cutoff,
             "submit_cutoff": submit_cutoff,

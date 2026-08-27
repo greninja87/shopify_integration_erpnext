@@ -95,6 +95,19 @@ _ACTION_REQUEST = "REQUEST_FULFILLMENT"
 # mid-request) and becomes eligible again.
 STALE_CLAIM_MINUTES = 30
 
+# Statuses a Delivery Note can be re-attempted from.  Deliberately a whitelist:
+# STATUS_FULFILLED is reachable with a BLANK fulfillment id (the order was
+# already fulfilled in Shopify by hand), and an "anything except Pending" rule
+# would then re-select that document on every scheduler tick forever, spending a
+# GraphQL query each time to rediscover the same answer.
+#
+# STATUS_PENDING is deliberately absent: it is a live claim, handled separately
+# by the staleness check in _claim() and mirrored in the scheduler query.
+#
+# scheduler._fulfil_store_delivery_notes() reproduces this list in SQL — keep
+# the two in step.
+RETRYABLE_STATUSES = ("", STATUS_FAILED)
+
 # Shopify caps fulfillmentOrderLineItems at 512 per fulfillment order.
 _MAX_LINE_ITEMS = 512
 
@@ -258,10 +271,14 @@ def plan_fulfillment(fulfillment_orders, wanted) -> dict:
         if qty <= 0:
             continue
 
-        # Exact line-item-id match first; SKU only when we have no id to go on.
+        # Exact line-item-id match first.  Falling back to SKU matters when the
+        # stored id no longer exists on the order — a Shopify-side edit replaces
+        # a line and issues a new line_item.id, and refusing the line then would
+        # fail a Delivery Note whose SKU is sitting right there, fulfillable.
+        candidates = []
         if line_item_id:
             candidates = [p for p in pool if p["line_item_id"] == line_item_id]
-        else:
+        if not candidates and sku:
             candidates = [p for p in pool if p["sku"] and p["sku"] == sku.lower()]
 
         if not candidates:
@@ -272,6 +289,7 @@ def plan_fulfillment(fulfillment_orders, wanted) -> dict:
             continue
 
         remaining_to_place = qty
+        capped = False
         for candidate in candidates:
             if remaining_to_place <= 0:
                 break
@@ -279,6 +297,14 @@ def plan_fulfillment(fulfillment_orders, wanted) -> dict:
             if take <= 0:
                 continue
             rows = grouped.setdefault(candidate["fo_id"], [])
+            # Enforce Shopify's per-fulfillment-order cap HERE rather than
+            # truncating the payload afterwards.  Truncating later would leave
+            # `allocated` counting units that were never sent, so the Delivery
+            # Note would be marked Fulfilled while Shopify still showed them
+            # outstanding.
+            if len(rows) >= _MAX_LINE_ITEMS:
+                capped = True
+                continue
             rows.append({"id": candidate["fo_line_id"], "quantity": take})
             candidate["remaining"] -= take
             remaining_to_place -= take
@@ -287,11 +313,18 @@ def plan_fulfillment(fulfillment_orders, wanted) -> dict:
         if remaining_to_place > 0:
             unallocated.append({
                 "sku": sku, "qty": remaining_to_place,
-                "reason": "already fulfilled in Shopify, or no quantity remaining",
+                "reason": (
+                    f"fulfillment order already holds Shopify's maximum of "
+                    f"{_MAX_LINE_ITEMS} line items"
+                    if capped else
+                    "already fulfilled in Shopify, or no quantity remaining"
+                ),
             })
 
+    # No slicing here: the cap is applied during allocation above, so `rows` is
+    # already within bounds and `allocated` matches what is actually sent.
     line_items_by_fo = [
-        {"fulfillmentOrderId": fo_id, "fulfillmentOrderLineItems": rows[:_MAX_LINE_ITEMS]}
+        {"fulfillmentOrderId": fo_id, "fulfillmentOrderLineItems": rows}
         for fo_id, rows in grouped.items()
         if rows
     ]
@@ -577,6 +610,18 @@ def check_eligibility(dn_name: str, settings=None) -> dict:
 
     if (dn.get(FULFILLMENT_ID_FIELD) or "").strip():
         out["reason"] = "Already fulfilled in Shopify."
+        return out
+
+    # Resolved without an ERPNext-created fulfillment: the order was already
+    # fulfilled in Shopify, or the fulfillment was cancelled there.  Terminal —
+    # offering the button again would just rediscover the same answer.
+    #
+    # Derived from RETRYABLE_STATUSES so the button and the scheduler cannot
+    # disagree about what is worth another attempt.  Pending is excluded from
+    # this check because it is a live claim, not a resolution: _claim() decides
+    # whether it is stale.
+    if out["status"] and out["status"] not in RETRYABLE_STATUSES + (STATUS_PENDING,):
+        out["reason"] = f"Already resolved ({out['status']}) — nothing further to send."
         return out
 
     if cint(dn.get("is_return")):
