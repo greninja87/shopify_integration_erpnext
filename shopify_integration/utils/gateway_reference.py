@@ -10,7 +10,6 @@ payloads we receive:
 
     * there is no `transactions` array on the payload
     * `reference` and `source_identifier` are null
-    * `note_attributes` is empty for PayU orders
 
 So it has to be pulled:
 
@@ -19,10 +18,39 @@ So it has to be pulled:
 Verified against a live store: Shopify's "Payment Reference" for PayU equals
 PayU's own txnid exactly — order #6428 → rkdkuLhOZPiHLp9XVygf0ASij (25 chars).
 
+That is true for PayU, whose note_attributes carry no reference.  It is NOT
+true generally: a gateway wired in through a custom Shopify app is invisible to
+Shopify, leaves the transaction empty, and writes its reference into the order's
+note_attributes instead — so the order payload is a second source, not a dead
+end.  See _NOTE_ATTRIBUTE_KEYS.
+
+What the field is for
+---------------------
+ONE field for every payment portal: custom_gateway_reference holds the value
+that will appear as `gateway_order_ref` on the matching Gateway Transaction
+(Payment Portals) row, giving a Payment Entry and a settlement line a shared
+key.
+
+That matters because most portals put the Shopify order number on their
+settlement rows, so they match on it — but PayU does not.  Verified on live
+data: of 681 PayU settlement rows, zero matched automatically and exactly one
+was linked by hand, while Cashfree and Snapmint match on order name or platform
+order id.  The reference is the only join key PayU offers.
+
+Verified both sides for order #6428:
+    Shopify transaction.authorization = rkdkuLhOZPiHLp9XVygf0ASij
+    Gateway Transaction.gateway_order_ref = rkdkuLhOZPiHLp9XVygf0ASij
+
+One caveat for whoever writes the join: gateway_order_ref is NOT unique in
+Gateway Transaction — #6428 has three rows against it, two Failed and one
+Success.  Any match must also require event_status = "Success", mirroring the
+kind/status filter select_gateway_transaction() applies on the Shopify side.
+
 Where the value lands
 ---------------------
-    Payment Entry.custom_gateway_reference   the gateway transaction id
+    Payment Entry.custom_gateway_reference   the portal's order reference
     Payment Entry.custom_gateway_name        e.g. "Cards, UPI, NB by PayU India"
+                                             or "CASHFREE - UPI" from the tags
 
 `reference_no` is NOT touched.  It holds the Shopify order name (#6282) and
 other code depends on that.
@@ -50,6 +78,7 @@ from frappe.utils import cint
 
 from shopify_integration.utils.shopify_api import (
     ShopifyAPIError,
+    get_order,
     get_order_transactions,
     has_admin_api_credentials,
 )
@@ -70,6 +99,19 @@ _REFERENCE_PATHS = (
     ("receipt", "txnid"),
     ("receipt", "payment_id"),
 )
+
+# Order-level note_attributes keys carrying a gateway reference.
+#
+# Needed because a gateway integrated through a custom Shopify app is invisible
+# to Shopify: payment_gateway_names reads ["manual"], the transaction has no
+# `authorization` and an empty `receipt`, and the real reference is left in the
+# order's note_attributes instead.
+#
+# Only keys verified against live settlement data belong here — an invented key
+# would silently capture nothing.  Verified: Cashfree writes `pg_order_id`
+# (e.g. "notdrones.myshopify.com_lgbqpnzdkq"), which is byte-for-byte the
+# `gateway_order_ref` on the matching Gateway Transaction row.
+_NOTE_ATTRIBUTE_KEYS = ("pg_order_id",)
 
 # Strings that mean "no value" once a gateway has round-tripped its response
 # through JSON.  Writing any of these would be writing a placeholder.
@@ -169,32 +211,85 @@ def _receipt(txn) -> dict:
     return {}
 
 
-def extract_gateway_reference(txn) -> str:
-    """
-    The gateway reference from one transaction, or "".
-
-    Priority: authorization → receipt.txnid → receipt.payment_id.
-    Returns "" rather than a placeholder when every source is empty.
-    """
-    if not isinstance(txn, dict):
+def _note_attribute(order, key: str) -> str:
+    """One order-level note_attributes value by name, or ""."""
+    if not isinstance(order, dict):
         return ""
+    for attr in (order.get("note_attributes") or []):
+        if isinstance(attr, dict) and (attr.get("name") or "").strip() == key:
+            return _clean(attr.get("value"))
+    return ""
 
-    for path in _REFERENCE_PATHS:
-        if len(path) == 1:
-            candidate = _clean(txn.get(path[0]))
-        else:
-            candidate = _clean(_receipt(txn).get(path[1]))
+
+def extract_gateway_reference(txn, order=None) -> str:
+    """
+    The gateway reference for one payment, or "".
+
+    ONE value for every portal: whatever will appear as `gateway_order_ref` on
+    the matching Gateway Transaction row, so a Payment Entry and a settlement
+    line share a key.  Where that value lives on the Shopify side differs by
+    portal, which is why this is a resolution chain rather than a single field:
+
+        transaction.authorization      PayU — verified: the 25-char txnid, and
+                                       the same string as gateway_order_ref
+        receipt.txnid / .payment_id    gateways that return a receipt blob
+        note_attributes.pg_order_id    Cashfree via a custom app, which reports
+                                       payment_gateway_names ["manual"] and
+                                       leaves the transaction empty
+
+    Snapmint is deliberately unhandled: its gateway_order_ref is a 10-digit id
+    with no counterpart in the Shopify payload, and its settlement rows already
+    carry platform_order_name so they match on order name without help.
+
+    Returns "" rather than a placeholder when every source is empty.
+
+    :param txn:   one transaction from GET /orders/{id}/transactions.json
+    :param order: the order payload, for the note_attributes fallback.  Omit it
+                  and only the transaction-level sources are tried.
+    """
+    if isinstance(txn, dict):
+        for path in _REFERENCE_PATHS:
+            if len(path) == 1:
+                candidate = _clean(txn.get(path[0]))
+            else:
+                candidate = _clean(_receipt(txn).get(path[1]))
+            if candidate:
+                return candidate[:_MAX_REFERENCE_LEN]
+
+    for key in _NOTE_ATTRIBUTE_KEYS:
+        candidate = _note_attribute(order, key)
         if candidate:
             return candidate[:_MAX_REFERENCE_LEN]
 
     return ""
 
 
-def extract_gateway_name(txn) -> str:
-    """The gateway that processed the transaction, e.g. 'Cards, UPI, NB by PayU India'."""
-    if not isinstance(txn, dict):
-        return ""
-    return _clean(txn.get("gateway"))[:_MAX_REFERENCE_LEN]
+def extract_gateway_name(txn, order=None) -> str:
+    """
+    Which portal took the payment, e.g. 'Cards, UPI, NB by PayU India'.
+
+    `transaction.gateway` reads "manual" for a gateway integrated through a
+    custom app, which is worse than useless on a reconciliation field — it hides
+    that the payment was Cashfree.  So "manual" is treated as absent and the
+    order's tags are consulted instead, which is where those integrations put
+    the real gateway (e.g. "CASHFREE - UPI").  Same reasoning as the tag-first
+    matching in payment_entry._resolve_gateway_mapping().
+    """
+    gateway = _clean(txn.get("gateway")) if isinstance(txn, dict) else ""
+    if gateway and gateway.lower() != "manual":
+        return gateway[:_MAX_REFERENCE_LEN]
+
+    if isinstance(order, dict):
+        tags = _clean(order.get("tags"))
+        if tags:
+            return tags[:_MAX_REFERENCE_LEN]
+        names = order.get("payment_gateway_names") or []
+        if names:
+            first = _clean(names[0])
+            if first:
+                return first[:_MAX_REFERENCE_LEN]
+
+    return gateway[:_MAX_REFERENCE_LEN]
 
 
 # ── Field availability ────────────────────────────────────────────────────────
@@ -220,6 +315,7 @@ def capture_gateway_reference(
     shopify_order_id,
     settings=None,
     transactions=None,
+    order=None,
 ) -> str:
     """
     Fetch and store the gateway reference for one Payment Entry.
@@ -236,6 +332,10 @@ def capture_gateway_reference(
                              Sales Order when omitted
     :param transactions:     pre-fetched transactions list (used by the
                              backfill and by tests) to skip the HTTP call
+    :param order:            the order payload, for the note_attributes
+                             fallback.  Supplied free by the order-sync path;
+                             the backfill fetches it only when the transaction
+                             yields nothing.
     :return: the reference written, or "" when nothing was written
     """
     try:
@@ -286,25 +386,51 @@ def capture_gateway_reference(
             transactions = get_order_transactions(settings, order_id)
 
         txn = select_gateway_transaction(transactions)
-        if not txn:
+
+        reference = extract_gateway_reference(txn, order)
+
+        # No usable transaction AND nothing in the order: genuinely nothing to
+        # capture.  A missing transaction is not itself fatal — a Cashfree order
+        # reports payment_gateway_names ["manual"] and its reference lives in the
+        # order's note_attributes, so the order alone can still supply it.
+        if not txn and not reference:
             frappe.log_error(
                 f"No successful sale/capture transaction on Shopify order {order_id} "
-                f"(Payment Entry {pe_name}). {len(transactions or [])} transaction(s) "
-                f"returned. Gateway reference left blank.",
+                f"(Payment Entry {pe_name}), and no gateway reference in the order "
+                f"payload. {len(transactions or [])} transaction(s) returned. "
+                f"Gateway reference left blank.",
                 "Shopify: Gateway Reference Not Found",
             )
             return ""
 
-        reference = extract_gateway_reference(txn)
+        # Transaction empty, order not yet consulted — fetch it before giving up.
+        # Only reached on the backfill path; the order-sync path passes `order` in.
+        if not reference and order is None and _NOTE_ATTRIBUTE_KEYS:
+            try:
+                order = get_order(settings, order_id)
+                reference = extract_gateway_reference(txn, order)
+            except ShopifyAPIError as exc:
+                frappe.log_error(
+                    f"Could not fetch Shopify order {order_id} to look for a "
+                    f"gateway reference in note_attributes "
+                    f"(Payment Entry {pe_name}): {exc}",
+                    "Shopify: Gateway Reference Order Fetch Failed",
+                )
+
         if not reference:
             frappe.log_error(
                 "\n".join([
                     f"Shopify order {order_id} (Payment Entry {pe_name}): transaction "
-                    f"{txn.get('id')} carries no gateway reference.",
+                    f"{(txn or {}).get('id')} carries no gateway reference, and none "
+                    f"in the order payload either.",
                     "",
-                    f"gateway            : {txn.get('gateway') or '(blank)'}",
-                    f"authorization      : {txn.get('authorization') or '(blank)'}",
-                    f"receipt keys       : {sorted(_receipt(txn).keys()) or '(none)'}",
+                    f"gateway            : {(txn or {}).get('gateway') or '(blank)'}",
+                    f"authorization      : {(txn or {}).get('authorization') or '(blank)'}",
+                    f"receipt keys       : {sorted(_receipt(txn or {}).keys()) or '(none)'}",
+                    f"order tags         : {(order or {}).get('tags') or '(blank)'}",
+                    f"note_attributes    : "
+                    f"{sorted((a or {}).get('name') for a in ((order or {}).get('note_attributes') or []) if isinstance(a, dict)) or '(none)'}",
+                    f"looked for keys    : {list(_NOTE_ATTRIBUTE_KEYS)}",
                     "",
                     f"{REFERENCE_FIELD} left blank — no placeholder written.",
                 ]),
@@ -315,7 +441,7 @@ def capture_gateway_reference(
         # ── Write ────────────────────────────────────────────────────────────
         values = {REFERENCE_FIELD: reference}
 
-        gateway_name = extract_gateway_name(txn)
+        gateway_name = extract_gateway_name(txn, order)
         if gateway_name and _pe_has_field(GATEWAY_FIELD):
             values[GATEWAY_FIELD] = gateway_name
 
@@ -397,6 +523,7 @@ def capture_for_order(pe_name: str, order: dict, settings) -> str:
         pe_name,
         (order or {}).get("id"),
         settings=settings,
+        order=order,
     )
 
 
