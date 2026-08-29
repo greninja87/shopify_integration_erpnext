@@ -205,11 +205,98 @@ class TestResolutionOrder(unittest.TestCase):
         order = cashfree_order()
         self.assertEqual(gr.extract_gateway_reference(payu_txn(), order), PAYU_TXNID)
 
-    def test_receipt_beats_note_attributes(self):
+    def test_note_attribute_beats_the_receipt(self):
+        """
+        pg_order_id outranks every receipt key.  It is already in the webhook
+        payload, so it needs no /transactions.json receipt fetch, and it is the
+        string that appears as gateway_order_ref — verified char-for-char on
+        #6485, #6488, #6489 and the #6531 test order.
+        """
         txn = {"authorization": "", "receipt": {"txnid": "from_receipt"}}
         self.assertEqual(
-            gr.extract_gateway_reference(txn, cashfree_order()), "from_receipt"
+            gr.extract_gateway_reference(txn, cashfree_order()), CASHFREE_REF
         )
+
+    def test_pg_order_id_beats_cf_payment_id(self):
+        txn = {"authorization": "", "receipt": {"cf_payment_id": "6350248507"}}
+        self.assertEqual(
+            gr.extract_gateway_reference(txn, cashfree_order()), CASHFREE_REF
+        )
+
+    def test_cf_payment_id_is_used_when_pg_order_id_is_absent(self):
+        """
+        Cashfree's payment id joins too, so it is a sound fallback for an order
+        that carries no pg_order_id — just not worth a receipt fetch as the
+        primary.
+        """
+        txn = {"authorization": "", "receipt": {"cf_payment_id": "6350248507"}}
+        self.assertEqual(
+            gr.extract_gateway_reference(txn, payu_order()), "6350248507"
+        )
+
+    def test_cf_payment_id_beats_the_generic_receipt_keys(self):
+        txn = {
+            "authorization": "",
+            "receipt": {"cf_payment_id": "6350248507", "txnid": "generic"},
+        }
+        self.assertEqual(gr.extract_gateway_reference(txn, None), "6350248507")
+
+    def test_payu_authorization_still_outranks_everything(self):
+        """
+        PayU orders carry no pg_order_id, so the two never actually compete —
+        but if a store ever produced both, Shopify's own normalised reference
+        wins, because that is the string PayU settlement rows carry.
+        """
+        txn = dict(payu_txn(), receipt={"cf_payment_id": "6350248507"})
+        self.assertEqual(
+            gr.extract_gateway_reference(txn, cashfree_order()), PAYU_TXNID
+        )
+
+    def test_pg_order_id_is_written_verbatim_with_the_shop_prefix(self):
+        """
+        The shop-domain prefix stays.  gateway_order_ref carries it too, so
+        stripping it would break the join the field exists for.
+        """
+        order = {
+            "note_attributes": [
+                {"name": "pg_order_id", "value": "notdrones.myshopify.com_flytsieopj"}
+            ]
+        }
+        self.assertEqual(
+            gr.extract_gateway_reference(cashfree_txn(), order),
+            "notdrones.myshopify.com_flytsieopj",
+        )
+
+    def test_pg_order_id_is_taken_by_presence_not_payment_method(self):
+        """
+        23 of the 33 exported orders carrying pg_order_id record as "manual"
+        (partial-COD checkouts).  Keying off "Cashfree Payments" would capture
+        only 10 of the 33, so nothing here may look at payment_gateway_names.
+        """
+        for gateway_names in (["manual"], ["Cashfree Payments"], [], None):
+            order = dict(cashfree_order(), payment_gateway_names=gateway_names)
+            self.assertEqual(
+                gr.extract_gateway_reference(cashfree_txn(), order), CASHFREE_REF
+            )
+
+    def test_every_declared_source_is_reachable(self):
+        """
+        Guards the table against a typo'd `where`: an entry nobody can resolve
+        would sit there looking like coverage it does not provide.
+        """
+        for label, where, key in gr._REFERENCE_SOURCES:
+            if where == "txn":
+                txn, order = {key: "HIT"}, None
+            elif where == "receipt":
+                txn, order = {"receipt": {key: "HIT"}}, None
+            elif where == "note":
+                txn = {}
+                order = {"note_attributes": [{"name": key, "value": "HIT"}]}
+            else:
+                self.fail(f"unknown source kind {where!r} on {label}")
+            self.assertEqual(
+                gr.extract_gateway_reference(txn, order), "HIT", f"{label} unreachable"
+            )
 
     def test_only_verified_note_attribute_keys_are_read(self):
         """An unverified key must not be guessed at."""

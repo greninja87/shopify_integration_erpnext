@@ -91,27 +91,57 @@ GATEWAY_FIELD   = "custom_gateway_name"
 # appears on the gateway's settlement report.
 _ELIGIBLE_KINDS = ("sale", "capture")
 
-# Where the reference lives, in priority order.  `authorization` is Shopify's
-# own normalised home for the gateway reference; the receipt blob is the
-# gateway's raw response and differs per provider.
-_REFERENCE_PATHS = (
-    ("authorization",),
-    ("receipt", "txnid"),
-    ("receipt", "payment_id"),
+# Where the reference lives, in priority order.  ONE table: every source lives
+# here, so the precedence is readable top to bottom and adding a portal is a
+# single line rather than a change to control flow.
+#
+# Each entry is (source_label, where, key):
+#     "txn"      a field on the transaction from /transactions.json
+#     "receipt"  a key inside that transaction's `receipt` blob
+#     "note"     an order-level note_attributes entry, from the webhook payload
+#
+# Only sources verified against live settlement data belong here.  An invented
+# key silently captures nothing while looking like it works.
+#
+# Order matters, and this is why:
+#
+#   authorization    PayU's txnid.  Verified char-for-char against
+#                    Gateway Transaction.gateway_order_ref on #6428.  PayU
+#                    orders carry no pg_order_id, so this never competes with
+#                    the Cashfree source below.
+#
+#   pg_order_id      Cashfree, and deliberately ABOVE the receipt keys: it is
+#                    already in the webhook payload, so it costs no extra call,
+#                    and it is verified char-for-char against gateway_order_ref
+#                    on #6485, #6488, #6489 and the #6531 test order.  Taken by
+#                    PRESENCE, never by payment method — of 50 exported orders
+#                    33 carry it and 23 of those record as "manual" (partial-COD
+#                    checkouts), so keying off "Cashfree Payments" would catch
+#                    only 10 of the 33.
+#                    Unambiguous in this data: across 337 successful Cashfree
+#                    payments every order reference maps to exactly one payment.
+#                    The 20/80 splits go through partial COD, where Cashfree only
+#                    ever sees the deposit and the balance is collected on
+#                    delivery — so the order id still identifies one payment.
+#
+#   cf_payment_id    Cashfree's payment id (e.g. "6350248507").  It also joins,
+#                    so it is a sound fallback for an order missing
+#                    pg_order_id — just not worth a receipt fetch as the primary.
+#
+#   txnid /          generic receipt keys other gateways use.
+#   payment_id
+_REFERENCE_SOURCES = (
+    ("transaction.authorization",      "txn",     "authorization"),
+    ("note_attributes.pg_order_id",    "note",    "pg_order_id"),
+    ("receipt.cf_payment_id",          "receipt", "cf_payment_id"),
+    ("receipt.txnid",                  "receipt", "txnid"),
+    ("receipt.payment_id",             "receipt", "payment_id"),
 )
 
-# Order-level note_attributes keys carrying a gateway reference.
-#
-# Needed because a gateway integrated through a custom Shopify app is invisible
-# to Shopify: payment_gateway_names reads ["manual"], the transaction has no
-# `authorization` and an empty `receipt`, and the real reference is left in the
-# order's note_attributes instead.
-#
-# Only keys verified against live settlement data belong here — an invented key
-# would silently capture nothing.  Verified: Cashfree writes `pg_order_id`
-# (e.g. "notdrones.myshopify.com_lgbqpnzdkq"), which is byte-for-byte the
-# `gateway_order_ref` on the matching Gateway Transaction row.
-_NOTE_ATTRIBUTE_KEYS = ("pg_order_id",)
+# Kept for readability elsewhere: the note-attribute keys this app reads.
+_NOTE_ATTRIBUTE_KEYS = tuple(
+    key for _label, where, key in _REFERENCE_SOURCES if where == "note"
+)
 
 # Strings that mean "no value" once a gateway has round-tripped its response
 # through JSON.  Writing any of these would be writing a placeholder.
@@ -228,40 +258,46 @@ def extract_gateway_reference(txn, order=None) -> str:
     ONE value for every portal: whatever will appear as `gateway_order_ref` on
     the matching Gateway Transaction row, so a Payment Entry and a settlement
     line share a key.  Where that value lives on the Shopify side differs by
-    portal, which is why this is a resolution chain rather than a single field:
+    portal, so the sources are tried in the order declared by
+    _REFERENCE_SOURCES — see the reasoning recorded there.
 
-        transaction.authorization      PayU — verified: the 25-char txnid, and
-                                       the same string as gateway_order_ref
-        receipt.txnid / .payment_id    gateways that return a receipt blob
-        note_attributes.pg_order_id    Cashfree via a custom app, which reports
-                                       payment_gateway_names ["manual"] and
-                                       leaves the transaction empty
+    The value is written through VERBATIM.  Cashfree's pg_order_id carries the
+    shop domain ("notdrones.myshopify.com_flytsieopj") and the settlement's
+    gateway_order_ref carries it too, so stripping the prefix would break the
+    join it exists for.
 
     Snapmint is deliberately unhandled: its gateway_order_ref is a 10-digit id
     with no counterpart in the Shopify payload, and its settlement rows already
-    carry platform_order_name so they match on order name without help.
+    carry platform_order_name, so they match on order name without help.
 
     Returns "" rather than a placeholder when every source is empty.
 
     :param txn:   one transaction from GET /orders/{id}/transactions.json
-    :param order: the order payload, for the note_attributes fallback.  Omit it
-                  and only the transaction-level sources are tried.
+    :param order: the order payload, carrying the note_attributes sources.
+                  Omit it and only the transaction-level sources are tried.
     """
-    if isinstance(txn, dict):
-        for path in _REFERENCE_PATHS:
-            if len(path) == 1:
-                candidate = _clean(txn.get(path[0]))
-            else:
-                candidate = _clean(_receipt(txn).get(path[1]))
-            if candidate:
-                return candidate[:_MAX_REFERENCE_LEN]
+    return _resolve_reference(txn, order)[0]
 
-    for key in _NOTE_ATTRIBUTE_KEYS:
-        candidate = _note_attribute(order, key)
+
+def _resolve_reference(txn, order) -> tuple:
+    """
+    (reference, source_label) — "" and "" when no source yields a value.
+
+    Separate from extract_gateway_reference so the diagnostic log can say WHICH
+    rule produced a value, without the caller having to re-derive it.
+    """
+    for label, where, key in _REFERENCE_SOURCES:
+        if where == "txn":
+            candidate = _clean(txn.get(key)) if isinstance(txn, dict) else ""
+        elif where == "receipt":
+            candidate = _clean(_receipt(txn).get(key)) if isinstance(txn, dict) else ""
+        else:
+            candidate = _note_attribute(order, key)
+
         if candidate:
-            return candidate[:_MAX_REFERENCE_LEN]
+            return candidate[:_MAX_REFERENCE_LEN], label
 
-    return ""
+    return "", ""
 
 
 def extract_gateway_name(txn, order=None) -> str:
@@ -387,7 +423,7 @@ def capture_gateway_reference(
 
         txn = select_gateway_transaction(transactions)
 
-        reference = extract_gateway_reference(txn, order)
+        reference, source = _resolve_reference(txn, order)
 
         # No usable transaction AND nothing in the order: genuinely nothing to
         # capture.  A missing transaction is not itself fatal — a Cashfree order
@@ -408,7 +444,7 @@ def capture_gateway_reference(
         if not reference and order is None and _NOTE_ATTRIBUTE_KEYS:
             try:
                 order = get_order(settings, order_id)
-                reference = extract_gateway_reference(txn, order)
+                reference, source = _resolve_reference(txn, order)
             except ShopifyAPIError as exc:
                 frappe.log_error(
                     f"Could not fetch Shopify order {order_id} to look for a "
@@ -430,7 +466,7 @@ def capture_gateway_reference(
                     f"order tags         : {(order or {}).get('tags') or '(blank)'}",
                     f"note_attributes    : "
                     f"{sorted((a or {}).get('name') for a in ((order or {}).get('note_attributes') or []) if isinstance(a, dict)) or '(none)'}",
-                    f"looked for keys    : {list(_NOTE_ATTRIBUTE_KEYS)}",
+                    f"sources tried      : {[label for label, _w, _k in _REFERENCE_SOURCES]}",
                     "",
                     f"{REFERENCE_FIELD} left blank — no placeholder written.",
                 ]),
@@ -457,7 +493,7 @@ def capture_gateway_reference(
 
         frappe.logger().info(
             f"Shopify: gateway reference {reference} captured on Payment Entry "
-            f"{pe_name} (order {order_id})."
+            f"{pe_name} (order {order_id}) from {source or 'unknown source'}."
         )
         return reference
 
