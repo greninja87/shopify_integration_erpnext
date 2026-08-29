@@ -41,9 +41,30 @@ def _seed_pe(name="PE-2026-00042", reference_no="#6428", gateway_reference=""):
     return name
 
 
-class TestCaptureGatewayReference(unittest.TestCase):
+class _OfflineCase(unittest.TestCase):
+    """
+    Base case that keeps the suite off the network.
+
+    capture_gateway_reference() fetches the order when a higher-ranked source
+    could live in its note_attributes, which is every backfill-shaped call here.
+    These tests stub get_order_transactions but not get_order, so without this
+    the real client runs: a rate-limit sleep and a DNS lookup per test, and a
+    suite that fails differently depending on whether the machine is online.
+
+    Returning {} is the honest default — an order with nothing in it.  A test
+    that cares what the order holds overrides gr.get_order itself.
+    """
+
     def setUp(self):
         frappe_stub.reset()
+        self._real_get_order = gr.get_order
+        gr.get_order = lambda settings, order_id: {}
+        self.addCleanup(setattr, gr, "get_order", self._real_get_order)
+
+
+class TestCaptureGatewayReference(_OfflineCase):
+    def setUp(self):
+        super().setUp()
 
     def test_writes_reference_and_gateway(self):
         pe = _seed_pe()
@@ -225,9 +246,9 @@ class TestCaptureGatewayReference(unittest.TestCase):
         self.assertTrue(any("Gateway Reference Failed" in title for _msg, title in frappe_stub.ERRORS))
 
 
-class TestCaptureForOrder(unittest.TestCase):
+class TestCaptureForOrder(_OfflineCase):
     def setUp(self):
-        frappe_stub.reset()
+        super().setUp()
 
     def test_reads_order_id_from_payload(self):
         pe = _seed_pe()
@@ -247,9 +268,9 @@ class TestCaptureForOrder(unittest.TestCase):
         self.assertEqual(frappe_stub.WRITES, [])
 
 
-class TestBackfill(unittest.TestCase):
+class TestBackfill(_OfflineCase):
     def setUp(self):
-        frappe_stub.reset()
+        super().setUp()
 
     def _pending_rows(self, rows):
         frappe_stub.SQL_RESULTS["FROM `tabPayment Entry` pe"] = rows

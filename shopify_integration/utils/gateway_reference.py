@@ -105,24 +105,48 @@ _ELIGIBLE_KINDS = ("sale", "capture")
 #
 # Order matters, and this is why:
 #
-#   authorization    PayU's txnid.  Verified char-for-char against
-#                    Gateway Transaction.gateway_order_ref on #6428.  PayU
-#                    orders carry no pg_order_id, so this never competes with
-#                    the Cashfree source below.
+#   pg_order_id      Cashfree, and FIRST — above authorization, which is the one
+#                    place a lower rule would otherwise win wrongly.
 #
-#   pg_order_id      Cashfree, and deliberately ABOVE the receipt keys: it is
-#                    already in the webhook payload, so it costs no extra call,
-#                    and it is verified char-for-char against gateway_order_ref
-#                    on #6485, #6488, #6489 and the #6531 test order.  Taken by
-#                    PRESENCE, never by payment method — of 50 exported orders
-#                    33 carry it and 23 of those record as "manual" (partial-COD
-#                    checkouts), so keying off "Cashfree Payments" would catch
-#                    only 10 of the 33.
-#                    Unambiguous in this data: across 337 successful Cashfree
-#                    payments every order reference maps to exactly one payment.
-#                    The 20/80 splits go through partial COD, where Cashfree only
-#                    ever sees the deposit and the balance is collected on
-#                    delivery — so the order id still identifies one payment.
+#                    Partial-COD orders carry BOTH: a pg_order_id and a Shopify
+#                    authorization.  Checked against the live Gateway Transaction
+#                    table, those authorization tokens
+#                    (rrrVTRPeGEZpqXT7sm1arpwjU, rEB8slEtDZbB24mGf2o1xDbG4 and
+#                    four more) match nothing at all — neither gateway_order_ref
+#                    nor gateway_payment_id.  The pg_order_ids for those same
+#                    orders matched every one of the five tested, each a
+#                    successful Cashfree payment.  With authorization first, 23
+#                    of the 50 orders in the 29 Aug export would be given a
+#                    reference that can never join, and an unjoinable reference
+#                    is indistinguishable from a missing one.
+#
+#                    "PayU orders carry no pg_order_id" is true, but PayU is not
+#                    the only gateway producing an authorization — the
+#                    partial-COD checkouts produce one too, which is what made
+#                    the two compete.
+#
+#                    Also cheap and verified: it is already in the webhook
+#                    payload, so it costs no extra call, and it is char-for-char
+#                    gateway_order_ref on #6485, #6488, #6489 and the #6531 test
+#                    order.  Unambiguous in this data — across 337 successful
+#                    Cashfree payments every order reference maps to exactly one
+#                    payment.  The 20/80 splits go through partial COD, where
+#                    Cashfree only ever sees the deposit and the balance is
+#                    collected on delivery, so the order id still identifies one
+#                    payment.
+#
+#                    Taken by PRESENCE, never by payment method — of the 50
+#                    exported orders 33 carry it and 23 of those record as
+#                    "manual", so keying off "Cashfree Payments" would catch only
+#                    10 of the 33.  Putting this rule first is what lets the
+#                    table stay presence-only: no gateway-name test is needed to
+#                    keep authorization off a Cashfree order.
+#
+#   authorization    PayU's txnid.  Verified char-for-char against
+#                    Gateway Transaction.gateway_order_ref on #6428.  Safe at #2
+#                    because no PayU order in the export carries a pg_order_id —
+#                    all 33 that do are "manual" or "Cashfree Payments" — so rule
+#                    #1 never fires for PayU and this still wins for it.
 #
 #   cf_payment_id    Cashfree's payment id (e.g. "6350248507").  It also joins,
 #                    so it is a sound fallback for an order missing
@@ -131,8 +155,8 @@ _ELIGIBLE_KINDS = ("sale", "capture")
 #   txnid /          generic receipt keys other gateways use.
 #   payment_id
 _REFERENCE_SOURCES = (
-    ("transaction.authorization",      "txn",     "authorization"),
     ("note_attributes.pg_order_id",    "note",    "pg_order_id"),
+    ("transaction.authorization",      "txn",     "authorization"),
     ("receipt.cf_payment_id",          "receipt", "cf_payment_id"),
     ("receipt.txnid",                  "receipt", "txnid"),
     ("receipt.payment_id",             "receipt", "payment_id"),
@@ -142,6 +166,23 @@ _REFERENCE_SOURCES = (
 _NOTE_ATTRIBUTE_KEYS = tuple(
     key for _label, where, key in _REFERENCE_SOURCES if where == "note"
 )
+
+# Rank of the best order-level source, and a rank lookup for a source label.
+# Both derive from the table, so reordering it above needs no change here.
+#
+# These exist for the backfill path, which starts without the order payload:
+# they answer "could fetching the order still beat what I have?".  An unresolved
+# source ranks worse than every real one.
+_BEST_NOTE_RANK = next(
+    (i for i, (_l, where, _k) in enumerate(_REFERENCE_SOURCES) if where == "note"),
+    None,
+)
+_SOURCE_RANK = {label: i for i, (label, _w, _k) in enumerate(_REFERENCE_SOURCES)}
+
+
+def _rank(source_label: str) -> int:
+    """Position of a source in the table; worse than any of them when unset."""
+    return _SOURCE_RANK.get(source_label, len(_REFERENCE_SOURCES))
 
 # Strings that mean "no value" once a gateway has round-tripped its response
 # through JSON.  Writing any of these would be writing a placeholder.
@@ -439,12 +480,28 @@ def capture_gateway_reference(
             )
             return ""
 
-        # Transaction empty, order not yet consulted — fetch it before giving up.
-        # Only reached on the backfill path; the order-sync path passes `order` in.
-        if not reference and order is None and _NOTE_ATTRIBUTE_KEYS:
+        # The order has not been consulted yet and it holds a source that
+        # outranks whatever the transaction gave us — fetch it.  Only reached on
+        # the backfill path; the order-sync path passes `order` in.
+        #
+        # The test is on RANK, not on `not reference`.  A partial-COD Cashfree
+        # order carries both a pg_order_id and an authorization that joins to
+        # nothing, so stopping as soon as the transaction yields anything would
+        # write the unjoinable one and never look at the order — which is the
+        # whole reason pg_order_id sits at the top of the table.
+        if (
+            order is None
+            and _BEST_NOTE_RANK is not None
+            and _BEST_NOTE_RANK < _rank(source)
+        ):
             try:
                 order = get_order(settings, order_id)
-                reference, source = _resolve_reference(txn, order)
+                # Re-resolve with the order in hand.  Guarded because the order
+                # may carry nothing: a lower-ranked transaction value we already
+                # have is better than dropping back to blank.
+                fetched, fetched_source = _resolve_reference(txn, order)
+                if fetched:
+                    reference, source = fetched, fetched_source
             except ShopifyAPIError as exc:
                 frappe.log_error(
                     f"Could not fetch Shopify order {order_id} to look for a "

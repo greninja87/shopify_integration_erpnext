@@ -196,14 +196,28 @@ class TestResolutionOrder(unittest.TestCase):
     def setUp(self):
         frappe_stub.reset()
 
-    def test_transaction_wins_over_note_attributes(self):
+    def test_pg_order_id_wins_when_an_order_carries_both(self):
         """
-        When both exist the transaction is authoritative: it is the gateway's own
-        normalised reference, while note_attributes is written by a third-party
-        app.
+        The case the ordering exists for.  Partial-COD Cashfree orders carry a
+        pg_order_id AND a Shopify authorization, and the authorization joins to
+        nothing — six were checked against the live Gateway Transaction table
+        and matched neither gateway_order_ref nor gateway_payment_id.  An
+        unjoinable reference is no better than a blank one.
         """
-        order = cashfree_order()
-        self.assertEqual(gr.extract_gateway_reference(payu_txn(), order), PAYU_TXNID)
+        txn = dict(cashfree_txn(), authorization="rrrVTRPeGEZpqXT7sm1arpwjU")
+        self.assertEqual(
+            gr.extract_gateway_reference(txn, cashfree_order()), CASHFREE_REF
+        )
+
+    def test_authorization_wins_when_there_is_no_pg_order_id(self):
+        """
+        A PayU order, which is the realistic shape: no PayU order in the export
+        carries a pg_order_id, so rule #1 does not fire and the authorization
+        still wins.
+        """
+        self.assertEqual(
+            gr.extract_gateway_reference(payu_txn(), payu_order()), PAYU_TXNID
+        )
 
     def test_note_attribute_beats_the_receipt(self):
         """
@@ -241,15 +255,15 @@ class TestResolutionOrder(unittest.TestCase):
         }
         self.assertEqual(gr.extract_gateway_reference(txn, None), "6350248507")
 
-    def test_payu_authorization_still_outranks_everything(self):
+    def test_payu_authorization_outranks_the_receipt_keys(self):
         """
-        PayU orders carry no pg_order_id, so the two never actually compete —
-        but if a store ever produced both, Shopify's own normalised reference
-        wins, because that is the string PayU settlement rows carry.
+        On a PayU order — no pg_order_id, which is every PayU order in the
+        export — the authorization beats anything in the receipt, because that
+        is the string PayU settlement rows carry.
         """
         txn = dict(payu_txn(), receipt={"cf_payment_id": "6350248507"})
         self.assertEqual(
-            gr.extract_gateway_reference(txn, cashfree_order()), PAYU_TXNID
+            gr.extract_gateway_reference(txn, payu_order()), PAYU_TXNID
         )
 
     def test_pg_order_id_is_written_verbatim_with_the_shop_prefix(self):
@@ -422,7 +436,13 @@ class TestBackfillFetchesTheOrder(unittest.TestCase):
         self.assertEqual(ref, CASHFREE_REF)
         self.assertEqual(len(calls), 1, "should fetch the order exactly once")
 
-    def test_order_is_not_fetched_when_the_transaction_suffices(self):
+    def test_order_is_fetched_even_when_the_transaction_has_a_value(self):
+        """
+        The backfill starts without the order payload, so an authorization in
+        hand does NOT mean we can stop: pg_order_id outranks it, and only the
+        order can supply that.  A PayU order carries none, so the authorization
+        survives the check — but the check has to happen.
+        """
         calls = []
         original = gr.get_order
         gr.get_order = lambda settings, oid: (calls.append(oid), payu_order())[1]
@@ -436,7 +456,69 @@ class TestBackfillFetchesTheOrder(unittest.TestCase):
             gr.get_order = original
 
         self.assertEqual(ref, PAYU_TXNID)
-        self.assertEqual(calls, [], "no wasted API call when authorization is present")
+        self.assertEqual(len(calls), 1, "must look for a higher-ranked source")
+
+    def test_backfill_prefers_pg_order_id_over_the_authorization(self):
+        """
+        The regression this ordering exists for, on the path that will actually
+        repair the 23 affected orders.  A partial-COD order carries both; the
+        authorization joins to nothing, so the fetched pg_order_id must win.
+        """
+        original = gr.get_order
+        gr.get_order = lambda settings, oid: cashfree_order()
+        try:
+            ref = gr.capture_gateway_reference(
+                "PE-0002", 7840770392169,
+                settings=frappe_stub.FakeSettings(),
+                transactions=[
+                    dict(cashfree_txn(), authorization="rrrVTRPeGEZpqXT7sm1arpwjU")
+                ],
+            )
+        finally:
+            gr.get_order = original
+
+        self.assertEqual(ref, CASHFREE_REF)
+
+    def test_transaction_value_survives_a_failed_order_fetch(self):
+        """
+        Fetching for a better source is an upgrade attempt, not a precondition.
+        If the order cannot be fetched, keep the lower-ranked value we already
+        had rather than dropping the reference to blank.
+        """
+        original = gr.get_order
+
+        def boom(settings, oid):
+            raise gr.ShopifyAPIError("500 from Shopify", 500)
+
+        gr.get_order = boom
+        try:
+            ref = gr.capture_gateway_reference(
+                "PE-0002", 7840691126377,
+                settings=frappe_stub.FakeSettings(),
+                transactions=[payu_txn()],
+            )
+        finally:
+            gr.get_order = original
+
+        self.assertEqual(ref, PAYU_TXNID)
+
+    def test_order_sync_path_does_not_refetch_the_order(self):
+        """The order-sync path passes the order in; it must never re-fetch."""
+        calls = []
+        original = gr.get_order
+        gr.get_order = lambda settings, oid: (calls.append(oid), cashfree_order())[1]
+        try:
+            ref = gr.capture_gateway_reference(
+                "PE-0002", 7840770392169,
+                settings=frappe_stub.FakeSettings(),
+                transactions=[cashfree_txn()],
+                order=cashfree_order(),
+            )
+        finally:
+            gr.get_order = original
+
+        self.assertEqual(ref, CASHFREE_REF)
+        self.assertEqual(calls, [], "the order was supplied; no call needed")
 
     def test_order_fetch_failure_is_survivable(self):
         original = gr.get_order
