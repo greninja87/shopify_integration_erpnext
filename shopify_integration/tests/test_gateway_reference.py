@@ -19,6 +19,7 @@ from shopify_integration.tests.frappe_stub import install as _install_frappe_stu
 _install_frappe_stub()
 
 from shopify_integration.utils.gateway_reference import (  # noqa: E402
+    extract_gateway_name,
     extract_gateway_reference,
     select_gateway_transaction,
 )
@@ -184,6 +185,33 @@ class TestExtractGatewayReference(unittest.TestCase):
         # Shopify sometimes returns the literal string "null" in receipt blobs.
         txn = {"authorization": "null", "receipt": {"txnid": "None"}}
         self.assertEqual(extract_gateway_reference(txn), "")
+
+
+class TestGatewayNameNeverSaysManual(unittest.TestCase):
+    """
+    "manual" is what Shopify reports for a gateway wired in through a custom
+    app.  It names no portal, so it must never reach a field described as
+    "identifies which settlement portal the reference belongs to" — there it
+    would be a placeholder wearing the shape of real data.
+    """
+
+    def test_manual_with_no_order_is_blank(self):
+        self.assertEqual(extract_gateway_name({"gateway": "manual"}), "")
+
+    def test_manual_with_an_orderless_backfill_is_blank(self):
+        self.assertEqual(extract_gateway_name({"gateway": "MANUAL"}, None), "")
+
+    def test_manual_falls_back_to_the_tags_when_the_order_is_there(self):
+        order = {"tags": "CASHFREE - UPI"}
+        self.assertEqual(
+            extract_gateway_name({"gateway": "manual"}, order), "CASHFREE - UPI"
+        )
+
+    def test_a_real_gateway_is_still_returned(self):
+        self.assertEqual(
+            extract_gateway_name({"gateway": "Cards, UPI, NB by PayU India"}),
+            "Cards, UPI, NB by PayU India",
+        )
 
 
 if __name__ == "__main__":

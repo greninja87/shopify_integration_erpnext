@@ -479,11 +479,16 @@ class TestBackfillFetchesTheOrder(unittest.TestCase):
 
         self.assertEqual(ref, CASHFREE_REF)
 
-    def test_transaction_value_survives_a_failed_order_fetch(self):
+    def test_failed_order_fetch_writes_nothing_rather_than_a_worse_value(self):
         """
-        Fetching for a better source is an upgrade attempt, not a precondition.
-        If the order cannot be fetched, keep the lower-ranked value we already
-        had rather than dropping the reference to blank.
+        A transient 500 must leave the field BLANK, not fall back to the
+        transaction.
+
+        This write is effectively permanent: the idempotency guard returns early
+        on a filled field and the backfill selects only blank ones.  Settling
+        for the authorization would bake in a value that, on a partial-COD
+        order, joins to nothing — and no re-run would ever correct it.  Blank is
+        retryable; wrong is not.
         """
         original = gr.get_order
 
@@ -500,7 +505,89 @@ class TestBackfillFetchesTheOrder(unittest.TestCase):
         finally:
             gr.get_order = original
 
+        self.assertEqual(ref, "")
+        self.assertEqual(frappe_stub.WRITES, [], "nothing may be written")
+        self.assertTrue(any("Order Fetch Failed" in t for _m, t in frappe_stub.ERRORS))
+
+    def test_reference_is_captured_with_no_eligible_transaction(self):
+        """
+        An order can carry its reference while Shopify holds no successful
+        sale/capture transaction for it.  The order is consulted first now, so
+        the "no usable transaction" path no longer discards a reference that was
+        sitting in the payload.
+        """
+        original = gr.get_order
+        gr.get_order = lambda settings, oid: cashfree_order()
+        try:
+            ref = gr.capture_gateway_reference(
+                "PE-0002", 7840770392169,
+                settings=frappe_stub.FakeSettings(),
+                transactions=[],
+            )
+        finally:
+            gr.get_order = original
+
+        self.assertEqual(ref, CASHFREE_REF)
+
+    def test_reference_is_captured_when_every_transaction_failed(self):
+        original = gr.get_order
+        gr.get_order = lambda settings, oid: cashfree_order()
+        try:
+            ref = gr.capture_gateway_reference(
+                "PE-0002", 7840770392169,
+                settings=frappe_stub.FakeSettings(),
+                transactions=[{
+                    "id": 1, "kind": "sale", "status": "failure",
+                    "created_at": "2026-08-27T14:00:00+05:30",
+                }],
+            )
+        finally:
+            gr.get_order = original
+
+        self.assertEqual(ref, CASHFREE_REF)
+
+    def test_transactions_are_not_fetched_when_the_order_resolves(self):
+        """
+        The order holds the top-ranked source, so a resolving order means
+        /transactions.json is never called — one request per entry against the
+        2 req/sec budget instead of two.
+        """
+        txn_calls = []
+        original_order = gr.get_order
+        original_txns  = gr.get_order_transactions
+        gr.get_order = lambda settings, oid: cashfree_order()
+        gr.get_order_transactions = lambda settings, oid: (
+            txn_calls.append(oid), [cashfree_txn()]
+        )[1]
+        try:
+            ref = gr.capture_gateway_reference(
+                "PE-0002", 7840770392169, settings=frappe_stub.FakeSettings(),
+            )
+        finally:
+            gr.get_order = original_order
+            gr.get_order_transactions = original_txns
+
+        self.assertEqual(ref, CASHFREE_REF)
+        self.assertEqual(txn_calls, [], "the order already gave the best source")
+
+    def test_transactions_are_fetched_when_the_order_does_not_resolve(self):
+        txn_calls = []
+        original_order = gr.get_order
+        original_txns  = gr.get_order_transactions
+        gr.get_order = lambda settings, oid: payu_order()
+        gr.get_order_transactions = lambda settings, oid: (
+            txn_calls.append(oid), [payu_txn()]
+        )[1]
+        try:
+            ref = gr.capture_gateway_reference(
+                "PE-0002", 7840691126377, settings=frappe_stub.FakeSettings(),
+            )
+        finally:
+            gr.get_order = original_order
+            gr.get_order_transactions = original_txns
+
         self.assertEqual(ref, PAYU_TXNID)
+        self.assertEqual(len(txn_calls), 1)
 
     def test_order_sync_path_does_not_refetch_the_order(self):
         """The order-sync path passes the order in; it must never re-fetch."""

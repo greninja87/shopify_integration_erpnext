@@ -20,9 +20,12 @@ PayU's own txnid exactly — order #6428 → rkdkuLhOZPiHLp9XVygf0ASij (25 chars
 
 That is true for PayU, whose note_attributes carry no reference.  It is NOT
 true generally: a gateway wired in through a custom Shopify app is invisible to
-Shopify, leaves the transaction empty, and writes its reference into the order's
-note_attributes instead — so the order payload is a second source, not a dead
-end.  See _NOTE_ATTRIBUTE_KEYS.
+Shopify, leaves the transaction empty or misleading, and writes its reference
+into the order's note_attributes instead.
+
+So the ORDER, not the transaction, holds the highest-ranked source, and it is
+read first — a Cashfree order resolves without a transactions.json call at all.
+See _REFERENCE_SOURCES for the full precedence and the evidence behind it.
 
 What the field is for
 ---------------------
@@ -351,6 +354,11 @@ def extract_gateway_name(txn, order=None) -> str:
     order's tags are consulted instead, which is where those integrations put
     the real gateway (e.g. "CASHFREE - UPI").  Same reasoning as the tag-first
     matching in payment_entry._resolve_gateway_mapping().
+
+    Returns "" when the only thing on offer IS "manual" — with no order to read
+    tags from, there is nothing to say.  Writing "manual" onto a field described
+    as "identifies which settlement portal the reference belongs to" would be a
+    placeholder: it names no portal while looking like captured data.
     """
     gateway = _clean(txn.get("gateway")) if isinstance(txn, dict) else ""
     if gateway and gateway.lower() != "manual":
@@ -366,6 +374,8 @@ def extract_gateway_name(txn, order=None) -> str:
             if first:
                 return first[:_MAX_REFERENCE_LEN]
 
+    if gateway.lower() == "manual":
+        return ""
     return gateway[:_MAX_REFERENCE_LEN]
 
 
@@ -409,10 +419,11 @@ def capture_gateway_reference(
                              Sales Order when omitted
     :param transactions:     pre-fetched transactions list (used by the
                              backfill and by tests) to skip the HTTP call
-    :param order:            the order payload, for the note_attributes
-                             fallback.  Supplied free by the order-sync path;
-                             the backfill fetches it only when the transaction
-                             yields nothing.
+    :param order:            the order payload, carrying the highest-ranked
+                             source in _REFERENCE_SOURCES.  Supplied free by the
+                             order-sync path; fetched first when absent, which
+                             is why an order whose note_attributes resolve never
+                             costs a /transactions.json call at all.
     :return: the reference written, or "" when nothing was written
     """
     try:
@@ -455,60 +466,83 @@ def capture_gateway_reference(
 
         # No token configured → the feature is simply off for this store.
         # Silent by design: logging every order would be noise, not signal.
-        if transactions is None and not has_admin_api_credentials(settings):
+        #
+        # The test covers BOTH calls.  The order is fetched first now, so gating
+        # on `transactions is None` alone would let a caller that supplies
+        # transactions still reach Shopify for the order on a store that has no
+        # credentials to reach it with.
+        needs_shopify = transactions is None or order is None
+        if needs_shopify and not has_admin_api_credentials(settings):
             return ""
 
-        # ── Fetch ────────────────────────────────────────────────────────────
-        if transactions is None:
-            transactions = get_order_transactions(settings, order_id)
+        # ── Fetch, best source first ─────────────────────────────────────────
+        # The order carries the top-ranked source (pg_order_id), so it is
+        # consulted BEFORE /transactions.json rather than after.  Two things
+        # follow, and both were bugs when the order came last:
+        #
+        #   * an order with no successful sale/capture transaction still yields
+        #     its reference — the old code hit the "no usable transaction"
+        #     return below and gave up with the value sitting in the payload
+        #   * when the order resolves, the transactions call is never made, so
+        #     a Cashfree entry now costs ONE request instead of two against the
+        #     2 req/sec budget
+        order_fetch_failed = False
+        if order is None and _BEST_NOTE_RANK == 0:
+            order, order_fetch_failed = _fetch_order(settings, order_id, pe_name)
 
-        txn = select_gateway_transaction(transactions)
+        reference, source = _resolve_reference(None, order)
 
-        reference, source = _resolve_reference(txn, order)
+        # Rank 0 is the best the table can do, so anything worse means the
+        # transaction is still worth asking for.
+        txn = None
+        if _rank(source) > 0:
+            if transactions is None:
+                transactions = get_order_transactions(settings, order_id)
+            txn = select_gateway_transaction(transactions)
+            reference, source = _resolve_reference(txn, order)
 
-        # No usable transaction AND nothing in the order: genuinely nothing to
-        # capture.  A missing transaction is not itself fatal — a Cashfree order
-        # reports payment_gateway_names ["manual"] and its reference lives in the
-        # order's note_attributes, so the order alone can still supply it.
+        # No usable transaction, and the order did not supply one either.  A
+        # missing transaction is not itself fatal — that is why the order is
+        # consulted first — so reaching here means both sources are genuinely
+        # empty, or the order could not be read.
         if not txn and not reference:
             frappe.log_error(
                 f"No successful sale/capture transaction on Shopify order {order_id} "
-                f"(Payment Entry {pe_name}), and no gateway reference in the order "
-                f"payload. {len(transactions or [])} transaction(s) returned. "
+                f"(Payment Entry {pe_name}), and no gateway reference from the order "
+                f"either ({'could not be fetched' if order_fetch_failed else 'no note_attributes match'}). "
+                f"{len(transactions or [])} transaction(s) returned. "
                 f"Gateway reference left blank.",
                 "Shopify: Gateway Reference Not Found",
             )
             return ""
 
-        # The order has not been consulted yet and it holds a source that
-        # outranks whatever the transaction gave us — fetch it.  Only reached on
-        # the backfill path; the order-sync path passes `order` in.
-        #
-        # The test is on RANK, not on `not reference`.  A partial-COD Cashfree
-        # order carries both a pg_order_id and an authorization that joins to
-        # nothing, so stopping as soon as the transaction yields anything would
-        # write the unjoinable one and never look at the order — which is the
-        # whole reason pg_order_id sits at the top of the table.
+        # The order still has not been consulted and it holds a source that
+        # outranks what we have.  Unreachable while the table puts an
+        # order-level source at rank 0 (the block above already fetched it), and
+        # kept so that reordering the table cannot silently skip the order.
         if (
             order is None
+            and not order_fetch_failed
             and _BEST_NOTE_RANK is not None
             and _BEST_NOTE_RANK < _rank(source)
         ):
-            try:
-                order = get_order(settings, order_id)
-                # Re-resolve with the order in hand.  Guarded because the order
-                # may carry nothing: a lower-ranked transaction value we already
-                # have is better than dropping back to blank.
-                fetched, fetched_source = _resolve_reference(txn, order)
-                if fetched:
-                    reference, source = fetched, fetched_source
-            except ShopifyAPIError as exc:
-                frappe.log_error(
-                    f"Could not fetch Shopify order {order_id} to look for a "
-                    f"gateway reference in note_attributes "
-                    f"(Payment Entry {pe_name}): {exc}",
-                    "Shopify: Gateway Reference Order Fetch Failed",
-                )
+            order, order_fetch_failed = _fetch_order(settings, order_id, pe_name)
+            fetched, fetched_source = _resolve_reference(txn, order)
+            if fetched:
+                reference, source = fetched, fetched_source
+
+        # A source that outranks what we hold could not be checked.  Do NOT
+        # settle for the lower-ranked value: this write is effectively permanent
+        # — the idempotency guard returns early on a filled field and the
+        # backfill query only selects blank ones — so a transient 500 would bake
+        # in, say, a partial-COD authorization that joins to nothing, and no
+        # re-run would ever correct it.  Blank is retryable; wrong is not.
+        if (
+            order_fetch_failed
+            and _BEST_NOTE_RANK is not None
+            and _BEST_NOTE_RANK < _rank(source)
+        ):
+            return ""
 
         if not reference:
             frappe.log_error(
@@ -570,6 +604,26 @@ def capture_gateway_reference(
             f"Shopify: Gateway Reference Failed — {pe_name}",
         )
         return ""
+
+
+def _fetch_order(settings, order_id: str, pe_name: str) -> tuple:
+    """
+    (order, failed) — the Shopify order, or (None, True) when it could not be
+    fetched.
+
+    The flag matters more than the None: it tells the caller that a source it
+    has not seen might outrank the one it holds, which is the difference between
+    "this order genuinely has no reference" and "we could not look".
+    """
+    try:
+        return get_order(settings, order_id), False
+    except ShopifyAPIError as exc:
+        frappe.log_error(
+            f"Could not fetch Shopify order {order_id} to look for a gateway "
+            f"reference in note_attributes (Payment Entry {pe_name}): {exc}",
+            "Shopify: Gateway Reference Order Fetch Failed",
+        )
+        return None, True
 
 
 def _settings_for_payment_entry(pe_name: str):
