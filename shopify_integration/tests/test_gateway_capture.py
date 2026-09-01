@@ -413,9 +413,60 @@ class TestBackfill(_OfflineCase):
         self.assertIn("ORDER BY pe.creation ASC", query)
         self.assertIn("pe.docstatus != 2", query)
         self.assertIn("IFNULL(pe.custom_gateway_reference, '') = ''", query)
-        self.assertIn("so.shopify_store = %(store)s", query)
+        # The store filter applies to the UNIONed subquery, aliased `src`, which
+        # carries shopify_store from whichever route resolved the order.
+        self.assertIn("src.shopify_store = %(store)s", query)
         self.assertEqual(captured["params"]["store"], "s.myshopify.com")
         self.assertEqual(captured["params"]["limit"], 50)
+
+    def _captured_pending_query(self, **kwargs):
+        captured = {}
+
+        def spy_sql(query, params=None, as_dict=False, **_kw):
+            captured["query"] = " ".join(query.split())
+            captured["params"] = params
+            return []
+
+        import frappe
+        original = frappe.db.sql
+        frappe.db.sql = spy_sql
+        try:
+            gr._pending_payment_entries(**kwargs)
+        finally:
+            frappe.db.sql = original
+        return captured
+
+    def test_query_also_resolves_orders_through_payment_entry_reference_no(self):
+        """A PE whose reference row was re-pointed to a Sales Invoice must still
+        be reachable.
+
+        ERPNext's advance allocation moves the reference from the Sales Order to
+        the Sales Invoice on invoice submit, after which the Sales-Order-reference
+        route finds nothing. PE.reference_no still holds the Shopify order name,
+        so it is matched against Sales Order.po_no as a second route.
+        """
+        query = self._captured_pending_query(limit=10)["query"]
+        self.assertIn("UNION", query)
+        self.assertIn("so.po_no = pe2.reference_no", query)
+        # Amend chains reuse a po_no; only the live order may match.
+        self.assertIn("so.docstatus != 2", query)
+        # The original Sales Order route is still there.
+        self.assertIn("per.reference_doctype = 'Sales Order'", query)
+
+    def test_query_reports_how_many_orders_a_payment_entry_resolves_to(self):
+        """Consolidated payments must be detectable, not silently collapsed."""
+        query = self._captured_pending_query(limit=10)["query"]
+        self.assertIn("COUNT(DISTINCT src.shopify_order_id) AS order_count", query)
+
+    def test_query_scopes_to_from_date_when_given(self):
+        captured = self._captured_pending_query(limit=10, from_date="2026-08-01")
+        self.assertIn("pe.posting_date >= %(from_date)s", captured["query"])
+        self.assertEqual(captured["params"]["from_date"], "2026-08-01")
+
+    def test_query_omits_from_date_filter_when_not_given(self):
+        captured = self._captured_pending_query(limit=10)
+        self.assertNotIn("posting_date", captured["query"])
+        self.assertNotIn("from_date", captured["params"])
 
     def test_query_omits_store_filter_when_not_given(self):
         captured = {}

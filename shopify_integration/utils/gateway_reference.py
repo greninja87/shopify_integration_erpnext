@@ -630,8 +630,18 @@ def _settings_for_payment_entry(pe_name: str):
     """
     Shopify Settings for the store that produced a Payment Entry.
 
-    Resolved through the PE's Sales Order reference — Payment Entry itself
-    carries no Shopify store field.
+    Payment Entry carries no Shopify store field, so the store is resolved from
+    the Sales Order, by either of two routes:
+
+      1. the PE's Sales Order reference row, and
+      2. PE.reference_no, which holds the Shopify order name (#6119) and matches
+         Sales Order.po_no.
+
+    Route 2 exists because ERPNext's advance allocation re-points a PE's
+    reference from the Sales Order to the Sales Invoice when that invoice is
+    submitted.  After that the PE has no Sales Order reference row at all, and
+    route 1 alone finds nothing — measured on live data, 8,587 Payment Entries
+    reference an invoice against 455 that still reference an order.
     """
     row = frappe.db.sql(
         """
@@ -641,6 +651,18 @@ def _settings_for_payment_entry(pe_name: str):
         WHERE per.parent = %(pe)s
           AND per.reference_doctype = 'Sales Order'
           AND IFNULL(so.shopify_store, '') != ''
+
+        UNION
+
+        SELECT so.shopify_store
+        FROM `tabPayment Entry` pe
+        JOIN `tabSales Order` so
+              ON so.po_no = pe.reference_no
+             AND so.docstatus != 2
+        WHERE pe.name = %(pe)s
+          AND IFNULL(pe.reference_no, '') != ''
+          AND IFNULL(so.shopify_store, '') != ''
+
         LIMIT 1
         """,
         {"pe": pe_name},
@@ -676,38 +698,75 @@ def capture_for_order(pe_name: str, order: dict, settings) -> str:
 
 # ── Backfill ──────────────────────────────────────────────────────────────────
 
-def _pending_payment_entries(store: str = None, limit: int = 200) -> list:
+def _pending_payment_entries(store: str = None, limit: int = 200, from_date: str = None) -> list:
     """
     Shopify-created Payment Entries with no gateway reference yet, oldest first.
 
-    "Shopify-created" is established by walking the PE's reference rows to a
-    Sales Order that carries a shopify_order_id — Payment Entry has no Shopify
-    field of its own.  Cancelled PEs (docstatus 2) are excluded.
+    Payment Entry has no Shopify field of its own, so "Shopify-created" is
+    established by reaching a Sales Order that carries a shopify_order_id.  Two
+    routes are needed, UNIONed:
 
-    Grouped by PE: an order-per-PE is the norm, and a PE spanning two Shopify
-    orders is pathological, so MIN() picks one deterministically.
+      1. the PE's Sales Order reference row, and
+      2. PE.reference_no, which create_payment_entry_from_shopify() sets to the
+         Shopify order name (#6119), matched against Sales Order.po_no.
+
+    Route 2 is not a nicety.  When a Sales Invoice is submitted with
+    allocate_advances_automatically, ERPNext moves the PE's reference off the
+    Sales Order and onto the invoice, after which route 1 cannot see the PE at
+    all.  Measured on live data: 8,587 Payment Entries reference an invoice
+    against 455 that still reference an order, so route 1 alone misses the
+    overwhelming majority of well-invoiced orders.
+
+    po_no is a safe key: across 1,594 Shopify Sales Orders there are 1,590
+    distinct values, no value is shared between the two stores, and the three
+    reused values are amend chains where every copy but one is cancelled --
+    which `so.docstatus != 2` removes.
+
+    Cancelled PEs (docstatus 2) are excluded.  order_count is returned so the
+    caller can skip a PE that resolves to more than one Shopify order rather
+    than stamping one order's reference onto a payment covering several.
+
+    :param from_date: only Payment Entries posted on/after this date (YYYY-MM-DD)
     """
     conditions = ""
     params = {"limit": int(limit)}
     if store:
-        conditions = " AND so.shopify_store = %(store)s"
+        conditions += " AND src.shopify_store = %(store)s"
         params["store"] = store
+    if from_date:
+        conditions += " AND pe.posting_date >= %(from_date)s"
+        params["from_date"] = from_date
 
     return frappe.db.sql(
         f"""
         SELECT
-            pe.name                  AS pe_name,
-            MIN(so.shopify_order_id) AS shopify_order_id,
-            MIN(so.shopify_store)    AS shopify_store
+            pe.name                               AS pe_name,
+            MIN(src.shopify_order_id)             AS shopify_order_id,
+            MIN(src.shopify_store)                AS shopify_store,
+            COUNT(DISTINCT src.shopify_order_id)  AS order_count
         FROM `tabPayment Entry` pe
-        JOIN `tabPayment Entry Reference` per
-              ON per.parent = pe.name
-             AND per.reference_doctype = 'Sales Order'
-        JOIN `tabSales Order` so
-              ON so.name = per.reference_name
+        JOIN (
+            SELECT per.parent AS pe_name, so.shopify_order_id, so.shopify_store
+            FROM `tabPayment Entry Reference` per
+            JOIN `tabSales Order` so
+                  ON so.name = per.reference_name
+            WHERE per.reference_doctype = 'Sales Order'
+              AND IFNULL(so.shopify_order_id, '') != ''
+
+            UNION
+
+            SELECT pe2.name AS pe_name, so.shopify_order_id, so.shopify_store
+            FROM `tabPayment Entry` pe2
+            JOIN `tabSales Order` so
+                  ON so.po_no = pe2.reference_no
+                 AND so.docstatus != 2
+            WHERE pe2.docstatus != 2
+              AND IFNULL(pe2.reference_no, '') != ''
+              AND IFNULL(pe2.{REFERENCE_FIELD}, '') = ''
+              AND IFNULL(so.shopify_order_id, '') != ''
+        ) src ON src.pe_name = pe.name
         WHERE pe.docstatus != 2
           AND IFNULL(pe.{REFERENCE_FIELD}, '') = ''
-          AND IFNULL(so.shopify_order_id, '') != ''
           {conditions}
         GROUP BY pe.name, pe.creation
         ORDER BY pe.creation ASC
@@ -719,7 +778,9 @@ def _pending_payment_entries(store: str = None, limit: int = 200) -> list:
 
 
 @frappe.whitelist()
-def backfill_gateway_references(store: str = None, limit: int = 200, dry_run: int = 0) -> dict:
+def backfill_gateway_references(
+    store: str = None, limit: int = 200, dry_run: int = 0, from_date: str = None
+) -> dict:
     """
     Populate custom_gateway_reference on existing Shopify Payment Entries,
     oldest first.
@@ -742,17 +803,21 @@ def backfill_gateway_references(store: str = None, limit: int = 200, dry_run: in
 
         --kwargs "{'limit': 500, 'dry_run': 1}"
 
-    :param store:   shop_domain to restrict to; all stores when omitted
-    :param limit:   maximum Payment Entries to process this run
-    :param dry_run: when truthy, report what would be processed and write nothing
-    :return: {"scanned", "updated", "no_reference", "failed", "dry_run", "entries"}
+    :param store:     shop_domain to restrict to; all stores when omitted
+    :param limit:     maximum Payment Entries to process this run
+    :param dry_run:   when truthy, report what would be processed and write nothing
+    :param from_date: only Payment Entries posted on/after this date (YYYY-MM-DD).
+                      Without it the run walks the whole history oldest-first and
+                      a small `limit` never reaches recent orders.
+    :return: {"scanned", "updated", "no_reference", "ambiguous", "failed",
+              "dry_run", "entries"}
     """
     limit   = cint(limit) or 200
     dry_run = bool(cint(dry_run))
 
     result = {
-        "scanned": 0, "updated": 0, "no_reference": 0, "failed": 0,
-        "dry_run": dry_run, "entries": [],
+        "scanned": 0, "updated": 0, "no_reference": 0, "ambiguous": 0,
+        "failed": 0, "dry_run": dry_run, "entries": [],
     }
 
     if not _pe_has_field(REFERENCE_FIELD):
@@ -764,7 +829,7 @@ def backfill_gateway_references(store: str = None, limit: int = 200, dry_run: in
         result["aborted"] = f"Payment Entry has no '{REFERENCE_FIELD}' field."
         return result
 
-    rows = _pending_payment_entries(store=store, limit=limit)
+    rows = _pending_payment_entries(store=store, limit=limit, from_date=from_date)
     result["scanned"] = len(rows)
 
     # One Settings doc per store, not per Payment Entry.
@@ -774,6 +839,21 @@ def backfill_gateway_references(store: str = None, limit: int = 200, dry_run: in
         pe_name  = row["pe_name"]
         order_id = row["shopify_order_id"]
         domain   = row.get("shopify_store") or ""
+
+        # A Payment Entry covering several Shopify orders has several gateway
+        # references and one field to hold them.  Picking one would stamp a
+        # settlement key that is wrong for every other order on the payment, so
+        # it is skipped and reported instead.  Not silent: a wrong reference on
+        # a reconciliation join is worse than a blank one.
+        if cint(row.get("order_count") or 1) > 1:
+            result["ambiguous"] += 1
+            frappe.log_error(
+                f"Payment Entry {pe_name} resolves to {row.get('order_count')} "
+                f"different Shopify orders — gateway reference not set. A "
+                f"consolidated payment needs the reference chosen by hand.",
+                "Shopify: Gateway Reference Ambiguous",
+            )
+            continue
 
         if dry_run:
             result["entries"].append({"payment_entry": pe_name, "shopify_order_id": order_id})
@@ -832,7 +912,7 @@ def _settings_for_domain(shop_domain: str):
 
 
 @frappe.whitelist()
-def enqueue_backfill(store: str = None, limit: int = 200) -> str:
+def enqueue_backfill(store: str = None, limit: int = 200, from_date: str = None) -> str:
     """
     Run the backfill in a background job.
 
@@ -847,6 +927,7 @@ def enqueue_backfill(store: str = None, limit: int = 200) -> str:
         timeout=max(600, limit * 10),   # ~0.5 s/request plus headroom for retries
         store=store,
         limit=limit,
+        from_date=from_date,
         job_name=f"shopify_gateway_reference_backfill_{store or 'all'}",
     )
     return f"Gateway reference backfill queued for up to {limit} Payment Entries."
