@@ -468,6 +468,86 @@ class TestBackfill(_OfflineCase):
         self.assertNotIn("posting_date", captured["query"])
         self.assertNotIn("from_date", captured["params"])
 
+    def _captured_with_gateway_accounts(self, accounts, **kwargs):
+        """Run _pending_payment_entries with _gateway_bank_accounts() stubbed.
+
+        _gateway_bank_accounts issues its own two SELECTs before the main query,
+        so the spy answers those from `accounts` and captures the last call.
+        """
+        captured = {}
+        calls = {"n": 0}
+
+        def spy_sql(query, params=None, as_dict=False, **_kw):
+            calls["n"] += 1
+            if "tabShopify Payment Gateway Mapping" in query:
+                return [{"bank_account": a} for a in accounts]
+            if "tabShopify Settings" in query:
+                return []
+            captured["query"] = " ".join(query.split())
+            captured["params"] = params
+            return []
+
+        import frappe
+        original = frappe.db.sql
+        frappe.db.sql = spy_sql
+        try:
+            gr._pending_payment_entries(**kwargs)
+        finally:
+            frappe.db.sql = original
+        return captured
+
+    def test_invoice_route_is_restricted_to_configured_gateway_accounts(self):
+        """Manual gateway payments reference only an invoice and carry a typed
+        note in reference_no, so the invoice route is the only one that reaches
+        them -- but it must not claim payments that merely landed on a Shopify
+        order's invoice from a bank transfer or COD remittance.
+        """
+        accounts = ["CashFree A/C - NDIPL", "PayU Payments Private Limited - NDIPL"]
+        captured = self._captured_with_gateway_accounts(accounts, limit=10)
+        query = captured["query"]
+        self.assertIn("per3.reference_doctype = 'Sales Invoice'", query)
+        self.assertIn("so.po_no = si.po_no", query)
+        self.assertIn("pe3.paid_to IN %(gw_accounts)s", query)
+        self.assertEqual(captured["params"]["gw_accounts"], accounts)
+        # amend chains reuse po_no; only the live order may match
+        self.assertIn("so.docstatus != 2", query)
+
+    def test_invoice_route_is_omitted_entirely_when_no_gateway_account_configured(self):
+        """An empty allowlist must match nothing, never everything."""
+        captured = self._captured_with_gateway_accounts([], limit=10)
+        query = captured["query"]
+        self.assertNotIn("Sales Invoice", query)
+        self.assertNotIn("gw_accounts", query)
+        self.assertNotIn("gw_accounts", captured["params"])
+        # the two original routes survive
+        self.assertIn("per.reference_doctype = 'Sales Order'", query)
+        self.assertIn("so.po_no = pe2.reference_no", query)
+
+    def test_gateway_accounts_come_from_settings_not_hardcoded(self):
+        """Read from the Gateway Mapping rows plus each store's default."""
+        seen = []
+
+        def spy_sql(query, params=None, as_dict=False, **_kw):
+            seen.append(query)
+            if "tabShopify Payment Gateway Mapping" in query:
+                return [{"bank_account": "CashFree A/C - NDIPL"}]
+            if "tabShopify Settings" in query:
+                return [{"default_bank_account": "PayU Payments Private Limited - NDIPL"}]
+            return []
+
+        import frappe
+        original = frappe.db.sql
+        frappe.db.sql = spy_sql
+        try:
+            accounts = gr._gateway_bank_accounts()
+        finally:
+            frappe.db.sql = original
+
+        self.assertEqual(accounts,
+            ["CashFree A/C - NDIPL", "PayU Payments Private Limited - NDIPL"])
+        self.assertTrue(any("tabShopify Payment Gateway Mapping" in q for q in seen))
+        self.assertTrue(any("tabShopify Settings" in q for q in seen))
+
     def test_query_omits_store_filter_when_not_given(self):
         captured = {}
 

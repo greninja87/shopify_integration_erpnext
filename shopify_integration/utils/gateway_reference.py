@@ -663,6 +663,20 @@ def _settings_for_payment_entry(pe_name: str):
           AND IFNULL(pe.reference_no, '') != ''
           AND IFNULL(so.shopify_store, '') != ''
 
+        UNION
+
+        SELECT so.shopify_store
+        FROM `tabPayment Entry Reference` per
+        JOIN `tabSales Invoice` si
+              ON si.name = per.reference_name
+        JOIN `tabSales Order` so
+              ON so.po_no = si.po_no
+             AND so.docstatus != 2
+        WHERE per.parent = %(pe)s
+          AND per.reference_doctype = 'Sales Invoice'
+          AND IFNULL(si.po_no, '') != ''
+          AND IFNULL(so.shopify_store, '') != ''
+
         LIMIT 1
         """,
         {"pe": pe_name},
@@ -698,6 +712,42 @@ def capture_for_order(pe_name: str, order: dict, settings) -> str:
 
 # ── Backfill ──────────────────────────────────────────────────────────────────
 
+def _gateway_bank_accounts() -> list:
+    """
+    Accounts that Shopify Settings treats as payment-gateway destinations: every
+    bank_account on a Gateway Mapping row, plus each store's default.
+
+    Read from configuration rather than hardcoded, so adding a gateway in
+    Settings is enough and no account name is baked into the app.
+
+    Used to restrict the Sales-Invoice resolution route.  That route matches on
+    Sales Invoice.po_no, which is broad enough to catch any manual payment
+    allocated to a Shopify order's invoice -- including bank transfers and COD
+    remittances that have no gateway reference at all.  Confining it to money
+    that actually landed in a gateway account keeps those out.
+    """
+    accounts = set()
+    for row in frappe.db.sql(
+        """
+        SELECT DISTINCT bank_account
+        FROM `tabShopify Payment Gateway Mapping`
+        WHERE IFNULL(bank_account, '') != ''
+        """,
+        as_dict=True,
+    ):
+        accounts.add(row["bank_account"])
+    for row in frappe.db.sql(
+        """
+        SELECT DISTINCT default_bank_account
+        FROM `tabShopify Settings`
+        WHERE IFNULL(default_bank_account, '') != ''
+        """,
+        as_dict=True,
+    ):
+        accounts.add(row["default_bank_account"])
+    return sorted(accounts)
+
+
 def _pending_payment_entries(store: str = None, limit: int = 200, from_date: str = None) -> list:
     """
     Shopify-created Payment Entries with no gateway reference yet, oldest first.
@@ -710,6 +760,10 @@ def _pending_payment_entries(store: str = None, limit: int = 200, from_date: str
       2. PE.reference_no, which create_payment_entry_from_shopify() sets to the
          Shopify order name (#6119), matched against Sales Order.po_no.
 
+      3. the PE's Sales Invoice reference -> Sales Invoice.po_no -> Sales Order,
+         restricted to Payment Entries paid into a configured gateway account
+         (see _gateway_bank_accounts).
+
     Route 2 is not a nicety.  When a Sales Invoice is submitted with
     allocate_advances_automatically, ERPNext moves the PE's reference off the
     Sales Order and onto the invoice, after which route 1 cannot see the PE at
@@ -721,6 +775,15 @@ def _pending_payment_entries(store: str = None, limit: int = 200, from_date: str
     distinct values, no value is shared between the two stores, and the three
     reused values are amend chains where every copy but one is cancelled --
     which `so.docstatus != 2` removes.
+
+    Route 3 exists for gateway payments entered by hand.  Those carry a typed
+    note in reference_no ("CF", "cashfree", "snapmint") rather than the order
+    name, and reference only the invoice, so routes 1 and 2 both miss them --
+    measured on live data, 44 such payments in August alone, every one of them
+    on a Shopify order whose po_no is an internal number (EB3436) rather than a
+    "#" name.  It is deliberately the narrowest route: without the gateway-account
+    restriction it would also claim bank transfers and COD remittances that
+    happen to be allocated to a Shopify order's invoice.
 
     Cancelled PEs (docstatus 2) are excluded.  order_count is returned so the
     caller can skip a PE that resolves to more than one Shopify order rather
@@ -736,6 +799,32 @@ def _pending_payment_entries(store: str = None, limit: int = 200, from_date: str
     if from_date:
         conditions += " AND pe.posting_date >= %(from_date)s"
         params["from_date"] = from_date
+
+    # Route 3 is only built when gateway accounts are configured.  An empty
+    # allowlist must match nothing, never everything.
+    gw_accounts = _gateway_bank_accounts()
+    invoice_route = ""
+    if gw_accounts:
+        params["gw_accounts"] = gw_accounts
+        invoice_route = f"""
+            UNION
+
+            SELECT pe3.name AS pe_name, so.shopify_order_id, so.shopify_store
+            FROM `tabPayment Entry` pe3
+            JOIN `tabPayment Entry Reference` per3
+                  ON per3.parent = pe3.name
+                 AND per3.reference_doctype = 'Sales Invoice'
+            JOIN `tabSales Invoice` si
+                  ON si.name = per3.reference_name
+            JOIN `tabSales Order` so
+                  ON so.po_no = si.po_no
+                 AND so.docstatus != 2
+            WHERE pe3.docstatus != 2
+              AND IFNULL(pe3.{REFERENCE_FIELD}, '') = ''
+              AND pe3.paid_to IN %(gw_accounts)s
+              AND IFNULL(si.po_no, '') != ''
+              AND IFNULL(so.shopify_order_id, '') != ''
+        """
 
     return frappe.db.sql(
         f"""
@@ -764,6 +853,7 @@ def _pending_payment_entries(store: str = None, limit: int = 200, from_date: str
               AND IFNULL(pe2.reference_no, '') != ''
               AND IFNULL(pe2.{REFERENCE_FIELD}, '') = ''
               AND IFNULL(so.shopify_order_id, '') != ''
+            {invoice_route}
         ) src ON src.pe_name = pe.name
         WHERE pe.docstatus != 2
           AND IFNULL(pe.{REFERENCE_FIELD}, '') = ''
