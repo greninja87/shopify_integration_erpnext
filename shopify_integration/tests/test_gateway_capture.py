@@ -570,3 +570,191 @@ class TestBackfill(_OfflineCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# ── Split-gateway orders ──────────────────────────────────────────
+
+CASHFREE_ACCOUNT = "CashFree A/C - NDIPL"
+PAYU_ACCOUNT     = "PayU Payments Private Limited - NDIPL"
+
+# Order #6138 as it actually arrived: Cashfree's app wrote pg_order_id and
+# tagged the order, then the balance was paid through PayU.
+SPLIT_ORDER = {
+    "name": "#6138",
+    "tags": "CASHFREE - PARTIAL COD, CASHFREE - UPI",
+    "payment_gateway_names": ["Cashfree Payments"],
+    "note_attributes": [
+        {"name": "pg_order_id", "value": "notdrones.myshopify.com_zqfakyojtt"},
+    ],
+}
+
+CASHFREE_TXN = {
+    "id": 9001, "kind": "sale", "status": "success",
+    "created_at": "2026-08-02T20:52:14+05:30",
+    "gateway": "Cashfree Payments",
+    "authorization": "6149667879",
+}
+PAYU_TXN = {
+    "id": 9002, "kind": "sale", "status": "success",
+    "created_at": "2026-08-02T22:26:51+05:30",   # LATER than the Cashfree one
+    "gateway": "Cards, UPI, NB by PayU India",
+    "authorization": "rd21z3yx4fqDJwEHu8h5ExYvS",
+}
+
+
+def _seed_pe_with_account(name, account, reference_no="CF"):
+    frappe_stub.set_doc("Payment Entry", name, {
+        "name": name,
+        "reference_no": reference_no,
+        "paid_to": account,
+        "custom_gateway_reference": "",
+        "custom_gateway_name": "",
+    })
+    return name
+
+
+class TestGatewayFamily(unittest.TestCase):
+    """The portal names itself differently in every place it appears."""
+
+    def setUp(self):
+        frappe_stub.reset()
+
+    def test_the_many_spellings_of_one_portal_collapse(self):
+        for value in ("Cashfree Payments", "CASHFREE - UPI", "Cashfree",
+                      "CashFree A/C - NDIPL", "cashfree"):
+            self.assertEqual(gr._gateway_family(value), "cashfree", value)
+        for value in ("Cards, UPI, NB by PayU India", "PAYu",
+                      "PayU Payments Private Limited - NDIPL"):
+            self.assertEqual(gr._gateway_family(value), "payu", value)
+        self.assertEqual(gr._gateway_family("snapmint, snapmint_75726098"), "snapmint")
+
+    def test_unrecognised_and_empty_are_blank_not_guessed(self):
+        for value in ("", None, "manual", "HDFC Bank - NDIPL"):
+            self.assertEqual(gr._gateway_family(value), "")
+
+    def test_account_gateway_comes_from_the_mapping_row(self):
+        frappe_stub.SQL_RESULTS["tabShopify Payment Gateway Mapping"] = [
+            {"shopify_gateway": "PAYu", "tag_contains": "payu"},
+        ]
+        self.assertEqual(gr._gateway_for_account("Weirdly Renamed A/C - X"), "payu")
+
+    def test_account_gateway_falls_back_to_the_account_name(self):
+        """No mapping row: these accounts are named after the portal anyway."""
+        self.assertEqual(gr._gateway_for_account(PAYU_ACCOUNT), "payu")
+        self.assertEqual(gr._gateway_for_account(CASHFREE_ACCOUNT), "cashfree")
+
+    def test_no_account_means_no_preference(self):
+        self.assertEqual(gr._gateway_for_account(""), "")
+        self.assertEqual(gr._gateway_for_account(None), "")
+
+
+class TestTransactionPreference(unittest.TestCase):
+    def setUp(self):
+        frappe_stub.reset()
+
+    def test_preferred_gateway_wins_over_the_earliest(self):
+        """Each payment must take the transaction that funded IT."""
+        picked = gr.select_gateway_transaction(
+            [CASHFREE_TXN, PAYU_TXN], prefer_gateway=PAYU_ACCOUNT)
+        self.assertEqual(picked["id"], 9002)
+
+    def test_without_a_preference_the_earliest_still_wins(self):
+        picked = gr.select_gateway_transaction([PAYU_TXN, CASHFREE_TXN])
+        self.assertEqual(picked["id"], 9001)
+
+    def test_an_unmatched_preference_is_ignored_not_fatal(self):
+        """A preference that matches nothing must not lose a usable reference."""
+        picked = gr.select_gateway_transaction(
+            [CASHFREE_TXN, PAYU_TXN], prefer_gateway="Razorpay A/C")
+        self.assertEqual(picked["id"], 9001)
+
+    def test_preference_cannot_resurrect_a_failed_transaction(self):
+        failed_payu = dict(PAYU_TXN, status="failure")
+        picked = gr.select_gateway_transaction(
+            [CASHFREE_TXN, failed_payu], prefer_gateway=PAYU_ACCOUNT)
+        self.assertEqual(picked["id"], 9001)
+
+
+class TestSkipOrderSources(unittest.TestCase):
+    def setUp(self):
+        frappe_stub.reset()
+
+    def test_order_level_source_is_dropped_when_asked(self):
+        ref, source = gr._resolve_reference(PAYU_TXN, SPLIT_ORDER, skip_order_sources=True)
+        self.assertEqual(ref, "rd21z3yx4fqDJwEHu8h5ExYvS")
+        self.assertEqual(source, "transaction.authorization")
+
+    def test_order_level_source_still_outranks_by_default(self):
+        ref, source = gr._resolve_reference(PAYU_TXN, SPLIT_ORDER)
+        self.assertEqual(ref, "notdrones.myshopify.com_zqfakyojtt")
+        self.assertEqual(source, "note_attributes.pg_order_id")
+
+
+class TestSplitGatewayOrder(_OfflineCase):
+    """Order #6138: Cashfree took 1,999.80 and PayU took the 7,999.20 balance.
+
+    Both Payment Entries were taking Cashfree's order-level pg_order_id, so the
+    PayU payment carried a key that joined to Cashfree's settlement row.
+    """
+
+    def setUp(self):
+        super().setUp()
+        gr.get_order = lambda settings, order_id: SPLIT_ORDER
+
+    def test_payu_payment_takes_the_payu_transaction_reference(self):
+        pe = _seed_pe_with_account("PE-PAYU", PAYU_ACCOUNT)
+        result = gr.capture_gateway_reference(
+            pe, 7768405639273, settings=frappe_stub.FakeSettings(),
+            transactions=[CASHFREE_TXN, PAYU_TXN])
+
+        self.assertEqual(result, "rd21z3yx4fqDJwEHu8h5ExYvS")
+        stored = frappe_stub.get_doc_values("Payment Entry", pe)
+        self.assertEqual(stored["custom_gateway_reference"], "rd21z3yx4fqDJwEHu8h5ExYvS")
+        self.assertNotEqual(stored["custom_gateway_reference"],
+                            "notdrones.myshopify.com_zqfakyojtt")
+
+    def test_payu_payment_is_not_labelled_with_the_orders_cashfree_tags(self):
+        pe = _seed_pe_with_account("PE-PAYU-NAME", PAYU_ACCOUNT)
+        gr.capture_gateway_reference(
+            pe, 7768405639273, settings=frappe_stub.FakeSettings(),
+            transactions=[CASHFREE_TXN, PAYU_TXN])
+
+        name = frappe_stub.get_doc_values("Payment Entry", pe)["custom_gateway_name"]
+        self.assertNotIn("CASHFREE", name.upper())
+        self.assertIn("payu", name.lower())
+
+    def test_cashfree_payment_on_the_same_order_is_unchanged(self):
+        """The regression guard: same-gateway payments keep the order-level key.
+
+        Every reference already captured came down this path, so it must not
+        move.
+        """
+        pe = _seed_pe_with_account("PE-CF", CASHFREE_ACCOUNT)
+        result = gr.capture_gateway_reference(
+            pe, 7768405639273, settings=frappe_stub.FakeSettings(),
+            transactions=[CASHFREE_TXN, PAYU_TXN])
+
+        self.assertEqual(result, "notdrones.myshopify.com_zqfakyojtt")
+        stored = frappe_stub.get_doc_values("Payment Entry", pe)
+        self.assertEqual(stored["custom_gateway_name"],
+                         "CASHFREE - PARTIAL COD, CASHFREE - UPI")
+
+    def test_a_payment_with_no_account_behaves_as_before(self):
+        """No account to key on: nothing is inferred, the order-level rule holds."""
+        pe = _seed_pe_with_account("PE-NOACCT", "")
+        result = gr.capture_gateway_reference(
+            pe, 7768405639273, settings=frappe_stub.FakeSettings(),
+            transactions=[CASHFREE_TXN, PAYU_TXN])
+        self.assertEqual(result, "notdrones.myshopify.com_zqfakyojtt")
+
+    def test_single_gateway_order_never_reaches_for_transactions(self):
+        """Cashfree orders must still cost one request, not two."""
+        calls = []
+        real = gr.get_order_transactions
+        gr.get_order_transactions = lambda s, o: (calls.append(o) or [CASHFREE_TXN])
+        self.addCleanup(setattr, gr, "get_order_transactions", real)
+
+        pe = _seed_pe_with_account("PE-CF-ONE", CASHFREE_ACCOUNT)
+        gr.capture_gateway_reference(pe, 7768405639273,
+                                     settings=frappe_stub.FakeSettings())
+        self.assertEqual(calls, [])

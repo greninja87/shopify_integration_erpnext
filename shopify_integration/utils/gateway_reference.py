@@ -220,7 +220,7 @@ def _parse_created_at(value):
     return parsed.astimezone(timezone.utc)
 
 
-def select_gateway_transaction(transactions):
+def select_gateway_transaction(transactions, prefer_gateway: str = None):
     """
     The one transaction whose reference we want, or None.
 
@@ -230,6 +230,14 @@ def select_gateway_transaction(transactions):
 
     Transactions with a missing or unparseable created_at sort last, but stay
     eligible: a usable reference on a badly-stamped row beats no reference.
+
+    `prefer_gateway` narrows the eligible set to transactions from one gateway
+    family when any of them match.  An order can be settled by two portals — a
+    part payment on one and the balance on another — and each Payment Entry
+    must take the reference of the transaction that funded IT, not whichever
+    came first overall.  When nothing matches, the preference is ignored rather
+    than returning None: an unmatched preference must not lose a reference that
+    the unfiltered rule would have found.
     """
     candidates = []
     for txn in (transactions or []):
@@ -243,6 +251,13 @@ def select_gateway_transaction(transactions):
 
     if not candidates:
         return None
+
+    wanted = _gateway_family(prefer_gateway)
+    if wanted:
+        matching = [t for t in candidates
+                    if _gateway_family(t.get("gateway")) == wanted]
+        if matching:
+            candidates = matching
 
     def sort_key(txn):
         parsed = _parse_created_at(txn.get("created_at"))
@@ -323,14 +338,23 @@ def extract_gateway_reference(txn, order=None) -> str:
     return _resolve_reference(txn, order)[0]
 
 
-def _resolve_reference(txn, order) -> tuple:
+def _resolve_reference(txn, order, skip_order_sources: bool = False) -> tuple:
     """
     (reference, source_label) — "" and "" when no source yields a value.
 
     Separate from extract_gateway_reference so the diagnostic log can say WHICH
     rule produced a value, without the caller having to re-derive it.
+
+    `skip_order_sources` drops the order-level sources, leaving only the ones
+    read off the transaction.  Set when the payment came through a different
+    gateway than the order's own: note_attributes.pg_order_id is written by one
+    portal's app and describes one portal's payment, so on a split-gateway order
+    it is simply not this payment's reference — outranking the transaction with
+    it produced a key that joins to the wrong settlement row.
     """
     for label, where, key in _REFERENCE_SOURCES:
+        if where == "note" and skip_order_sources:
+            continue
         if where == "txn":
             candidate = _clean(txn.get(key)) if isinstance(txn, dict) else ""
         elif where == "receipt":
@@ -490,16 +514,37 @@ def capture_gateway_reference(
         if order is None and _BEST_NOTE_RANK == 0:
             order, order_fetch_failed = _fetch_order(settings, order_id, pe_name)
 
-        reference, source = _resolve_reference(None, order)
+        # ── Which gateway funded THIS payment? ───────────────────────────────
+        # The account the money landed in, mapped back through the Gateway
+        # Mapping.  When it disagrees with the gateway Shopify recorded on the
+        # order, the order was settled by two portals and the order-level
+        # sources describe the other one — so they are skipped for this payment
+        # and the matching transaction is used instead.
+        #
+        # Live case: order #6138 was part-paid by Cashfree (1,999.80) and the
+        # balance by PayU (7,999.20).  Both Payment Entries took Cashfree's
+        # pg_order_id, so the PayU payment carried a key that joined to
+        # Cashfree's settlement row.
+        pe_account = frappe.db.get_value("Payment Entry", pe_name, "paid_to") or ""
+        pe_gateway = _gateway_for_account(pe_account)
+        order_gateway = _gateway_family(extract_gateway_name(None, order))
+        cross_gateway = bool(pe_gateway and order_gateway and pe_gateway != order_gateway)
+
+        reference, source = _resolve_reference(
+            None, order, skip_order_sources=cross_gateway
+        )
 
         # Rank 0 is the best the table can do, so anything worse means the
-        # transaction is still worth asking for.
+        # transaction is still worth asking for.  A cross-gateway payment always
+        # asks, because only the transaction can identify its own settlement.
         txn = None
-        if _rank(source) > 0:
+        if cross_gateway or _rank(source) > 0:
             if transactions is None:
                 transactions = get_order_transactions(settings, order_id)
-            txn = select_gateway_transaction(transactions)
-            reference, source = _resolve_reference(txn, order)
+            txn = select_gateway_transaction(transactions, prefer_gateway=pe_gateway)
+            reference, source = _resolve_reference(
+                txn, order, skip_order_sources=cross_gateway
+            )
 
         # No usable transaction, and the order did not supply one either.  A
         # missing transaction is not itself fatal — that is why the order is
@@ -527,7 +572,9 @@ def capture_gateway_reference(
             and _BEST_NOTE_RANK < _rank(source)
         ):
             order, order_fetch_failed = _fetch_order(settings, order_id, pe_name)
-            fetched, fetched_source = _resolve_reference(txn, order)
+            fetched, fetched_source = _resolve_reference(
+                txn, order, skip_order_sources=cross_gateway
+            )
             if fetched:
                 reference, source = fetched, fetched_source
 
@@ -568,7 +615,11 @@ def capture_gateway_reference(
         # ── Write ────────────────────────────────────────────────────────────
         values = {REFERENCE_FIELD: reference}
 
-        gateway_name = extract_gateway_name(txn, order)
+        # On a cross-gateway payment the order's tags name the OTHER portal, so
+        # the transaction is the only honest source for this payment's name.
+        gateway_name = extract_gateway_name(txn, None if cross_gateway else order)
+        if not gateway_name and cross_gateway:
+            gateway_name = pe_account
         if gateway_name and _pe_has_field(GATEWAY_FIELD):
             values[GATEWAY_FIELD] = gateway_name
 
@@ -711,6 +762,52 @@ def capture_for_order(pe_name: str, order: dict, settings) -> str:
 
 
 # ── Backfill ──────────────────────────────────────────────────────────────────
+
+def _gateway_family(value: str) -> str:
+    """Coarse gateway identity for comparison, or "" when unrecognised.
+
+    Deliberately coarse.  The same portal appears under many spellings across
+    the three places it is named -- "Cashfree Payments" in
+    payment_gateway_names, "CASHFREE - UPI" in tags, "Cashfree" as the
+    Gateway Transaction provider, "CashFree A/C - NDIPL" as the account -- and
+    an exact match on any pair of those would fail.  Only the portal matters
+    here, never the instrument.
+    """
+    text = (value or "").lower()
+    for family in ("cashfree", "snapmint", "payu", "razorpay", "paytm", "phonepe"):
+        if family in text:
+            return family
+    return ""
+
+
+def _gateway_for_account(account: str) -> str:
+    """The gateway family configured against a bank account, or "".
+
+    Read from the Gateway Mapping rows rather than the account name, so a
+    renamed account keeps working; falls back to the account name because that
+    is how these accounts are conventionally named ("PayU Payments Private
+    Limited - NDIPL") and it costs nothing to try.
+    """
+    if not account:
+        return ""
+
+    rows = frappe.db.sql(
+        """
+        SELECT shopify_gateway, tag_contains
+        FROM `tabShopify Payment Gateway Mapping`
+        WHERE bank_account = %(account)s
+        """,
+        {"account": account},
+        as_dict=True,
+    )
+    for row in rows:
+        family = (_gateway_family(row.get("shopify_gateway"))
+                  or _gateway_family(row.get("tag_contains")))
+        if family:
+            return family
+
+    return _gateway_family(account)
+
 
 def _gateway_bank_accounts() -> list:
     """
