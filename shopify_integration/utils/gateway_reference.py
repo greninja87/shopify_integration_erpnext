@@ -477,6 +477,15 @@ def capture_gateway_reference(
         if existing:
             return existing
 
+        # ── Submitted only ───────────────────────────────────────────────────
+        # Enforced here as well as in the backfill query, so a direct call
+        # cannot bypass it.  Silent rather than logged: a draft Payment Entry is
+        # a normal intermediate state, not a fault, and the order-sync path
+        # reaches this line for every store that leaves auto-submit off.  The
+        # entry is picked up by the backfill once it is submitted.
+        if cint(frappe.db.get_value("Payment Entry", pe_name, "docstatus")) != 1:
+            return ""
+
         # ── Resolve store settings ───────────────────────────────────────────
         if settings is None:
             settings = _settings_for_payment_entry(pe_name)
@@ -882,9 +891,18 @@ def _pending_payment_entries(store: str = None, limit: int = 200, from_date: str
     restriction it would also claim bank transfers and COD remittances that
     happen to be allocated to a Shopify order's invoice.
 
-    Cancelled PEs (docstatus 2) are excluded.  order_count is returned so the
-    caller can skip a PE that resolves to more than one Shopify order rather
-    than stamping one order's reference onto a payment covering several.
+    Only SUBMITTED Payment Entries (docstatus 1) are selected -- drafts and
+    cancelled entries are both skipped.  A draft is not yet a payment: it can
+    still be edited, re-pointed at a different order, or abandoned, so keying it
+    to a settlement row would leave a reference behind that outlives the
+    document it described.  Live case: a draft COD remittance sat allocated to
+    a Shopify order and re-acquired that order's Cashfree reference on every
+    run, having been cleared by hand each time.  It becomes eligible the moment
+    it is submitted.
+
+    order_count is returned so the caller can skip a PE that resolves to more
+    than one Shopify order rather than stamping one order's reference onto a
+    payment covering several.
 
     :param from_date: only Payment Entries posted on/after this date (YYYY-MM-DD)
     """
@@ -916,7 +934,7 @@ def _pending_payment_entries(store: str = None, limit: int = 200, from_date: str
             JOIN `tabSales Order` so
                   ON so.po_no = si.po_no
                  AND so.docstatus != 2
-            WHERE pe3.docstatus != 2
+            WHERE pe3.docstatus = 1
               AND IFNULL(pe3.{REFERENCE_FIELD}, '') = ''
               AND pe3.paid_to IN %(gw_accounts)s
               AND IFNULL(si.po_no, '') != ''
@@ -946,13 +964,13 @@ def _pending_payment_entries(store: str = None, limit: int = 200, from_date: str
             JOIN `tabSales Order` so
                   ON so.po_no = pe2.reference_no
                  AND so.docstatus != 2
-            WHERE pe2.docstatus != 2
+            WHERE pe2.docstatus = 1
               AND IFNULL(pe2.reference_no, '') != ''
               AND IFNULL(pe2.{REFERENCE_FIELD}, '') = ''
               AND IFNULL(so.shopify_order_id, '') != ''
             {invoice_route}
         ) src ON src.pe_name = pe.name
-        WHERE pe.docstatus != 2
+        WHERE pe.docstatus = 1
           AND IFNULL(pe.{REFERENCE_FIELD}, '') = ''
           {conditions}
         GROUP BY pe.name, pe.creation

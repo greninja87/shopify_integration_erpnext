@@ -31,10 +31,11 @@ SALE_TXN = {
 }
 
 
-def _seed_pe(name="PE-2026-00042", reference_no="#6428", gateway_reference=""):
+def _seed_pe(name="PE-2026-00042", reference_no="#6428", gateway_reference="", docstatus=1):
     frappe_stub.set_doc("Payment Entry", name, {
         "name": name,
         "reference_no": reference_no,
+        "docstatus": docstatus,
         "custom_gateway_reference": gateway_reference,
         "custom_gateway_name": "",
     })
@@ -411,7 +412,8 @@ class TestBackfill(_OfflineCase):
 
         query = captured["query"]
         self.assertIn("ORDER BY pe.creation ASC", query)
-        self.assertIn("pe.docstatus != 2", query)
+        # Submitted only: a draft is not yet a payment, so it gets no key.
+        self.assertIn("pe.docstatus = 1", query)
         self.assertIn("IFNULL(pe.custom_gateway_reference, '') = ''", query)
         # The store filter applies to the UNIONed subquery, aliased `src`, which
         # carries shopify_store from whichever route resolved the order.
@@ -602,15 +604,91 @@ PAYU_TXN = {
 }
 
 
-def _seed_pe_with_account(name, account, reference_no="CF"):
+def _seed_pe_with_account(name, account, reference_no="CF", docstatus=1):
     frappe_stub.set_doc("Payment Entry", name, {
         "name": name,
         "reference_no": reference_no,
+        "docstatus": docstatus,
         "paid_to": account,
         "custom_gateway_reference": "",
         "custom_gateway_name": "",
     })
     return name
+
+
+class TestSubmittedOnly(_OfflineCase):
+    """A draft is not yet a payment, so it gets no settlement key.
+
+    Live case: a draft COD remittance sat allocated to a Shopify order and
+    re-acquired that order's Cashfree reference on every backfill run, having
+    been cleared by hand each time.
+    """
+
+    def test_draft_gets_no_reference_and_no_api_call(self):
+        calls = []
+        real = gr.get_order_transactions
+        gr.get_order_transactions = lambda s, o: (calls.append(o) or [SALE_TXN])
+        self.addCleanup(setattr, gr, "get_order_transactions", real)
+
+        pe = _seed_pe(name="PE-DRAFT", docstatus=0)
+        result = gr.capture_gateway_reference(pe, 6428, settings=frappe_stub.FakeSettings(),
+                                              transactions=[SALE_TXN])
+
+        self.assertEqual(result, "")
+        self.assertEqual(frappe_stub.WRITES, [])
+        self.assertEqual(calls, [])
+        self.assertEqual(
+            frappe_stub.get_doc_values("Payment Entry", pe)["custom_gateway_reference"], "")
+
+    def test_a_draft_is_not_an_error(self):
+        """Normal intermediate state — it must not fill the Error Log."""
+        gr.capture_gateway_reference(_seed_pe(name="PE-DRAFT-2", docstatus=0), 6428,
+                                     settings=frappe_stub.FakeSettings(),
+                                     transactions=[SALE_TXN])
+        self.assertEqual(frappe_stub.ERRORS, [])
+
+    def test_cancelled_gets_no_reference(self):
+        pe = _seed_pe(name="PE-CANCELLED", docstatus=2)
+        self.assertEqual(
+            gr.capture_gateway_reference(pe, 6428, settings=frappe_stub.FakeSettings(),
+                                         transactions=[SALE_TXN]), "")
+        self.assertEqual(frappe_stub.WRITES, [])
+
+    def test_submitted_still_captures(self):
+        pe = _seed_pe(name="PE-SUBMITTED", docstatus=1)
+        self.assertEqual(
+            gr.capture_gateway_reference(pe, 6428, settings=frappe_stub.FakeSettings(),
+                                         transactions=[SALE_TXN]), PAYU_TXNID)
+
+    def test_a_draft_that_already_has_one_still_reports_it(self):
+        """Idempotency comes first: reading back an existing value is not a write."""
+        pe = _seed_pe(name="PE-DRAFT-FILLED", gateway_reference="already-there", docstatus=0)
+        self.assertEqual(
+            gr.capture_gateway_reference(pe, 6428, settings=frappe_stub.FakeSettings(),
+                                         transactions=[SALE_TXN]), "already-there")
+        self.assertEqual(frappe_stub.WRITES, [])
+
+    def test_query_selects_submitted_only(self):
+        captured = {}
+
+        def spy_sql(query, params=None, as_dict=False, **_kw):
+            if "tabShopify" in query:
+                return []
+            captured["query"] = " ".join(query.split())
+            return []
+
+        import frappe
+        original = frappe.db.sql
+        frappe.db.sql = spy_sql
+        try:
+            gr._pending_payment_entries(limit=10)
+        finally:
+            frappe.db.sql = original
+
+        query = captured["query"]
+        self.assertIn("pe.docstatus = 1", query)
+        self.assertNotIn("pe.docstatus != 2", query)
+        self.assertIn("pe2.docstatus = 1", query)
 
 
 class TestGatewayFamily(unittest.TestCase):

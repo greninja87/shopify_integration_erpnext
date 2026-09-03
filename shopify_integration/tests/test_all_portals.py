@@ -347,7 +347,7 @@ class TestCaptureAcrossPortals(unittest.TestCase):
     def setUp(self):
         frappe_stub.reset()
         frappe_stub.set_doc("Payment Entry", "PE-0001", {
-            "name": "PE-0001", "reference_no": "#6498",
+            "name": "PE-0001", "reference_no": "#6498", "docstatus": 1,
             "custom_gateway_reference": "", "custom_gateway_name": "",
         })
 
@@ -417,7 +417,8 @@ class TestBackfillFetchesTheOrder(unittest.TestCase):
     def setUp(self):
         frappe_stub.reset()
         frappe_stub.set_doc("Payment Entry", "PE-0002", {
-            "name": "PE-0002", "custom_gateway_reference": "", "custom_gateway_name": "",
+            "name": "PE-0002", "docstatus": 1,
+            "custom_gateway_reference": "", "custom_gateway_name": "",
         })
 
     def test_order_is_fetched_when_the_transaction_is_empty(self):
