@@ -7,10 +7,16 @@ Customer name source priority:
   3. email → "Shopify Customer {id}"
 
 Matching priority:
+  0. GSTIN → Address → Customer  (repeat order under a GSTIN already on file)
   1. Shopify Customer ID (fastest if already synced)
   2. Phone number (primary unique identifier)
   3. Email address
   4. Create new customer
+
+Passes 1-3 run for B2C and B2B alike.  A GSTIN identifies the tax entity, not
+the person, so an order that carries one must still resolve to the shopper's
+existing Customer; when it does, that Customer is renamed to the GST legal name
+and retyped in place (see _upgrade_customer_to_b2b) instead of being duplicated.
 
 Address behaviour:
   - find_or_create_address_for_order() is the single entry point for all address
@@ -90,18 +96,35 @@ def get_or_create_customer(
                 },
                 "link_name",
             )
-            if linked:
+            # Skip a disabled customer the same way _find_customer() does: the
+            # GST address survives on a record that was disabled as a duplicate,
+            # and returning it would fail the Sales Order insert.  Falling
+            # through to the identity match finds the surviving record instead.
+            if linked and not frappe.db.get_value("Customer", linked, "disabled"):
                 _update_shopify_fields(linked, shopify_id, phone, email)
                 return linked
 
-    # ── GST B2B path — skip individual matching entirely ─────────────────────
-    # When a GSTIN is present the customer represents a company, not the individual
-    # who placed the order.  Matching by phone/email would return an existing B2C
-    # individual record (wrong type, wrong name).  Pass 0 above already handled
-    # the "repeat B2B customer" case via GSTIN → Address → Customer lookup.
-    # Reaching here with gst_legal_name means: no existing GSTIN match → create
-    # a fresh company customer with Shopify's contact info and shipping address.
+    # ── 1-3. Identity match — Shopify Customer ID → phone → email ────────────
+    # Runs for B2C *and* B2B.  A GSTIN identifies the tax entity, not the human:
+    # the same Shopify shopper routinely orders once personally and once for the
+    # firm (proprietorships especially).  Matching B2B orders on GSTIN alone made
+    # the second order create a duplicate Customer for a shopper already on file
+    # — live incident: orders #6267/#6268 → NOT-CUS-4455 + NOT-CUS-4456.
+    existing = _match_existing_customer(shopify_id, phone, email)
+
+    # ── GST B2B path ──────────────────────────────────────────────────────────
+    # Pass 0 above already handled the "repeat order under the same GSTIN" case.
+    # Reaching here with gst_legal_name means the GSTIN is new to ERPNext, so:
+    #   • known shopper → reuse their Customer and upgrade it to the tax entity
+    #   • unknown shopper → create a fresh company customer
     if gst_legal_name:
+        if existing:
+            _upgrade_customer_to_b2b(
+                existing, gstin, gst_legal_name, gst_customer_type
+            )
+            _update_shopify_fields(existing, shopify_id, phone, email)
+            return existing
+
         return _create_customer(
             full_name=gst_legal_name,
             phone=phone,
@@ -116,51 +139,15 @@ def get_or_create_customer(
         )
 
     # ── B2C path — name from Shopify, Individual type ────────────────────────
+    if existing:
+        _update_shopify_fields(existing, shopify_id, phone, email)
+        return existing
+
     billing_name  = (billing_address or {}).get("name", "").strip()
     full_name     = (
         billing_name or shopify_person_name or email or
         f"Shopify Customer {shopify_id}"
     )
-
-    # ── 1. Match by Shopify Customer ID ───────────────────────────────────────
-    if shopify_id:
-        existing = frappe.db.get_value(
-            "Customer", {"shopify_customer_id": shopify_id}, "name"
-        )
-        if existing:
-            return existing
-
-    # ── 2. Match by phone ─────────────────────────────────────────────────────
-    if phone:
-        existing = frappe.db.get_value(
-            "Customer", {"shopify_phone": phone}, "name"
-        )
-        if existing:
-            _update_shopify_fields(existing, shopify_id, phone, email)
-            return existing
-
-        existing = frappe.db.get_value(
-            "Customer", {"mobile_no": phone}, "name"
-        )
-        if existing:
-            _update_shopify_fields(existing, shopify_id, phone, email)
-            return existing
-
-    # ── 3. Match by email ─────────────────────────────────────────────────────
-    if email:
-        existing = frappe.db.get_value(
-            "Customer", {"shopify_email": email}, "name"
-        )
-        if existing:
-            _update_shopify_fields(existing, shopify_id, phone, email)
-            return existing
-
-        existing = frappe.db.get_value(
-            "Customer", {"email_id": email}, "name"
-        )
-        if existing:
-            _update_shopify_fields(existing, shopify_id, phone, email)
-            return existing
 
     # ── 4. Create new individual customer ─────────────────────────────────────
     return _create_customer(
@@ -173,6 +160,123 @@ def get_or_create_customer(
         settings=settings,
         contact_person_name=shopify_person_name,
     )
+
+
+def _find_customer(filters: dict) -> str | None:
+    """Return one enabled Customer matching `filters`, newest first.
+
+    Two guarantees that matter when historical duplicates still exist:
+
+    • `disabled != 1` — the remediation for a duplicate pair is to disable the
+      stale record, and ERPNext refuses to put a disabled customer on a Sales
+      Order.  Matching one would fail the whole order sync with "Customer is
+      disabled", so a disabled record must never be returned.
+    • `order_by` — several customers can still share a phone or email from
+      before this dedup existed.  Without an explicit order the DB returns an
+      arbitrary row, so the same shopper could land on a different record from
+      one order to the next.  Newest wins: for a pair created by the old
+      GST-duplicate bug the later record is the GST-registered one, which is
+      the record now in use.
+    """
+    return frappe.db.get_value(
+        "Customer",
+        dict(filters, disabled=["!=", 1]),
+        "name",
+        order_by="creation desc",
+    )
+
+
+def _match_existing_customer(shopify_id: str, phone: str, email: str) -> str | None:
+    """Find the ERPNext Customer for this shopper, or None.
+
+    Priority: Shopify customer id → phone → email, checking the app's own
+    shopify_* fields before ERPNext's native mobile_no / email_id so a customer
+    created by this app is matched even if an operator later edited the native
+    fields.  Identity only — the caller decides what to do with the match.
+    """
+    if shopify_id:
+        found = _find_customer({"shopify_customer_id": shopify_id})
+        if found:
+            return found
+
+    if phone:
+        for fieldname in ("shopify_phone", "mobile_no"):
+            found = _find_customer({fieldname: phone})
+            if found:
+                return found
+
+    if email:
+        for fieldname in ("shopify_email", "email_id"):
+            found = _find_customer({fieldname: email})
+            if found:
+                return found
+
+    return None
+
+
+def _upgrade_customer_to_b2b(
+    customer_name: str, gstin: str, gst_legal_name: str, gst_customer_type: str
+):
+    """Promote an existing (usually B2C) Customer to the GST-registered entity.
+
+    A tax invoice must carry the GST-registered legal name as the party name, so
+    when a known shopper first orders under a GSTIN the Customer is renamed and
+    retyped in place rather than duplicated.
+
+    Skipped when the customer already has an Address carrying a *different*
+    GSTIN: one Shopify login can legitimately front two registrations, and
+    renaming on every order would make the party name flip-flop between them.
+    The GST address is still linked to this customer by
+    gst.resolve_billing_from_gstin(), and the SO/SI picks its GSTIN per order,
+    so the invoice is classified correctly either way.
+
+    Written with db.set_value rather than doc.save(): this runs inside a
+    background job where a full Customer validation can fail on unrelated
+    permission checks, and none of ERPNext's Customer hooks are needed here.
+    """
+    if not gst_legal_name:
+        return
+
+    for other in _linked_address_gstins(customer_name):
+        if other and other != gstin:
+            return
+
+    current = frappe.db.get_value(
+        "Customer", customer_name, ["customer_name", "customer_type"], as_dict=True
+    ) or {}
+
+    updates = {}
+    if gst_legal_name != current.get("customer_name"):
+        updates["customer_name"] = gst_legal_name
+    if gst_customer_type and gst_customer_type != current.get("customer_type"):
+        updates["customer_type"] = gst_customer_type
+
+    if updates:
+        frappe.db.set_value("Customer", customer_name, updates)
+
+
+def _linked_address_gstins(customer_name: str) -> list:
+    """Return the GSTINs on every Address linked to this Customer."""
+    if not frappe.db.has_column("Address", "gstin"):
+        return []
+
+    linked = frappe.get_all(
+        "Dynamic Link",
+        filters={
+            "link_doctype": "Customer",
+            "link_name":    customer_name,
+            "parenttype":   "Address",
+        },
+        pluck="parent",
+    )
+    if not linked:
+        return []
+
+    return [
+        g for g in frappe.get_all(
+            "Address", filters={"name": ["in", linked]}, pluck="gstin"
+        ) if g
+    ]
 
 
 def _create_customer(

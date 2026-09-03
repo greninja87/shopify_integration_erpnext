@@ -41,6 +41,10 @@ PASSWORDS = {}
 CACHE = {}
 # key -> expires_in_sec passed to set_value, so a test can assert the TTL
 CACHE_TTL = {}
+# doctype -> set of column names frappe.db.has_column() should report as present
+COLUMNS = {}
+# every doc dict inserted via frappe.get_doc({...}).insert(), in order
+INSERTS = []
 
 
 def reset():
@@ -53,6 +57,9 @@ def reset():
     PASSWORDS.clear()
     CACHE.clear()
     CACHE_TTL.clear()
+    COLUMNS.clear()
+    COLUMNS["Address"] = {"gstin", "gst_category"}
+    INSERTS.clear()
     META_FIELDS.clear()
     META_FIELDS["Payment Entry"] = {
         "custom_gateway_reference",
@@ -111,6 +118,41 @@ class _Meta:
         return {"fieldname": fieldname} if fieldname in self._fields else None
 
 
+def _filter_matches(doc, filters):
+    """Evaluate dict filters against a doc, including the ["op", value] form.
+
+    Real frappe accepts `{"disabled": ["!=", 1]}` alongside plain equality; a
+    stub that only did equality silently matched nothing for those, so code
+    guarded by an operator filter looked broken in tests when it was fine.
+    """
+    for key, cond in (filters or {}).items():
+        actual = doc.get(key)
+        if isinstance(cond, (list, tuple)) and len(cond) == 2:
+            op, expected = cond
+            op = str(op).lower()
+            if op == "!=":
+                if actual == expected:
+                    return False
+            elif op == "=":
+                if actual != expected:
+                    return False
+            elif op == "in":
+                if actual not in expected:
+                    return False
+            elif op == "not in":
+                if actual in expected:
+                    return False
+            elif op == "is":
+                is_set = actual not in (None, "")
+                if (expected == "set") != is_set:
+                    return False
+            else:
+                raise NotImplementedError(f"frappe_stub: filter operator {op!r}")
+        elif actual != cond:
+            return False
+    return True
+
+
 def _db_get_value(doctype, filters, fieldname=None, as_dict=False, **kwargs):
     if isinstance(filters, str):
         if filters not in DB.get(doctype, {}):
@@ -123,10 +165,21 @@ def _db_get_value(doctype, filters, fieldname=None, as_dict=False, **kwargs):
             # SimpleNamespace here made the stub disagree with production.
             return dict(picked) if as_dict else types.SimpleNamespace(**picked)
         return doc.get(fieldname)
-    # dict filters — first doc whose fields all match
-    for name, doc in DB.get(doctype, {}).items():
-        if all(doc.get(k) == v for k, v in (filters or {}).items()):
-            return name if fieldname == "name" else doc.get(fieldname)
+    # dict filters — first doc whose fields all match, honouring order_by so a
+    # test can pin which of several matching docs production picks.
+    matching = [
+        (name, doc) for name, doc in DB.get(doctype, {}).items()
+        if _filter_matches(doc, filters)
+    ]
+    order_by = kwargs.get("order_by")
+    if order_by:
+        field, _, direction = order_by.partition(" ")
+        matching.sort(
+            key=lambda pair: (pair[1].get(field) is None, pair[1].get(field)),
+            reverse=direction.strip().lower() == "desc",
+        )
+    for name, doc in matching:
+        return name if fieldname == "name" else doc.get(fieldname)
     return None
 
 
@@ -142,6 +195,62 @@ def _db_sql(query, params=None, as_dict=False, **kwargs):
         if needle in " ".join(query.split()):
             return rows
     return []
+
+
+class _NewDoc:
+    """Stand-in for the doc returned by frappe.get_doc({...}).
+
+    Supports the surface this app uses on a brand-new doc: attribute get/set,
+    .get(), .append() for child tables, .insert() and .save().  Inserting
+    records the dict in INSERTS and seeds DB, so a test can assert both what
+    was created and — the point of most of these tests — that nothing was.
+    """
+
+    def __init__(self, values):
+        self.__dict__["_values"] = dict(values)
+        self.__dict__["flags"] = types.SimpleNamespace(ignore_permissions=False)
+        doctype = values.get("doctype", "DOC")
+        self.__dict__["_values"].setdefault(
+            "name", values.get("name") or f"{doctype}-{len(INSERTS) + 1:04d}"
+        )
+
+    def __getattr__(self, key):
+        try:
+            return self.__dict__["_values"][key]
+        except KeyError:
+            raise AttributeError(key)
+
+    def __setattr__(self, key, value):
+        self.__dict__["_values"][key] = value
+
+    def get(self, key, default=None):
+        return self._values.get(key, default)
+
+    def append(self, fieldname, row):
+        self._values.setdefault(fieldname, []).append(dict(row))
+        return row
+
+    def insert(self, *a, **k):
+        INSERTS.append(dict(self._values))
+        doctype = self._values.get("doctype", "DOC")
+        DB.setdefault(doctype, {})[self._values["name"]] = dict(self._values)
+        return self
+
+    def save(self, *a, **k):
+        doctype = self._values.get("doctype", "DOC")
+        DB.setdefault(doctype, {}).setdefault(self._values["name"], {}).update(self._values)
+        return self
+
+
+def _get_doc(doctype, name=None, **k):
+    # frappe.get_doc({...}) — building a new doc
+    if isinstance(doctype, dict):
+        return _NewDoc(doctype)
+    # frappe.get_doc("Doctype", "name") — loading an existing one
+    return types.SimpleNamespace(
+        name=name,
+        get=lambda key, default=None: get_doc_values(doctype, name).get(key, default),
+    )
 
 
 def install():
@@ -166,9 +275,7 @@ def install():
     )
     frappe.get_meta      = lambda doctype: _Meta(doctype)
     frappe.get_all       = lambda *a, **k: []
-    frappe.get_doc       = lambda doctype, name=None, **k: types.SimpleNamespace(
-        name=name, get=lambda key, default=None: get_doc_values(doctype, name).get(key, default)
-    )
+    frappe.get_doc       = _get_doc
     frappe.whitelist     = lambda *a, **k: (lambda fn: fn)
     frappe.enqueue       = _noop
     frappe.get_traceback = lambda *a, **k: "traceback"
@@ -199,6 +306,7 @@ def install():
         sql=_db_sql,
         commit=lambda: COMMITS.append(1),
         exists=lambda *a, **k: True,
+        has_column=lambda doctype, column: column in COLUMNS.get(doctype, set()),
     )
 
     utils = types.ModuleType("frappe.utils")
