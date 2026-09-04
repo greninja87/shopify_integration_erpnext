@@ -31,6 +31,20 @@ def _create_credit_note_background(refund_data: dict, store_name: str, log_name:
 
     try:
         cn_name = create_credit_note_from_shopify_refund(refund_data, settings)
+        if not cn_name:
+            # This refund is ERPNext's own, written back by utils/refund.py, and
+            # the Credit Note for it already exists.  Not an error.
+            update_log_status(
+                log_name=log_name,
+                shopify_order_id=order_id,
+                status="Skipped",
+                error=(
+                    "This refund was raised in ERPNext and written back to "
+                    "Shopify by this app, so its Credit Note already exists. "
+                    "No second Credit Note was created."
+                ),
+            )
+            return
         update_log_status(
             log_name=log_name,
             shopify_order_id=order_id,
@@ -62,10 +76,34 @@ def create_credit_note_from_shopify_refund(refund_data: dict, settings) -> str:
 
     :param refund_data: Shopify refund dict (from refunds/create webhook payload)
     :param settings:    Shopify Settings document
-    :return:            Credit Note (Sales Invoice) name
+    :return:            Credit Note (Sales Invoice) name, or None when the refund
+                        is one this app wrote back and ERPNext already has it
     :raises:            frappe.DoesNotExistError when no SI is found for the order
     :raises:            Any exception from ERPNext document creation
     """
+    # ── The loop guard ───────────────────────────────────────────────────────
+    # utils/refund.py writes ERPNext refunds back to Shopify, and Shopify then
+    # sends us refunds/create for our own write.  Without this, that webhook
+    # builds a SECOND Credit Note for a refund ERPNext raised and already has a
+    # Credit Note for.  Checked first, before the erpnext import and before any
+    # lookup, because there is nothing to do at all in that case.
+    #
+    # The existing return_against idempotency below does not cover it: a refund
+    # ERPNext raised may have had its Credit Note created and submitted through
+    # a path that does not set return_against to the same original SI, and in
+    # any case a partial second refund of the same order is legitimate and must
+    # still work.  Matching the refund's own id is the precise test.
+    from shopify_integration.utils.refund import refund_request_for_shopify_refund
+
+    refund_id = str(refund_data.get("id", ""))
+    own_refund = refund_request_for_shopify_refund(refund_id)
+    if own_refund:
+        frappe.logger().info(
+            f"Shopify: refund {refund_id} was written back from Refund Request "
+            f"{own_refund} — skipping Credit Note creation, ERPNext already has one."
+        )
+        return None
+
     from erpnext.controllers.accounts_controller import make_return_doc
 
     order_id = str(refund_data.get("order_id", ""))

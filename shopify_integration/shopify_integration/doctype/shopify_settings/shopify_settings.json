@@ -104,6 +104,10 @@
     "auto_submit_credit_note",
     "section_cn_series",
     "cn_naming_series",
+    "section_refund_writeback",
+    "enable_refund_writeback",
+    "column_break_refund_writeback",
+    "notify_customer_on_refund",
     "tab_compliance",
     "section_e_compliance",
     "enable_e_invoice",
@@ -723,6 +727,31 @@
       "description": "Naming series for Credit Notes created from this store. Leave blank to use the ERPNext default."
     },
     {
+      "fieldname": "section_refund_writeback",
+      "fieldtype": "Section Break",
+      "label": "Refund Write-Back to Shopify",
+      "description": "Refunds are raised in ERPNext. When a <b>Refund Request</b> reaches <b>Completed</b>, tell Shopify, so the order stops showing the full amount as still refundable and nobody refunds it a second time there.<br><br><b>A successful write-back pays the customer.</b> It is a payment instruction, not a record: on this store the refund is logged against the <code>manual</code> gateway and the Cashfree-OCC app then turns it into a real Cashfree refund, usually within the same minute. Do not read <code>manual</code> as \"no money moved\".<br><br><b>Never let both paths run for one refund.</b> Shopify's refund reaches Cashfree on its own, so a refund that is also sent through the Cashfree API directly pays the customer twice. Leave this off until the <b>payment_portals</b> routing guard is in place, which refuses a Cashfree send for a refund whose Sales Order came from Shopify.<br><br>Requires the <b>payment_portals</b> app, which owns the Refund Request DocType. Shopify is never allowed to block, slow or fail a refund: the write-back is enqueued, and a failure is recorded on the document and in Shopify Log."
+    },
+    {
+      "default": "0",
+      "fieldname": "enable_refund_writeback",
+      "fieldtype": "Check",
+      "label": "Enable Refund Write-Back",
+      "description": "Off by default. There is no Shopify test store, so a write from any site — including the test site — hits the live storefront and moves real customer money. Exercise it first on an order that is already fully refunded, where Shopify must refuse."
+    },
+    {
+      "fieldname": "column_break_refund_writeback",
+      "fieldtype": "Column Break"
+    },
+    {
+      "default": "0",
+      "depends_on": "eval:doc.enable_refund_writeback",
+      "fieldname": "notify_customer_on_refund",
+      "fieldtype": "Check",
+      "label": "Email the Customer from Shopify",
+      "description": "Off by default. ERPNext already emails about the refund, and two refund emails for one refund is a support ticket."
+    },
+    {
       "fieldname": "tab_compliance",
       "fieldtype": "Tab Break",
       "label": "Compliance"
@@ -817,7 +846,7 @@
   "is_single": 0,
   "issingle": 0,
   "links": [],
-  "modified": "2026-08-26 00:00:00.000000",
+  "modified": "2026-09-04 10:00:00.000000",
   "modified_by": "Administrator",
   "module": "Shopify Integration",
   "name": "Shopify Settings",

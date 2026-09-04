@@ -34,6 +34,14 @@ def before_uninstall():
         "Delivery Note-custom_shopify_fulfillment_column_break",
         "Delivery Note-custom_shopify_fulfilled_at",
         "Delivery Note-custom_shopify_fulfillment_error",
+        # Refund Request (payment_portals) — Shopify refund write-back state
+        "Refund Request-shopify_refund_writeback_section",
+        "Refund Request-shopify_writeback_status",
+        "Refund Request-shopify_refund_gid",
+        "Refund Request-shopify_refund_writeback_column_break",
+        "Refund Request-shopify_refund_gateway",
+        "Refund Request-shopify_writeback_at",
+        "Refund Request-shopify_writeback_error",
     ]
     for cf_name in _SHOPIFY_CUSTOM_FIELDS:
         if frappe.db.exists("Custom Field", cf_name):
@@ -64,6 +72,7 @@ def after_install():
     create_payment_entry_custom_fields()
     create_sales_order_item_custom_fields()
     create_delivery_note_fulfillment_custom_fields()
+    create_refund_request_writeback_custom_fields()
     frappe.db.commit()  # nosemgrep: frappe-manual-commit — install hook runs outside request lifecycle
     print("✅ Shopify Integration: Custom fields created / updated successfully.")
 
@@ -479,4 +488,115 @@ def create_delivery_note_fulfillment_custom_fields():
         "allow_on_submit": 1,
         "no_copy":         1,
         "description":     "Why the last attempt failed, or what was left unfulfilled on a partial fulfillment.",
+    })
+
+
+def _refund_request_anchor() -> str:
+    """
+    Anchor for the write-back section on Refund Request.
+
+    amended_from is the doctype's last field, so a Section Break after it opens
+    a new section at the very end of the form and reparents nothing — no need
+    for the _section_boundary_anchor walk the Delivery Note and Sales Order
+    sections need.  The fallbacks cover a payment_portals version that has
+    reordered its own fields.
+    """
+    meta = frappe.get_meta("Refund Request")
+    for fieldname in ["amended_from", "error_log", "confirmed_transaction", "status"]:
+        if meta.get_field(fieldname):
+            return fieldname
+    return "status"
+
+
+def create_refund_request_writeback_custom_fields():
+    """
+    Add Shopify refund write-back state to Refund Request.
+
+    Refund Request belongs to payment_portals.  These are Custom Fields, so they
+    live in their own table rather than in refund_request.json: nothing in that
+    app is edited, and a `bench migrate` there will not undo them.  This app
+    already extends five DocTypes it does not own the same way.
+
+    shopify_refund_gid is the idempotency key: set means Shopify has been told,
+    and every trigger path treats it as a hard stop.  It is also what the
+    credit-note webhook guard matches against, so our own write-back cannot come
+    back round as a second Credit Note.
+
+    All fields are read_only + allow_on_submit: they are written after the
+    Refund Request is submitted, by machine, via frappe.db.set_value.  no_copy
+    keeps them off amended copies — an amended refund has not been written back,
+    and inheriting the GID would make it permanently unwritable, silently.
+
+    Created even while the write-back is disabled: they sit in a collapsed
+    section and stay blank until a store turns the feature on.  Skipped entirely
+    when payment_portals is absent, so this app stays installable without it.
+    """
+    doctype = "Refund Request"
+    if not frappe.db.exists("DocType", doctype):
+        return  # payment_portals not installed on this site
+
+    create_or_update_custom_field(doctype, {
+        "fieldname":    "shopify_refund_writeback_section",
+        "label":        "Shopify Refund Write-Back",
+        "fieldtype":    "Section Break",
+        "insert_after": _refund_request_anchor(),
+        "collapsible":  1,
+        "description":  "What this app told Shopify about this refund. Populated automatically once the refund is Completed, and only for refunds against a Shopify order. A <b>Done</b> here is a payment instruction Shopify accepted, not merely a record of one.",
+    })
+    create_or_update_custom_field(doctype, {
+        "fieldname":       "shopify_writeback_status",
+        "label":           "Shopify Write-Back Status",
+        "fieldtype":       "Select",
+        "options":         "\nPending\nDone\nFailed\nSkipped",
+        "insert_after":    "shopify_refund_writeback_section",
+        "read_only":       1,
+        "allow_on_submit": 1,
+        "no_copy":         1,
+        "in_standard_filter": 1,
+        "description":     "Pending = claimed by a worker. Done = Shopify recorded the refund. Failed = retry with the Write Back to Shopify button. Skipped = nothing to send (not a Shopify order, or the refund came from Shopify already).",
+    })
+    create_or_update_custom_field(doctype, {
+        "fieldname":       "shopify_refund_gid",
+        "label":           "Shopify Refund ID",
+        "fieldtype":       "Data",
+        "insert_after":    "shopify_writeback_status",
+        "read_only":       1,
+        "allow_on_submit": 1,
+        "no_copy":         1,
+        "description":     "Set once Shopify has accepted the refund. While this is set, no further refund is ever sent for this document.",
+    })
+    create_or_update_custom_field(doctype, {
+        "fieldname":    "shopify_refund_writeback_column_break",
+        "fieldtype":    "Column Break",
+        "insert_after": "shopify_refund_gid",
+    })
+    create_or_update_custom_field(doctype, {
+        "fieldname":       "shopify_refund_gateway",
+        "label":           "Shopify Refund Gateway",
+        "fieldtype":       "Data",
+        "insert_after":    "shopify_refund_writeback_column_break",
+        "read_only":       1,
+        "allow_on_submit": 1,
+        "no_copy":         1,
+        "description":     "The gateway Shopify attached the refund to, copied verbatim from the order's own parent transaction. On orders created by the Cashfree-OCC app this reads <b>manual</b>, because Shopify holds no gateway transaction of its own — that does <b>not</b> mean the customer went unpaid. The OCC app turns the Shopify refund into a real Cashfree refund; the proof is the Cashfree refund that follows, which Settlement Recon ingests at a median lag of about 48 hours. Its absence proves nothing for a day or two.",
+    })
+    create_or_update_custom_field(doctype, {
+        "fieldname":       "shopify_writeback_at",
+        "label":           "Shopify Write-Back At",
+        "fieldtype":       "Datetime",
+        "insert_after":    "shopify_refund_gateway",
+        "read_only":       1,
+        "allow_on_submit": 1,
+        "no_copy":         1,
+        "description":     "When Shopify accepted the refund. On a Pending or Failed row this is the last attempt time — it doubles as the worker claim stamp.",
+    })
+    create_or_update_custom_field(doctype, {
+        "fieldname":       "shopify_writeback_error",
+        "label":           "Shopify Write-Back Error",
+        "fieldtype":       "Small Text",
+        "insert_after":    "shopify_writeback_at",
+        "read_only":       1,
+        "allow_on_submit": 1,
+        "no_copy":         1,
+        "description":     "Why the last attempt failed, or why it was skipped.",
     })

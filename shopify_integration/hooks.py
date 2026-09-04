@@ -15,6 +15,16 @@ required_apps   = ["frappe", "erpnext"]
 # ----------------------------------------------------------
 doctype_js = {
     "Delivery Note": "public/js/delivery_note.js",
+    # Refund Request belongs to payment_portals; this only adds a Shopify
+    # write-back banner and button, and renders nothing on a non-Shopify refund.
+    #
+    # That button is the ONLY trigger for the refund write-back — there is
+    # deliberately no doc_events entry for "Refund Request".  A successful
+    # refundCreate pays the customer (the Cashfree-OCC app turns it into a real
+    # Cashfree refund), so it is a payout rather than a record, and the decision
+    # to fire it belongs with whatever owns the refund's money path, not with a
+    # post-submit save handler here.  See utils/refund.py.
+    "Refund Request": "public/js/refund_request.js",
 }
 
 doctype_list_js = {
