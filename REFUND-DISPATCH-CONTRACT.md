@@ -63,6 +63,41 @@ dispatcher is built. Nothing here is wired up yet.
 - The coupling is therefore exactly two things: **a hook name** and **the
   signature and result shape below**. Nothing else.
 
+### An argument you send can vanish without an error
+
+`frappe.call` resolves a dotted path and then calls `fn(*args, **newargs)`,
+where `newargs` is the caller's kwargs **filtered to the parameters the resolved
+function actually declares**. An argument the target does not accept is dropped
+silently — no `TypeError`, no warning. Proven accidentally on
+`electrobotictest`: a call passing `refund_request=…` to
+`get_refund_writeback_status` failed complaining about a *missing* `refund_name`,
+never about the unexpected keyword. (The same line is why whitelisting is not
+required for the in-process hook path — the whitelist gate lives in
+`frappe.handler.execute_cmd`, which only HTTP requests reach.)
+
+**So this rule governs every optional argument across this seam:**
+
+> An optional argument that changes a **safety** decision must be paired with a
+> **positive acknowledgement in the result**, emitted only on a path that
+> actually honoured it.
+
+Without that, sending the argument to a version that does not implement it is
+indistinguishable from having it honoured, and the caller believes a guard ran
+when nothing did. That is the same failure class as `caller_must_pay`: make the
+safe direction the default for absent, unknown and not-yet-implemented.
+
+The arguments that exist today are safe under this rule for reasons worth
+stating, not by luck:
+
+| argument | if it were dropped | why that is acceptable |
+|---|---|---|
+| `refund_name` | required positional → `TypeError` | fails loudly; cannot be missed |
+| `triggered_by` | defaults to `"manual"` | reaches a log line only; no decision depends on it |
+| `expected_amount` | **silently no cross-check** | **not acceptable — see §9.2** |
+
+`contract_version` does not save you here. It says what the document promises,
+not what the function resolved on this call actually accepted.
+
 ---
 
 ## 2. The hook
@@ -252,6 +287,10 @@ a version bump; none will be removed or change meaning without one.
   "payout_owner":    "shopify" | "caller" | "unknown",   # see §3
   "caller_must_pay": bool,   # THE routing flag; true only for not_a_shopify_order
   "owns_payout":     True | False | None,                # diagnostic; see §3
+
+  # RESERVED, not emitted yet: present and true only when an expected_amount
+  # you sent was actually compared. Absent means not compared. See §9.2.
+  # "expected_amount_checked": True,
 
   "message":     "<human sentence, safe to show a user>",
   "amount":      12999.0,   # net_refund_amount as understood here
@@ -476,12 +515,44 @@ So the other side can rely on it rather than defend against it:
 1. **Confirm the hook name `refund_payout_dispatchers`.** Nothing is registered
    on this side until you do — it is a one-line `hooks.py` addition and no other
    code. If you prefer another name, say it and I will register under that.
-2. **`expected_amount` is not implemented yet.** If you want the caller's figure
-   cross-checked, say so and I will add an optional `expected_amount` argument
-   that **refuses** on any mismatch with `net_refund_amount`
-   (`reason_code: "amount_mismatch"`, nothing sent) and never selects the amount
-   to pay. It is listed in §6 as reserved. Everything else in §6 is emitted
-   today.
+2. **`expected_amount` is not implemented yet, and must not ship without its
+   acknowledgement.** Raised from the `payment_portals` side, and correctly: as
+   originally specified it was unsafe. Sending it to a version that does not
+   implement it gets it dropped by `frappe.call` (§1) with no error, so the
+   caller would believe a cross-check had run when nothing compared anything —
+   a guard that silently is not there, which is the exact failure this document
+   exists to eliminate.
+
+   **The specification, so it can be built mechanically and only in one piece:**
+
+   - Signature becomes
+     `write_back_refund(refund_name, triggered_by="manual", expected_amount=None)`.
+   - When `expected_amount` is `None` or absent: behave exactly as now, and do
+     **not** emit the acknowledgement.
+   - When it is supplied: compare it to `net_refund_amount` **in minor units**
+     (`_paise`, the same integer basis the allocation uses — a float compare
+     would fail on 46952.16). On any difference, refuse before sending:
+     `outcome: "refused"`, `reason_code: "amount_mismatch"`, both figures in
+     `message`, nothing sent, `payout_owner` unchanged.
+   - On a match, and **only** on a path that actually performed that comparison,
+     emit `expected_amount_checked: true` in the result. It is never emitted
+     otherwise — absent and `false` both mean "not checked", and a caller must
+     not have to tell those apart.
+   - It never selects the amount to pay. `net_refund_amount` remains the single
+     source of truth; `expected_amount` can only ever cause a refusal.
+
+   **Your side's rule:** if you sent `expected_amount` and the result does not
+   carry `expected_amount_checked: true`, do not treat the figure as validated.
+   The case to handle deliberately is `outcome: "paid"` **without** the
+   acknowledgement — that is money already moved, at `net_refund_amount`, with
+   your expectation never compared. It is not a retry (retrying pays twice) and
+   not a failure; it is a reconciliation item, and it can only arise from a
+   version mismatch, which is worth alerting on rather than absorbing.
+
+   `amount_mismatch` and `expected_amount_checked` are both listed as reserved
+   and neither is emitted today. Everything else in §6 is. Say the word and I
+   will build the pair together — a test already refuses to let the parameter
+   land without the acknowledgement.
 3. **Guard against two dispatchers.** Registration is `hooks.py`, so a second
    app — or a duplicated entry — silently doubles the payout. The check belongs
    on your side because you are the one iterating the list; the snippet in §2

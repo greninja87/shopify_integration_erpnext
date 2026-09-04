@@ -51,6 +51,10 @@ def contract_text() -> str:
 class TestContractDocument(unittest.TestCase):
     def setUp(self):
         self.text = contract_text()
+        # Prose in this document is hard-wrapped, so a phrase that reads as one
+        # string on the page is split by a newline in the file.  Assert prose
+        # against this, and code/keys against self.text.
+        self.prose = " ".join(self.text.split())
 
     def test_the_contract_exists_where_the_other_side_was_told_to_look(self):
         self.assertTrue(CONTRACT.is_file(), CONTRACT)
@@ -104,6 +108,16 @@ class TestContractDocument(unittest.TestCase):
         """An enqueued payout cannot be reported as sent, and that reasoning is
         the whole answer to the question — it has to be in the document."""
         self.assertIn("synchronous", self.text.lower())
+
+    def test_the_acknowledgement_pattern_is_specified_not_just_promised(self):
+        """expected_amount is unsafe without it, so the document has to say what
+        the acknowledgement is called and when it is emitted — otherwise the
+        next session builds the argument alone."""
+        self.assertIn("expected_amount_checked", self.text)
+        self.assertIn("frappe.call", self.text)
+        prose = self.prose.lower()
+        self.assertIn("dropped silently", prose)
+        self.assertIn("positive acknowledgement in the result", prose)
 
     def test_the_unimplemented_parts_are_marked_as_such(self):
         """The other side is building against this; a promised function that does
@@ -239,6 +253,103 @@ class TestOutcomeVocabulary(WritebackTestCase):
         self.seed()
         self.responses = [targets_response(), ShopifyAPIError("connection reset")]
         self.assertEqual(r.write_back_refund(REFUND)["amount"], 12999.0)
+
+
+# ── Optional arguments across the seam ────────────────────────────────────────
+
+class TestSeamArguments(WritebackTestCase):
+    """frappe.call drops kwargs the resolved function does not declare, silently
+    and with no error.  So an optional argument that gates a safety decision is
+    only safe when the result positively acknowledges that it was honoured —
+    otherwise "sent to a version that ignores it" is indistinguishable from
+    "honoured", and the caller believes a guard ran when nothing did.
+    """
+
+    ACK = "expected_amount_checked"
+
+    def test_the_signature_is_still_the_two_documented_arguments(self):
+        """A deliberate tripwire, not a rule against ever changing this.  The
+        signature is published in the contract's §2, so changing it here means
+        changing it there — update both, and this line, together."""
+        import inspect
+
+        self.assertEqual(
+            list(inspect.signature(r.write_back_refund).parameters),
+            ["refund_name", "triggered_by"],
+            "write_back_refund's signature changed; §2 of "
+            "REFUND-DISPATCH-CONTRACT.md publishes it, and payment_portals "
+            "calls it by keyword — update the document and this test together",
+        )
+
+    def test_expected_amount_cannot_land_without_its_acknowledgement(self):
+        """Inert today, and the whole point of it is the day it is not.  Add the
+        parameter without the acknowledgement key and this fails — the pair has
+        to ship together, the same way the permission check and the whitelist had
+        to come off together."""
+        import inspect
+
+        params = list(inspect.signature(r.write_back_refund).parameters)
+        if "expected_amount" not in params:
+            self.assertNotIn(
+                self.ACK, r.write_back_refund(REFUND),
+                f"{self.ACK} is emitted but expected_amount is not a parameter — "
+                f"an acknowledgement for a check that cannot have run",
+            )
+            return
+
+        # The parameter exists, so every clause of §9.2 is now in force.
+        clean = r.write_back_refund(REFUND)
+        self.assertNotIn(
+            self.ACK, clean,
+            "no expected_amount was sent, so nothing was compared and the "
+            "acknowledgement must be absent",
+        )
+
+        self.seed()
+        matched = r.write_back_refund(REFUND, expected_amount=12999.0)
+        self.assertIs(
+            matched.get(self.ACK), True,
+            "a compared and matching expected_amount must be acknowledged, or "
+            "the caller cannot tell the check ran",
+        )
+
+        self.seed()
+        mismatched = r.write_back_refund(REFUND, expected_amount=12000.0)
+        self.assertEqual(mismatched["reason_code"], "amount_mismatch")
+        self.assertEqual(mismatched["outcome"], r.OUTCOME_REFUSED)
+        self.assertNothingSent()
+        self.assertIn("12999.00", mismatched["message"])
+        self.assertIn("12000.00", mismatched["message"])
+
+        # Minor units, not floats: the figure that exposed the difference.
+        self.seed()
+        self.set_field(net_refund_amount=46952.16)
+        self.responses = [targets_response([{
+            "id": "gid://shopify/OrderTransaction/99",
+            "kind": "SALE", "status": "SUCCESS", "gateway": "manual",
+            "amountSet": {"presentmentMoney": {"amount": "46952.16"}},
+            "maximumRefundableV2": {"amount": "46952.16"},
+        }]), refund_created()]
+        paise = r.write_back_refund(REFUND, expected_amount=46952.16)
+        self.assertIs(paise.get(self.ACK), True, paise)
+
+    def test_triggered_by_being_dropped_could_change_nothing(self):
+        """It is safe to lose precisely because no decision reads it — it reaches
+        a log line.  Asserted so it stays that way."""
+        with_label = r.write_back_refund(REFUND, triggered_by="payment_portals_payout")
+        self.seed()
+        without = r.write_back_refund(REFUND)
+
+        for key in ("outcome", "reason_code", "payout_owner", "caller_must_pay",
+                    "retry_safe", "possibly_paid", "status", "refund_gid"):
+            self.assertEqual(with_label[key], without[key], key)
+
+    def test_refund_name_fails_loudly_rather_than_silently(self):
+        """The one argument that must never be dropped is positional, so
+        frappe.call's filtering surfaces it as a TypeError instead of a refund
+        for the wrong document."""
+        with self.assertRaises(TypeError):
+            r.write_back_refund()
 
 
 # ── The routing invariant ─────────────────────────────────────────────────────
