@@ -11,8 +11,6 @@ Covers the pure half of utils/refund.py, which is where the correctness lives:
     agree on their shape, and guessing wrong reads as "no transactions"
   * refundable_parents   — refunding against a REFUND row, a VOID or an
     uncaptured AUTHORIZATION
-  * gateway_moves_money  — whether Shopify charges a gateway back itself, which
-    is NOT the same question as whether the customer gets paid
   * plan_refund          — over-refunding a parent past maximumRefundableV2, or
     writing back a partial amount that looks settled and is not
   * build_refund_input   — restocking by accident, and losing the reason
@@ -151,34 +149,6 @@ class TestRefundableParents(unittest.TestCase):
         self.assertEqual([p["id"] for p in parents], ["t/1"])
 
 
-# ── Does Shopify charge a gateway back? ─────────────────────────────────────────────
-
-class TestGatewayMovesMoney(unittest.TestCase):
-    """Deliberately narrow: this reports whether SHOPIFY charges a gateway back,
-    not whether the customer ends up paid.  A "manual" refund on this store does
-    pay the customer, through the Cashfree-OCC bridge."""
-
-    def test_manual_is_not_a_shopify_gateway_charge(self):
-        """Cashfree-OCC marked the order paid by hand, so Shopify holds no
-        gateway transaction to reverse — the OCC app does that part."""
-        self.assertFalse(r.gateway_moves_money("manual"))
-
-    def test_manual_is_case_and_space_insensitive(self):
-        self.assertFalse(r.gateway_moves_money("Manual"))
-        self.assertFalse(r.gateway_moves_money("  MANUAL  "))
-
-    def test_blank_reads_as_manual(self):
-        """An absent gateway is not evidence of a real one."""
-        self.assertFalse(r.gateway_moves_money(""))
-        self.assertFalse(r.gateway_moves_money("   "))
-        self.assertFalse(r.gateway_moves_money(None))
-
-    def test_a_real_gateway_is_a_shopify_gateway_charge(self):
-        self.assertTrue(r.gateway_moves_money("cashfree"))
-        self.assertTrue(r.gateway_moves_money("Cashfree Payments"))
-        self.assertTrue(r.gateway_moves_money("shopify_payments"))
-
-
 # ── Planning ──────────────────────────────────────────────────────────────────
 
 class TestPlanRefund(unittest.TestCase):
@@ -211,7 +181,7 @@ class TestPlanRefund(unittest.TestCase):
 
         self.assertEqual(plan["transactions"], [])
         self.assertEqual(plan["allocated"], 0.0)
-        self.assertFalse(plan["moves_money"])
+        self.assertEqual(plan["gateways"], [])
         self.assertTrue(plan["problem"])
         self.assertIn("5000.00", plan["problem"])
         self.assertIn("12999.00", plan["problem"])
@@ -243,34 +213,40 @@ class TestPlanRefund(unittest.TestCase):
         ], 9000.0)
         self.assertEqual([t["parentId"] for t in plan["transactions"]], ["t/1"])
 
-    def test_moves_money_is_false_for_an_all_manual_order(self):
-        """Order #6518 — Shopify charges nothing back itself.  The customer is
-        still paid, by the OCC app; this flag does not claim otherwise."""
+    def test_the_order_s_own_gateway_is_reported_verbatim(self):
+        """Order #6518 — "manual", which is the normal value on an OCC order and
+        says nothing either way about whether the customer gets paid."""
         plan = r.plan_refund(order_6518_transactions(), 12999.0)
 
         self.assertIsNone(plan["problem"])
-        self.assertFalse(plan["moves_money"])
         self.assertEqual(plan["gateways"], ["manual"])
 
-    def test_moves_money_is_true_when_any_allocated_parent_is_real(self):
+    def test_every_allocated_gateway_is_reported_in_order(self):
         plan = r.plan_refund([
             txn("t/1", gateway="manual", refundable="10000.00"),
             txn("t/2", gateway="cashfree", refundable="8000.00"),
         ], 15000.0)
 
-        self.assertTrue(plan["moves_money"])
         self.assertEqual(plan["gateways"], ["manual", "cashfree"])
 
-    def test_moves_money_ignores_a_real_gateway_that_got_no_allocation(self):
-        """A Cashfree row with headroom we never touched does not make this a
-        Shopify gateway charge."""
+    def test_a_gateway_that_got_no_allocation_is_not_reported(self):
+        """A Cashfree row with headroom we never touched is not part of this
+        refund, and recording it would misattribute the payout."""
         plan = r.plan_refund([
             txn("t/1", gateway="manual", refundable="20000.00"),
             txn("t/2", gateway="cashfree", refundable="8000.00"),
         ], 5000.0)
 
-        self.assertFalse(plan["moves_money"])
         self.assertEqual(plan["gateways"], ["manual"])
+
+    def test_no_moves_money_flag_is_offered(self):
+        """Deleted deliberately: it was diagnostic only, nothing consumed it,
+        and a boolean over the gateway name invited exactly the misreading that
+        produced the wrong first draft of this feature's brief.  The gateway
+        names are recorded; that is the whole of what is knowable here."""
+        plan = r.plan_refund([txn("t/1")], 12999.0)
+        self.assertNotIn("moves_money", plan)
+        self.assertFalse(hasattr(r, "gateway_moves_money"))
 
     def test_gateways_are_deduplicated_in_allocation_order(self):
         plan = r.plan_refund([

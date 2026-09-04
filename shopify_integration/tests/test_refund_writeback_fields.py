@@ -123,16 +123,28 @@ class TestRefundWritebackFields(unittest.TestCase):
 
     # ── Shapes ────────────────────────────────────────────────────────────────
 
-    def test_the_status_field_offers_exactly_the_four_states_and_blank(self):
+    def test_the_status_field_offers_exactly_the_five_states_and_blank(self):
         options = self.fields[r.WRITEBACK_STATUS_FIELD]["options"]
         self.assertEqual(
-            options.split("\n"), ["", "Pending", "Done", "Failed", "Skipped"]
+            options.split("\n"),
+            ["", "Pending", "Done", "Failed", "Skipped", "Unverified"],
         )
 
     def test_the_status_options_match_the_constants_the_code_writes(self):
+        """A status the code writes but the Select does not offer is invisible in
+        the form and unfilterable in the list view."""
         options = set(self.fields[r.WRITEBACK_STATUS_FIELD]["options"].split("\n"))
-        for status in (r.STATUS_PENDING, r.STATUS_DONE, r.STATUS_FAILED, r.STATUS_SKIPPED):
+        for status in (r.STATUS_PENDING, r.STATUS_DONE, r.STATUS_FAILED,
+                       r.STATUS_SKIPPED, r.STATUS_UNVERIFIED):
             self.assertIn(status, options)
+
+    def test_the_status_description_warns_that_unverified_may_be_paid(self):
+        """Unverified is the one state where doing the obvious thing — retrying —
+        pays the customer twice."""
+        description = self.fields[r.WRITEBACK_STATUS_FIELD].get("description", "").lower()
+        self.assertIn("unverified", description)
+        self.assertIn("may already have been paid", description)
+        self.assertIn("do not retry", description)
 
     def test_field_types(self):
         self.assertEqual(self.fields[r.REFUND_GID_FIELD]["fieldtype"], "Data")

@@ -33,14 +33,24 @@ Because Shopify's refund reaches Cashfree by itself, one refund must never go ou
 through both this write-back and payment_portals' own Cashfree refund call — that
 pays the customer twice.  The split is by order origin: a refund whose Sales Order
 carries a shopify_order_id is Shopify's payout, and a payment-link or direct
-Cashfree payment stays with the Cashfree API.  The refusing half of that guard
-lives in payment_portals and is not this app's to write.  Until it exists,
-enable_refund_writeback must stay off.
+Cashfree payment stays with the Cashfree API.
 
-Snapmint is not known to work this way at all: there has never been a Snapmint
-refund event in production, and #6518's ₹12,999 went out by NEFT.  Nothing here
-distinguishes a Snapmint order from an OCC one — the parent transaction reads
-"manual" for both — so that remains an open question rather than a guard.
+That refusing gate lives in payment_portals (portal_channel_blocked, third gate,
+commit 1ed0e8b) and is not this app's to write.  Note what it does and does not
+do: it **refuses** a Payment Portal refund on a Shopify order, pointing the
+reader at Manual Portal Refund.  It does not delegate to this module, and no
+dispatcher exists yet — so nothing calls write_back_refund except the whitelisted
+entry point and the form button.  See REFUND-DISPATCH-CONTRACT.md for the
+handshake that would change that.
+
+Snapmint needs no guard here.  The discriminator is not visible in the
+transaction nodes — OCC and Snapmint orders both read "manual" — and it does not
+have to be: payment_portals decides it upstream from
+Refund Request.portal_account -> provider, where SnapmintProvider.supports_refunds
+is False and portal_channel_blocked already refuses the portal channel outright.
+A Snapmint refund therefore never reaches this module on the portal channel, and
+one recorded as Bank Transfer or Manual Portal Refund is skipped by the guards
+below.
 
 Coupling
 --------
@@ -75,6 +85,10 @@ from shopify_integration.utils.shopify_graphql import (
 
 REFUND_REQUEST = "Refund Request"
 
+# Bumped when the shape of write_back_refund's result dict changes in a way a
+# caller has to care about.  See REFUND-DISPATCH-CONTRACT.md.
+CONTRACT_VERSION = 1
+
 # Refund Request state fields, created by this app as Custom Fields.
 REFUND_GID_FIELD      = "shopify_refund_gid"
 WRITEBACK_STATUS_FIELD = "shopify_writeback_status"
@@ -86,6 +100,69 @@ STATUS_PENDING = "Pending"
 STATUS_DONE    = "Done"
 STATUS_FAILED  = "Failed"
 STATUS_SKIPPED = "Skipped"
+
+# The refund was sent and its fate is unknown — the customer may or may not have
+# been paid.  Deliberately NOT "Failed": a Failed row invites a retry, and
+# retrying a refund that already went through pays the customer twice.  Nothing
+# retries this state; it is cleared by a person via
+# resolve_unverified_writeback() after checking the order in Shopify.
+STATUS_UNVERIFIED = "Unverified"
+
+# ── The outcome vocabulary ───────────────────────────────────────────────────
+#
+# write_back_refund's `status` is the document state.  `outcome` is the caller's
+# contract, and it exists because "Failed" is not precise enough for something
+# that moves money: a caller has to know whether nobody was paid (retry) or
+# whether it cannot tell (reconcile, never retry).  See
+# REFUND-DISPATCH-CONTRACT.md.
+OUTCOME_PAID           = "paid"            # Shopify accepted; refund_gid is set
+OUTCOME_REFUSED        = "refused"         # not sent; nobody paid; config/data
+OUTCOME_FAILED_UNSENT  = "failed_unsent"   # not sent; nobody paid; safe to retry
+OUTCOME_FAILED_UNKNOWN = "failed_unknown"  # SENT, fate unknown; POSSIBLY PAID
+OUTCOME_IN_PROGRESS    = "in_progress"     # another worker holds the claim
+
+# Only one outcome is ever safe to retry automatically.
+_RETRY_SAFE_OUTCOMES = (OUTCOME_FAILED_UNSENT,)
+
+# The closed reason_code vocabulary, per outcome, and the single source of truth
+# for REFUND-DISPATCH-CONTRACT.md — tests/test_refund_contract.py asserts the
+# document lists every code here and that nothing is emitted from outside it.
+# It is closed because payment_portals branches on these slugs to decide whether
+# a customer might already have been paid.
+REASON_CODES = {
+    OUTCOME_PAID: frozenset({""}),
+    OUTCOME_REFUSED: frozenset({
+        "already_paid",
+        "not_a_shopify_order",
+        "channel_is_manual_portal_refund",
+        "wrong_refund_status",
+        "not_submitted",
+        "nothing_to_refund",
+        "writeback_unavailable_for_store",
+        "no_api_credentials",
+        "no_permission",
+        "not_installed",
+        "refund_request_missing",
+        # Reserved for execute_refund_payout's optional expected_amount
+        # cross-check, which is not built yet — see the contract's §9.
+        "amount_mismatch",
+    }),
+    OUTCOME_FAILED_UNSENT: frozenset({
+        "query_failed",
+        "shopify_order_not_found",
+        "insufficient_refundable",
+        "no_refundable_transactions",
+        "rejected_by_shopify",
+        "not_authorised",
+        "setup_failed",
+    }),
+    OUTCOME_FAILED_UNKNOWN: frozenset({
+        "transport_error_after_send",
+        "response_unverifiable",
+        "unverified_previous_attempt",
+    }),
+    OUTCOME_IN_PROGRESS: frozenset({"claimed_elsewhere"}),
+}
 
 # The Refund Request status that means booked and paid.  Only then is ERPNext
 # sure enough to tell Shopify.
@@ -99,9 +176,6 @@ CHANNEL_FROM_SHOPIFY = "Manual Portal Refund"
 # no money, a VOID has given it back already, and a REFUND row is the result of
 # a refund rather than something to refund.
 _PARENT_KINDS = ("SALE", "CAPTURE")
-
-# A gateway of "manual" means Shopify recorded a payment nobody charged.
-_MANUAL_GATEWAY = "manual"
 
 # A Pending claim older than this is assumed abandoned (worker killed
 # mid-request) and becomes eligible again.  Mirrors fulfillment.py.
@@ -232,23 +306,6 @@ def refundable_parents(nodes) -> list:
     return parents
 
 
-def gateway_moves_money(gateway) -> bool:
-    """
-    Whether SHOPIFY itself charges a gateway back for this refund.
-
-    False for "manual" and for blank/None; True otherwise.  Blank reads as
-    manual because an absent gateway is not evidence of a real one.
-
-    Read the name narrowly.  This is NOT "did the customer get paid" — on this
-    store the answer to that is yes either way, because the Cashfree-OCC app
-    bridges a "manual" Shopify refund into a real Cashfree refund (see the
-    module docstring).  What this distinguishes is whether the money leaves
-    through a gateway Shopify itself holds, or through the OCC app afterwards.
-    Never surface it to a user as "money moved" / "no money moved".
-    """
-    return (str(gateway or "").strip().lower() or _MANUAL_GATEWAY) != _MANUAL_GATEWAY
-
-
 def plan_refund(nodes, amount) -> dict:
     """
     Allocate `amount` across refundable parents, capped per parent by its
@@ -256,11 +313,15 @@ def plan_refund(nodes, amount) -> dict:
 
     :return: {"transactions": [{"parentId", "kind", "gateway", "amount"}],
               "gateways": [gateway names actually allocated, in order],
-              "moves_money": bool, "allocated": float, "problem": str | None}
+              "allocated": float, "problem": str | None}
 
-    `moves_money` is True when ANY allocated parent's gateway is one Shopify
-    charges back itself — see gateway_moves_money for how narrowly to read that.
-    A parent that got no allocation does not count, however real its gateway.
+    `gateways` carries only the gateways that were actually allocated against —
+    a parent left untouched contributes nothing, however large its headroom.
+    There is deliberately no "does this move money" flag derived from those
+    names: on these orders "manual" is the normal gateway *and* the customer
+    gets paid, via the Cashfree-OCC bridge, so such a flag is false comfort.
+    The gateway names themselves are recorded on the Refund Request, which is
+    the whole of what is knowable here.
 
     Allocates nothing and sets `problem` when the parents' combined headroom is
     short of `amount`: a partial Shopify record is worse than none, because it
@@ -268,7 +329,7 @@ def plan_refund(nodes, amount) -> dict:
     useful next question is "short by how much".
     """
     def empty(problem):
-        return {"transactions": [], "gateways": [], "moves_money": False,
+        return {"transactions": [], "gateways": [],
                 "allocated": 0.0, "problem": problem}
 
     wanted = _paise(amount)
@@ -313,7 +374,6 @@ def plan_refund(nodes, amount) -> dict:
     return {
         "transactions": transactions,
         "gateways": gateways,
-        "moves_money": any(gateway_moves_money(g) for g in gateways),
         "allocated": flt(_money(wanted - remaining)),
         "problem": None,
     }
@@ -446,6 +506,13 @@ def _claim(refund_name: str) -> bool:
         frappe.db.commit()  # nosemgrep: frappe-manual-commit — release the row lock
         return False
 
+    # Re-checked here and not only in check_eligibility: two callers can both
+    # pass eligibility before either writes its result, and the loser must not
+    # send a second refund against an attempt whose fate is unknown.
+    if (current.get(WRITEBACK_STATUS_FIELD) or "") == STATUS_UNVERIFIED:
+        frappe.db.commit()  # nosemgrep: frappe-manual-commit — release the row lock
+        return False
+
     if (current.get(WRITEBACK_STATUS_FIELD) or "") == STATUS_PENDING:
         claimed_at = _claim_timestamp(refund_name)
         cutoff = add_to_date(now_datetime(), minutes=-STALE_CLAIM_MINUTES)
@@ -521,10 +588,12 @@ def check_eligibility(refund_name: str, settings=None) -> dict:
     rather than raising.  A payout path that throws on an edge case is worse
     than one that refuses.
     """
-    out = {"ok": False, "reason": "", "settings": None, "shopify_order_id": "",
-           "amount": 0.0, "note": "", "status": "", "refund_gid": ""}
+    out = {"ok": False, "reason": "", "reason_code": "", "settings": None,
+           "shopify_order_id": "", "amount": 0.0, "note": "", "status": "",
+           "refund_gid": ""}
 
     if not _has_writeback_fields():
+        out["reason_code"] = "not_installed"
         out["reason"] = _NOT_MIGRATED_REASON
         return out
 
@@ -536,6 +605,7 @@ def check_eligibility(refund_name: str, settings=None) -> dict:
         as_dict=True,
     )
     if not row:
+        out["reason_code"] = "refund_request_missing"
         out["reason"] = f"{REFUND_REQUEST} {refund_name} does not exist."
         return out
 
@@ -548,17 +618,30 @@ def check_eligibility(refund_name: str, settings=None) -> dict:
     # guard that must hold even if the document has since been edited into a
     # state the other guards would reject.
     if out["refund_gid"]:
+        out["reason_code"] = "already_paid"
         out["reason"] = (
             f"Already written back to Shopify as {out['refund_gid']}. No further "
             f"refund is ever sent for this document."
         )
         return out
 
+    if out["status"] == STATUS_UNVERIFIED:
+        out["reason_code"] = "unverified_previous_attempt"
+        out["reason"] = (
+            "A previous attempt was sent to Shopify and its outcome could not be "
+            "confirmed, so this refund may already have been paid. Retrying could "
+            "pay the customer twice. Check the order in Shopify, then record what "
+            "you found with resolve_unverified_writeback."
+        )
+        return out
+
     if cint(row.get("docstatus")) != 1:
+        out["reason_code"] = "not_submitted"
         out["reason"] = "Only a submitted Refund Request is written back."
         return out
 
     if (row.get("status") or "") != REFUND_BOOKED_STATUS:
+        out["reason_code"] = "wrong_refund_status"
         out["reason"] = (
             f"Refund status is '{row.get('status') or 'blank'}', not "
             f"'{REFUND_BOOKED_STATUS}' — Shopify is told once ERPNext has booked "
@@ -567,6 +650,7 @@ def check_eligibility(refund_name: str, settings=None) -> dict:
         return out
 
     if (row.get("refund_channel") or "") == CHANNEL_FROM_SHOPIFY:
+        out["reason_code"] = "channel_is_manual_portal_refund"
         out["reason"] = (
             f"Refund channel is '{CHANNEL_FROM_SHOPIFY}' — this refund was made "
             f"in Shopify already, so writing it back would refund it twice."
@@ -574,6 +658,7 @@ def check_eligibility(refund_name: str, settings=None) -> dict:
         return out
 
     if out["amount"] <= 0:
+        out["reason_code"] = "nothing_to_refund"
         out["reason"] = (
             f"Net refund to customer is {out['amount']:.2f} — there is nothing "
             f"to send."
@@ -582,6 +667,7 @@ def check_eligibility(refund_name: str, settings=None) -> dict:
 
     sales_order = str(row.get("sales_order") or "").strip()
     if not sales_order:
+        out["reason_code"] = "not_a_shopify_order"
         out["reason"] = "No Sales Order on this refund, so no Shopify order to refund."
         return out
 
@@ -590,6 +676,7 @@ def check_eligibility(refund_name: str, settings=None) -> dict:
     ) or {}
     shopify_order_id = str(order.get("shopify_order_id") or "").strip()
     if not shopify_order_id:
+        out["reason_code"] = "not_a_shopify_order"
         out["reason"] = (
             f"Sales Order {sales_order} has no Shopify order id — this is a "
             f"payment link or a direct gateway payment, and its refund does not "
@@ -601,6 +688,7 @@ def check_eligibility(refund_name: str, settings=None) -> dict:
     shop_domain = str(order.get("shopify_store") or "").strip()
     settings = settings or _settings_for_store(shop_domain)
     if not settings:
+        out["reason_code"] = "writeback_unavailable_for_store"
         out["reason"] = (
             f"No enabled Shopify Settings for store '{shop_domain or '?'}' with "
             f"Refund Write-Back switched on. Nothing was sent."
@@ -608,6 +696,7 @@ def check_eligibility(refund_name: str, settings=None) -> dict:
         return out
 
     if not has_admin_api_credentials(settings):
+        out["reason_code"] = "no_api_credentials"
         out["reason"] = (
             f"Store '{shop_domain}' has no Admin API credentials configured, so "
             f"the refund cannot be sent."
@@ -681,17 +770,33 @@ def write_back_refund(refund_name: str, triggered_by: str = "manual") -> dict:
     :return: {"ok", "status", "refund_gid", "gateway", "message",
               "refund_request"}
     """
-    def result(ok, status, message, refund_gid="", gateway=""):
-        return {"ok": ok, "status": status, "message": message,
-                "refund_gid": refund_gid, "gateway": gateway,
-                "refund_request": refund_name}
+    def result(ok, status, message, outcome, reason_code="",
+               refund_gid="", gateway="", amount=0.0):
+        return {
+            "ok": ok,
+            "outcome": outcome,
+            "reason_code": reason_code,
+            # Derivable from `outcome`, stated anyway so a caller cannot get the
+            # mapping wrong on the one axis where being wrong pays twice.
+            "retry_safe": outcome in _RETRY_SAFE_OUTCOMES,
+            "possibly_paid": outcome in (OUTCOME_PAID, OUTCOME_FAILED_UNKNOWN),
+            "status": status,
+            "message": message,
+            "refund_gid": refund_gid,
+            "gateway": gateway,
+            "amount": amount,
+            "refund_request": refund_name,
+            "provider": "shopify",
+            "contract_version": CONTRACT_VERSION,
+        }
 
     # Availability first.  On a site without payment_portals — or one where the
     # patch has not run — frappe.has_permission on a missing DocType fails, and
     # "you lack permission" would be the wrong diagnosis for "this app is inert
     # here".
     if not _has_writeback_fields():
-        return result(False, STATUS_SKIPPED, _NOT_MIGRATED_REASON)
+        return result(False, STATUS_SKIPPED, _NOT_MIGRATED_REASON,
+                      OUTCOME_REFUSED, reason_code="not_installed")
 
     # Refused before anything else is read or written: an unauthorised caller
     # must not be able to pay a customer, nor to leave a mark on the document
@@ -704,7 +809,8 @@ def write_back_refund(refund_name: str, triggered_by: str = "manual") -> dict:
     if not permitted:
         return result(False, STATUS_SKIPPED,
                       f"You do not have submit permission on {REFUND_REQUEST} "
-                      f"{refund_name}, so no refund was sent.")
+                      f"{refund_name}, so no refund was sent.",
+                      OUTCOME_REFUSED, reason_code="no_permission")
 
     try:
         eligibility = check_eligibility(refund_name)
@@ -713,9 +819,20 @@ def write_back_refund(refund_name: str, triggered_by: str = "manual") -> dict:
             # other refusal is recorded as a Skip with its reason.
             if eligibility["refund_gid"]:
                 return result(False, STATUS_DONE, eligibility["reason"],
-                              refund_gid=eligibility["refund_gid"])
+                              OUTCOME_REFUSED, reason_code="already_paid",
+                              refund_gid=eligibility["refund_gid"],
+                              amount=eligibility["amount"])
+            # An unconfirmed earlier attempt keeps its Unverified status; it must
+            # not be flattened into a Skip, which reads as "nothing happened".
+            if eligibility["status"] == STATUS_UNVERIFIED:
+                return result(False, STATUS_UNVERIFIED, eligibility["reason"],
+                              OUTCOME_FAILED_UNKNOWN,
+                              reason_code=eligibility["reason_code"],
+                              amount=eligibility["amount"])
             _record_skip(refund_name, eligibility["reason"])
-            return result(False, STATUS_SKIPPED, eligibility["reason"])
+            return result(False, STATUS_SKIPPED, eligibility["reason"],
+                          OUTCOME_REFUSED, reason_code=eligibility["reason_code"],
+                          amount=eligibility["amount"])
 
         settings = eligibility["settings"]
         shopify_order_id = eligibility["shopify_order_id"]
@@ -725,17 +842,48 @@ def write_back_refund(refund_name: str, triggered_by: str = "manual") -> dict:
         if not _claim(refund_name):
             return result(False, STATUS_PENDING,
                           "Another process is already writing this refund back to "
-                          "Shopify.")
+                          "Shopify.",
+                          OUTCOME_IN_PROGRESS, reason_code="claimed_elsewhere",
+                          amount=amount)
     except Exception:
         frappe.log_error(
             frappe.get_traceback(), f"Shopify: Refund Write-Back Setup Failed — {refund_name}"
         )
-        return result(False, "", "Could not start the write-back; see the Error Log.")
+        # Thrown before the claim, so before any HTTP: nothing was sent.
+        return result(False, "", "Could not start the write-back; see the Error Log.",
+                      OUTCOME_FAILED_UNSENT, reason_code="setup_failed")
 
-    def fail(message):
+    def fail_unsent(message, reason_code):
+        """Nothing left this process, or Shopify explicitly declined it.  Nobody
+        was paid, and a retry cannot double-pay."""
         _release_claim(refund_name, STATUS_FAILED, message)
         _log(settings, refund_name, shopify_order_id, "Failed", message)
-        return result(False, STATUS_FAILED, message)
+        return result(False, STATUS_FAILED, message,
+                      OUTCOME_FAILED_UNSENT, reason_code=reason_code, amount=amount)
+
+    def fail_unknown(message, reason_code):
+        """The mutation went out and we cannot prove what became of it.
+
+        The customer may already have been paid, so this must never be reported
+        as a plain failure and must never be retried automatically.  It lands on
+        Unverified, which no trigger picks up.
+        """
+        message = (
+            f"{message}\n\nPOSSIBLY PAID — the refund request reached Shopify and "
+            f"the outcome could not be confirmed. Do NOT retry. Open order "
+            f"{shopify_order_id} in Shopify: if a refund is there, record it with "
+            f"resolve_unverified_writeback; if not, clear this to retry."
+        )
+        _release_claim(refund_name, STATUS_UNVERIFIED, message)
+        _log(settings, refund_name, shopify_order_id, "Failed", message)
+        frappe.log_error(message, f"Shopify: Refund Outcome Unknown — {refund_name}")
+        return result(False, STATUS_UNVERIFIED, message,
+                      OUTCOME_FAILED_UNKNOWN, reason_code=reason_code, amount=amount)
+
+    # Flipped immediately before the mutation is posted and never reset.  It is
+    # the single fact that separates "nobody was paid" from "somebody might have
+    # been", so it is a plain local rather than anything inferred after the fact.
+    sent = False
 
     # ── Everything past the claim must land in a definite state ──────────────
     try:
@@ -750,14 +898,15 @@ def write_back_refund(refund_name: str, triggered_by: str = "manual") -> dict:
 
         order = (data or {}).get("order")
         if not order:
-            return fail(
+            return fail_unsent(
                 f"Shopify order {shopify_order_id} not found — it may have been "
-                f"deleted, or the token cannot see it. Nothing was refunded."
+                f"deleted, or the token cannot see it. Nothing was refunded.",
+                "shopify_order_not_found",
             )
 
         plan = plan_refund(order.get("transactions"), amount)
         if plan["problem"]:
-            return fail(plan["problem"])
+            return fail_unsent(plan["problem"], "insufficient_refundable")
 
         payload = build_refund_input(
             order_gid,
@@ -767,11 +916,13 @@ def write_back_refund(refund_name: str, triggered_by: str = "manual") -> dict:
             fallback_note=f"Refund {refund_name}",
         )
         if not payload:
-            return fail(
+            return fail_unsent(
                 "Nothing could be allocated to a refundable transaction on "
-                "this order."
+                "this order.",
+                "no_refundable_transactions",
             )
 
+        sent = True
         data = execute(
             settings,
             build_refund_mutation(),
@@ -787,11 +938,12 @@ def write_back_refund(refund_name: str, triggered_by: str = "manual") -> dict:
         refund = mutation_payload.get("refund") or {}
         refund_gid = str(refund.get("id") or "").strip()
         if not refund_gid:
-            # HTTP 200, no errors, no userErrors, no refund.  Failed, never Done.
-            return fail(
-                "Shopify accepted the request but returned no refund — nothing "
-                "was refunded. Treat this as a failure, not a success, and check "
-                "the order in Shopify before retrying."
+            # HTTP 200, no errors, no userErrors, and no refund either.  The
+            # request reached Shopify and it answered without complaining, so
+            # "nothing happened" is an assumption, not a fact.
+            return fail_unknown(
+                "Shopify accepted the request but returned no refund object.",
+                "response_unverifiable",
             )
 
         gateways = _response_gateways(refund) or plan["gateways"]
@@ -820,18 +972,42 @@ def write_back_refund(refund_name: str, triggered_by: str = "manual") -> dict:
         )
         _log(settings, refund_name, shopify_order_id, "Processed", message,
              payload={"refund_request": refund_name, "refund": refund})
-        return result(True, STATUS_DONE, message,
-                      refund_gid=refund_gid, gateway=", ".join(gateways))
+        return result(True, STATUS_DONE, message, OUTCOME_PAID,
+                      refund_gid=refund_gid, gateway=", ".join(gateways),
+                      amount=plan["allocated"])
 
     except ShopifyUserError as exc:
-        return fail(str(exc))
+        # userErrors is unambiguous: the request was well-formed, Shopify read it
+        # and declined it, and nothing was refunded.
+        return fail_unsent(str(exc), "rejected_by_shopify")
+
     except ShopifyAPIError as exc:
-        return fail(str(exc))
+        # Which phase raised decides whether the customer might have been paid.
+        # Before the mutation was posted, nothing can have happened.  After, it
+        # can — execute() retries internally, so a lost response on any attempt
+        # may be hiding a refund that went through.
+        if not sent:
+            return fail_unsent(str(exc), "query_failed")
+        if getattr(exc, "status_code", None) in (401, 403):
+            # Rejected at the auth layer, before the document ran.  This one is
+            # safe to call unsent, and saying so keeps a mis-scoped token from
+            # parking refunds in Unverified where a person has to clear each one.
+            return fail_unsent(str(exc), "not_authorised")
+        return fail_unknown(str(exc), "transport_error_after_send")
+
     except Exception:
         frappe.log_error(
             frappe.get_traceback(), f"Shopify: Refund Write-Back Failed — {refund_name}"
         )
-        return fail("Unexpected error during the write-back; see the Error Log.")
+        if not sent:
+            return fail_unsent(
+                "Unexpected error before the refund was sent; see the Error Log.",
+                "setup_failed",
+            )
+        return fail_unknown(
+            "Unexpected error after the refund was sent; see the Error Log.",
+            "response_unverifiable",
+        )
 
 
 # ── The credit-note loop guard ────────────────────────────────────────────────
@@ -856,6 +1032,102 @@ def refund_request_for_shopify_refund(shopify_refund_id):
     return frappe.db.get_value(
         REFUND_REQUEST, {REFUND_GID_FIELD: ["in", sorted(candidates)]}, "name"
     )
+
+
+# ── Clearing an unconfirmed attempt ───────────────────────────────────────────
+
+@frappe.whitelist()
+def resolve_unverified_writeback(refund_name: str, resolution: str,
+                                 shopify_refund_gid: str = "",
+                                 gateway: str = "", note: str = "") -> dict:
+    """
+    Close out an Unverified write-back, once a person has checked Shopify.
+
+    Unverified means the mutation went out and its fate is unknown, so nothing
+    automatic touches it — and without this it would be a dead end, which is the
+    same silent-trap failure the staleness escape exists to avoid.  The only way
+    out is a person reading the order in Shopify and saying what is there:
+
+        resolution="paid"      a refund exists; supply its GID.  Recorded as
+                               Done, exactly as if we had seen the response.
+        resolution="not_paid"  no refund exists.  Cleared back to blank so the
+                               ordinary path can send it.
+
+    "paid" demands a GID rather than taking somebody's word for it: the GID is
+    what the credit-note loop guard matches on, so a Done row without one would
+    let the refunds/create webhook build a second Credit Note.
+
+    Who resolved it and which way is written into the note, because this is a
+    decision about whether a customer has been paid, made without evidence in
+    hand.
+    """
+    frappe.has_permission(REFUND_REQUEST, "submit", doc=refund_name, throw=True)
+
+    def refuse(message):
+        return {"ok": False, "message": message, "refund_request": refund_name,
+                "contract_version": CONTRACT_VERSION}
+
+    if not _has_writeback_fields():
+        return refuse(_NOT_MIGRATED_REASON)
+
+    resolution = str(resolution or "").strip().lower()
+    if resolution not in ("paid", "not_paid"):
+        return refuse("Resolution must be 'paid' or 'not_paid'.")
+
+    current = frappe.db.get_value(
+        REFUND_REQUEST, refund_name, WRITEBACK_STATUS_FIELD
+    )
+    if current != STATUS_UNVERIFIED:
+        # Deliberately narrow.  This is not a general "fix the status" tool; it
+        # exists for one state, and pointing it at a Done row would overwrite a
+        # real GID with a hand-typed one.
+        return refuse(
+            f"Write-back status is '{current or 'blank'}', not "
+            f"'{STATUS_UNVERIFIED}'. Nothing was changed."
+        )
+
+    who = frappe.session.user
+    detail = f" {note.strip()}" if str(note or "").strip() else ""
+
+    if resolution == "paid":
+        refund_gid = str(shopify_refund_gid or "").strip()
+        if not refund_gid:
+            return refuse(
+                "Recording this as paid needs the Shopify refund id (the GID "
+                "from the order's refund in Shopify). Without it the "
+                "credit-note guard cannot recognise the refund and the "
+                "refunds/create webhook would create a second Credit Note."
+            )
+        _set_state(refund_name, **{
+            REFUND_GID_FIELD: gid("Refund", refund_gid),
+            WRITEBACK_STATUS_FIELD: STATUS_DONE,
+            REFUND_GATEWAY_FIELD: str(gateway or "").strip()[:140],
+            WRITEBACK_AT_FIELD: now_datetime(),
+            WRITEBACK_ERROR_FIELD: (
+                f"Unconfirmed attempt resolved as PAID by {who} after checking "
+                f"the order in Shopify.{detail}"
+            )[:1000],
+        })
+        message = f"Recorded as refunded in Shopify ({gid('Refund', refund_gid)})."
+    else:
+        _set_state(refund_name, **{
+            REFUND_GID_FIELD: "",
+            WRITEBACK_STATUS_FIELD: "",
+            WRITEBACK_ERROR_FIELD: (
+                f"Unconfirmed attempt resolved as NOT PAID by {who} after "
+                f"checking the order in Shopify; cleared for another attempt."
+                f"{detail}"
+            )[:1000],
+        })
+        message = "Cleared. The refund can be sent to Shopify again."
+
+    frappe.db.commit()  # nosemgrep: frappe-manual-commit — a money decision must persist immediately
+    frappe.logger().info(
+        f"Shopify: unverified write-back on {refund_name} resolved as "
+        f"{resolution} by {who}"
+    )
+    return {"ok": True, "message": message, "resolution": resolution,
+            "refund_request": refund_name, "contract_version": CONTRACT_VERSION}
 
 
 # ── Whitelisted endpoints (form button / client status) ───────────────────────
@@ -903,4 +1175,12 @@ def get_refund_writeback_status(refund_name: str) -> dict:
         "amount": eligibility["amount"],
         "can_write_back": eligibility["ok"],
         "reason": eligibility["reason"],
+        # For a caller deciding the money path, not just a form drawing a banner.
+        # `owns_payout` answers the only question that matters before paying:
+        # is this refund Shopify's to pay?  It is true even when can_write_back
+        # is false — Shopify owning a payout it cannot currently perform is
+        # exactly the case where falling back to another route double-pays later.
+        "reason_code": eligibility["reason_code"],
+        "owns_payout": bool(eligibility["shopify_order_id"]),
+        "contract_version": CONTRACT_VERSION,
     }

@@ -12,7 +12,10 @@ success without being one.
 
   * each guard in §6 skips, records a reason, and does not raise
   * userErrors → Failed, error stored, no GID written
-  * HTTP 200 with empty userErrors and no refund object → Failed, never Done
+  * HTTP 200 with empty userErrors and no refund object → never Done, and
+    reported as possibly-paid rather than as a plain failure
+  * the sent/not-sent boundary: everything before the mutation is safe to retry,
+    everything after it may already have paid the customer
   * success writes the GID, Done, and the gateway Shopify actually used
   * a second call on a row that already has a GID sends nothing
   * the credit-note webhook guard returns early for a refund we wrote
@@ -274,45 +277,133 @@ class TestResponseFailures(WritebackTestCase):
         self.assertIn("exceeds the amount available", self.stored(r.WRITEBACK_ERROR_FIELD))
         self.assertNoGid()
 
-    def test_http_200_with_no_user_errors_and_no_refund_is_failed_not_done(self):
+    def test_http_200_with_no_user_errors_and_no_refund_is_never_done(self):
         """The quiet failure this codebase already guards elsewhere: the request
-        was accepted, nothing happened, and nothing said so."""
+        was accepted and nothing said what happened.  It must not be Done — and
+        it must not be a plain failure either, because Shopify answered without
+        complaining and "nothing happened" is an assumption."""
         self.responses = [targets_response(), refund_created(refund=False)]
         result = r.write_back_refund(REFUND)
 
         self.assertFalse(result["ok"])
-        self.assertEqual(result["status"], r.STATUS_FAILED)
-        self.assertEqual(self.stored(r.WRITEBACK_STATUS_FIELD), r.STATUS_FAILED)
+        self.assertNotEqual(result["status"], r.STATUS_DONE)
+        self.assertEqual(result["status"], r.STATUS_UNVERIFIED)
+        self.assertEqual(result["outcome"], r.OUTCOME_FAILED_UNKNOWN)
+        self.assertFalse(result["retry_safe"])
+        self.assertTrue(result["possibly_paid"])
+        self.assertEqual(self.stored(r.WRITEBACK_STATUS_FIELD), r.STATUS_UNVERIFIED)
         self.assertNoGid()
 
-    def test_a_refund_object_with_no_id_is_also_failed(self):
+    def test_a_refund_object_with_no_id_is_also_unverified(self):
         self.responses = [targets_response(), {"refundCreate": {
             "refund": {"id": "", "transactions": {"edges": []}}, "userErrors": [],
         }}]
         result = r.write_back_refund(REFUND)
-        self.assertEqual(result["status"], r.STATUS_FAILED)
+        self.assertEqual(result["outcome"], r.OUTCOME_FAILED_UNKNOWN)
         self.assertNoGid()
 
-    def test_a_missing_mutation_key_is_failed(self):
+    def test_a_missing_mutation_key_is_unverified(self):
+        """check_user_errors raises ShopifyAPIError here, but the mutation was
+        already posted, so the response being unintelligible does not mean the
+        refund did not happen."""
         self.responses = [targets_response(), {}]
         result = r.write_back_refund(REFUND)
-        self.assertEqual(result["status"], r.STATUS_FAILED)
+        self.assertEqual(result["outcome"], r.OUTCOME_FAILED_UNKNOWN)
+        self.assertFalse(result["retry_safe"])
         self.assertNoGid()
 
-    def test_a_transport_error_is_failed_and_recorded(self):
+    def test_a_transport_error_after_the_mutation_is_possibly_paid(self):
+        """execute() retries internally, so a lost response on any attempt may be
+        hiding a refund that went through."""
         self.responses = [targets_response(), ShopifyAPIError("connection reset")]
         result = r.write_back_refund(REFUND)
 
-        self.assertEqual(result["status"], r.STATUS_FAILED)
+        self.assertEqual(result["status"], r.STATUS_UNVERIFIED)
+        self.assertEqual(result["outcome"], r.OUTCOME_FAILED_UNKNOWN)
+        self.assertEqual(result["reason_code"], "transport_error_after_send")
         self.assertIn("connection reset", self.stored(r.WRITEBACK_ERROR_FIELD))
         self.assertNoGid()
+
+    def test_the_unverified_note_tells_the_reader_not_to_retry(self):
+        self.responses = [targets_response(), ShopifyAPIError("connection reset")]
+        r.write_back_refund(REFUND)
+        recorded = self.stored(r.WRITEBACK_ERROR_FIELD).lower()
+
+        self.assertIn("possibly paid", recorded)
+        self.assertIn("not retry", recorded)
+        self.assertIn(ORDER_ID, self.stored(r.WRITEBACK_ERROR_FIELD))
+
+    def test_an_unverified_outcome_is_shouted_into_the_error_log(self):
+        """Nothing chases this state, so it has to be loud where somebody looks."""
+        self.responses = [targets_response(), ShopifyAPIError("connection reset")]
+        r.write_back_refund(REFUND)
+        titles = [title for _, title in frappe_stub.ERRORS]
+        self.assertTrue(
+            any("Outcome Unknown" in title for title in titles), titles
+        )
+
+    def test_an_auth_rejection_is_unsent_not_unverified(self):
+        """Rejected at the auth layer before the document ran.  Calling this
+        unknown would park every refund on a mis-scoped token in Unverified for a
+        person to clear by hand."""
+        self.responses = [targets_response(), ShopifyAPIError("forbidden", 403)]
+        result = r.write_back_refund(REFUND)
+
+        self.assertEqual(result["outcome"], r.OUTCOME_FAILED_UNSENT)
+        self.assertEqual(result["reason_code"], "not_authorised")
+        self.assertTrue(result["retry_safe"])
+        self.assertEqual(self.stored(r.WRITEBACK_STATUS_FIELD), r.STATUS_FAILED)
+
+    def test_user_errors_are_unsent_and_safe_to_retry(self):
+        """userErrors is unambiguous: Shopify read the request and declined it."""
+        self.responses = [
+            targets_response(),
+            refund_created(user_errors=[{"field": None, "message": "Refund too large."}]),
+        ]
+        result = r.write_back_refund(REFUND)
+
+        self.assertEqual(result["outcome"], r.OUTCOME_FAILED_UNSENT)
+        self.assertEqual(result["reason_code"], "rejected_by_shopify")
+        self.assertTrue(result["retry_safe"])
+        self.assertFalse(result["possibly_paid"])
 
     def test_a_failed_query_never_reaches_the_mutation(self):
         self.responses = [ShopifyAPIError("order query failed")]
         result = r.write_back_refund(REFUND)
 
         self.assertEqual(result["status"], r.STATUS_FAILED)
+        self.assertEqual(result["outcome"], r.OUTCOME_FAILED_UNSENT)
+        self.assertEqual(result["reason_code"], "query_failed")
+        self.assertTrue(result["retry_safe"])
         self.assertNothingSent()
+
+    def test_nothing_that_stopped_short_of_the_mutation_is_possibly_paid(self):
+        """The sent/not-sent boundary, swept.  Every one of these gives up before
+        refundCreate is posted, so all of them are safe to retry and none may be
+        reported as possibly paid."""
+        cases = {
+            "query_failed": [ShopifyAPIError("boom")],
+            "shopify_order_not_found": [targets_response(order=False)],
+            "insufficient_refundable": [targets_response([{
+                "id": "gid://shopify/OrderTransaction/99",
+                "kind": "SALE", "status": "SUCCESS", "gateway": "manual",
+                "amountSet": {"presentmentMoney": {"amount": "12999.00"}},
+                "maximumRefundableV2": {"amount": "1.00"},
+            }])],
+        }
+        for reason_code, responses in cases.items():
+            self.seed()
+            self.responses = list(responses)
+            result = r.write_back_refund(REFUND)
+
+            self.assertEqual(result["outcome"], r.OUTCOME_FAILED_UNSENT, reason_code)
+            self.assertEqual(result["reason_code"], reason_code)
+            self.assertTrue(result["retry_safe"], reason_code)
+            self.assertFalse(result["possibly_paid"], reason_code)
+            self.assertNothingSent()
+            self.assertEqual(
+                self.stored(r.WRITEBACK_STATUS_FIELD), r.STATUS_FAILED, reason_code
+            )
 
     def test_a_missing_order_fails_without_sending(self):
         self.responses = [targets_response(order=False)]
@@ -648,6 +739,129 @@ class TestEndpoints(WritebackTestCase):
         info = r.get_refund_writeback_status(REFUND)
         self.assertFalse(info["is_shopify"])
         self.assertFalse(info["migrated"])
+
+
+# ── Unverified: blocked, and not a dead end ───────────────────────────────────
+
+class TestUnverified(WritebackTestCase):
+    """Unverified means the mutation went out and its fate is unknown.  Nothing
+    automatic may touch it, and a person must be able to close it out."""
+
+    def unverify(self):
+        self.set_field(**{
+            r.WRITEBACK_STATUS_FIELD: r.STATUS_UNVERIFIED,
+            r.WRITEBACK_ERROR_FIELD: "POSSIBLY PAID — do not retry.",
+        })
+
+    def test_an_unverified_row_sends_nothing(self):
+        """The whole point: retrying could pay the customer twice."""
+        self.unverify()
+        result = r.write_back_refund(REFUND)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], r.STATUS_UNVERIFIED)
+        self.assertEqual(result["outcome"], r.OUTCOME_FAILED_UNKNOWN)
+        self.assertFalse(result["retry_safe"])
+        self.assertTrue(result["possibly_paid"])
+        self.assertNothingSent()
+
+    def test_an_unverified_row_is_not_downgraded_to_skipped(self):
+        """Skipped reads as "nothing happened", which is exactly what is not
+        known here."""
+        self.unverify()
+        r.write_back_refund(REFUND)
+        self.assertEqual(self.stored(r.WRITEBACK_STATUS_FIELD), r.STATUS_UNVERIFIED)
+
+    def test_the_claim_also_refuses_it(self):
+        """Two callers can both clear eligibility before either writes; the claim
+        is the layer that has to hold."""
+        self.unverify()
+        self.assertFalse(r._claim(REFUND))
+
+    def test_resolving_as_paid_records_the_gid_and_marks_it_done(self):
+        self.unverify()
+        result = r.resolve_unverified_writeback(
+            REFUND, "paid", shopify_refund_gid="1234567890", gateway="manual",
+            note="Found in Shopify admin.",
+        )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(self.stored(r.REFUND_GID_FIELD), REFUND_GID)
+        self.assertEqual(self.stored(r.WRITEBACK_STATUS_FIELD), r.STATUS_DONE)
+        self.assertEqual(self.stored(r.REFUND_GATEWAY_FIELD), "manual")
+
+    def test_a_bare_numeric_id_is_stored_as_a_gid(self):
+        """It has to match what the credit-note guard looks for."""
+        self.unverify()
+        r.resolve_unverified_writeback(REFUND, "paid", shopify_refund_gid="1234567890")
+        self.assertEqual(
+            r.refund_request_for_shopify_refund("1234567890"), REFUND
+        )
+
+    def test_resolving_as_paid_without_a_gid_is_refused(self):
+        """A Done row with no GID would let the refunds/create webhook build a
+        second Credit Note."""
+        self.unverify()
+        result = r.resolve_unverified_writeback(REFUND, "paid")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(self.stored(r.WRITEBACK_STATUS_FIELD), r.STATUS_UNVERIFIED)
+        self.assertFalse(self.stored(r.REFUND_GID_FIELD))
+
+    def test_resolving_as_not_paid_clears_it_for_another_attempt(self):
+        self.unverify()
+        result = r.resolve_unverified_writeback(REFUND, "not_paid")
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(self.stored(r.WRITEBACK_STATUS_FIELD), "")
+        self.assertFalse(self.stored(r.REFUND_GID_FIELD))
+        # And it really is sendable again.
+        self.assertTrue(r.write_back_refund(REFUND)["ok"])
+
+    def test_the_resolution_records_who_decided_and_which_way(self):
+        """A call about whether a customer has been paid, made without the
+        evidence in hand.  It should not be anonymous."""
+        self.unverify()
+        r.resolve_unverified_writeback(REFUND, "not_paid", note="Checked #6518.")
+        recorded = self.stored(r.WRITEBACK_ERROR_FIELD)
+
+        self.assertIn("NOT PAID", recorded)
+        self.assertIn("Administrator", recorded)
+        self.assertIn("Checked #6518.", recorded)
+
+    def test_an_unknown_resolution_is_refused(self):
+        self.unverify()
+        for resolution in ("", None, "maybe", "done"):
+            result = r.resolve_unverified_writeback(REFUND, resolution)
+            self.assertFalse(result["ok"], resolution)
+            self.assertEqual(self.stored(r.WRITEBACK_STATUS_FIELD), r.STATUS_UNVERIFIED)
+
+    def test_it_refuses_any_status_other_than_unverified(self):
+        """Not a general status-fixing tool: pointed at a Done row it would
+        overwrite a real GID with a hand-typed one."""
+        for status in ("", r.STATUS_DONE, r.STATUS_FAILED, r.STATUS_PENDING,
+                       r.STATUS_SKIPPED):
+            self.seed()
+            self.set_field(**{r.WRITEBACK_STATUS_FIELD: status,
+                              r.REFUND_GID_FIELD: "gid://shopify/Refund/original"})
+            result = r.resolve_unverified_writeback(
+                REFUND, "paid", shopify_refund_gid="9999"
+            )
+            self.assertFalse(result["ok"], status)
+            self.assertEqual(
+                self.stored(r.REFUND_GID_FIELD), "gid://shopify/Refund/original", status
+            )
+
+    def test_it_needs_submit_permission(self):
+        self.unverify()
+        real = frappe.has_permission
+        calls = []
+        frappe.has_permission = lambda *a, **k: calls.append(k) or True
+        try:
+            r.resolve_unverified_writeback(REFUND, "not_paid")
+        finally:
+            frappe.has_permission = real
+        self.assertTrue(any(k.get("throw") for k in calls), calls)
 
 
 # ── The credit-note loop ──────────────────────────────────────────────────────

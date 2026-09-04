@@ -32,7 +32,10 @@ function shopify_refund_indicator(frm, info) {
         'Done': 'green',
         'Pending': 'blue',
         'Failed': 'red',
-        'Skipped': 'grey'
+        'Skipped': 'grey',
+        // Not 'red'. Red reads as "it failed, try again", and trying again is
+        // the one thing that must not happen here.
+        'Unverified': 'orange'
     };
 
     if (info.status) {
@@ -54,6 +57,11 @@ function shopify_refund_button(frm, info) {
     // so don't offer a button that cannot work.
     if (info.refund_gid || !info.can_write_back) return;
 
+    // Belt and braces. can_write_back is already false for an unconfirmed
+    // attempt, but this state is the one where a stray retry pays the customer
+    // twice, so it is refused here by name as well as by eligibility.
+    if (info.status === 'Unverified') return;
+
     const label = (info.status === 'Failed')
         ? __('Retry Shopify Refund')
         : __('Refund in Shopify');
@@ -66,6 +74,22 @@ function shopify_refund_button(frm, info) {
 
 function shopify_refund_message(frm, info) {
     const messages = [];
+
+    if (info.status === 'Unverified') {
+        messages.push({
+            text: '<b>' + __('Shopify Refund: outcome unknown') + '</b><br>'
+                  + __('The refund request reached Shopify and the result could not be confirmed, so the customer may already have been paid. Do not retry it. Open the Shopify order, then record what you find.')
+                  + '<br>' + frappe.utils.escape_html(info.error || ''),
+            colour: 'orange'
+        });
+        frm.dashboard.clear_headline();
+        frm.dashboard.set_headline_alert(
+            '<div style="padding-right:40px;display:block;line-height:1.5;">'
+            + messages[0].text + '</div>',
+            'orange'
+        );
+        return;
+    }
 
     if (info.refund_gid) {
         let done = '<b>' + __('Shopify Refund') + ':</b> '
@@ -128,6 +152,20 @@ function shopify_confirm_and_write_back(frm, info) {
                     frappe.show_alert({
                         message: __('Refunded in Shopify'),
                         indicator: 'green'
+                    });
+                } else if (result && result.possibly_paid) {
+                    // "Not sent" would be a lie here, and acting on it — trying
+                    // again — is what pays the customer twice.
+                    frappe.msgprint({
+                        title: __('Refund May Have Been Sent'),
+                        message: '<p><b>'
+                            + __('Do not retry this refund.')
+                            + '</b> '
+                            + __('The request reached Shopify and the outcome could not be confirmed, so the customer may already have been paid. Check the Shopify order and record what you find.')
+                            + '</p><p>'
+                            + frappe.utils.escape_html(result.message || '')
+                            + '</p>',
+                        indicator: 'orange'
                     });
                 } else {
                     frappe.msgprint({
