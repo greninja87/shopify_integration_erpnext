@@ -193,6 +193,33 @@ class TestPlanRefund(unittest.TestCase):
         self.assertIn("0.00", plan["problem"])
         self.assertIn("100.00", plan["problem"])
 
+    def test_each_problem_carries_the_code_the_caller_reports(self):
+        """Three different refusals shared one reason_code, so
+        no_refundable_transactions was documented but unreachable and an order
+        with no refundable rows was reported as merely short of headroom."""
+        no_parents = r.plan_refund([txn(kind="REFUND")], 100.0)
+        self.assertEqual(no_parents["problem_code"], "no_refundable_transactions")
+
+        short = r.plan_refund([txn("t/1", refundable="5000.00")], 12999.0)
+        self.assertEqual(short["problem_code"], "insufficient_refundable")
+
+        nothing = r.plan_refund([txn("t/1")], 0)
+        self.assertEqual(nothing["problem_code"], "nothing_to_refund")
+
+    def test_a_successful_plan_has_no_problem_code(self):
+        plan = r.plan_refund([txn("t/1")], 12999.0)
+        self.assertIsNone(plan["problem"])
+        self.assertEqual(plan["problem_code"], "")
+
+    def test_every_problem_code_is_in_the_published_vocabulary(self):
+        """They are handed straight to the caller as reason_code, so they cannot
+        drift out of the closed set."""
+        published = set().union(*r.REASON_CODES.values())
+        for nodes, amount in (([txn(kind="REFUND")], 100.0),
+                              ([txn("t/1", refundable="1.00")], 12999.0),
+                              ([txn("t/1")], 0)):
+            self.assertIn(r.plan_refund(nodes, amount)["problem_code"], published)
+
     def test_spreads_across_two_parents_when_one_is_too_small(self):
         plan = r.plan_refund([
             txn("t/1", gateway="cashfree", refundable="10000.00"),
@@ -369,8 +396,13 @@ class TestRefundMutation(unittest.TestCase):
         mutation = r.build_refund_mutation("REF-0007:12999.00")
         self.assertIn('@idempotent(key: "REF-0007:12999.00")', mutation)
 
-    def test_the_key_is_derived_from_the_refund_and_its_amount(self):
-        self.assertEqual(r.idempotency_key("REF-0007", 12999.0), "REF-0007:12999.00")
+    def test_no_key_generator_is_offered_while_the_directive_is_off(self):
+        """idempotency_key() was deleted: nothing called it, and a helper that
+        mints a key while no call sends one reads as though retries were already
+        protected.  The key format lives in build_refund_mutation's docstring
+        until the directive is verified against a live response."""
+        self.assertFalse(hasattr(r, "idempotency_key"))
+        self.assertIn("net_refund_amount", r.build_refund_mutation.__doc__)
 
     def test_a_key_with_a_quote_in_it_cannot_break_the_document(self):
         mutation = r.build_refund_mutation('bad"key')

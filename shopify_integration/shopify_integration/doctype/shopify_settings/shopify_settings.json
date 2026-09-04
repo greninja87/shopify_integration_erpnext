@@ -730,7 +730,7 @@
       "fieldname": "section_refund_writeback",
       "fieldtype": "Section Break",
       "label": "Refund Write-Back to Shopify",
-      "description": "Refunds are raised in ERPNext. When a <b>Refund Request</b> reaches <b>Completed</b>, tell Shopify, so the order stops showing the full amount as still refundable and nobody refunds it a second time there.<br><br><b>A successful write-back pays the customer.</b> It is a payment instruction, not a record: on this store the refund is logged against the <code>manual</code> gateway and the Cashfree-OCC app then turns it into a real Cashfree refund, usually within the same minute. Do not read <code>manual</code> as \"no money moved\".<br><br><b>Never let both paths run for one refund.</b> Shopify's refund reaches Cashfree on its own, so a refund that is also sent through the Cashfree API directly pays the customer twice. Leave this off until the <b>payment_portals</b> routing guard is in place, which refuses a Cashfree send for a refund whose Sales Order came from Shopify.<br><br>Requires the <b>payment_portals</b> app, which owns the Refund Request DocType. Shopify is never allowed to block, slow or fail a refund: the write-back is enqueued, and a failure is recorded on the document and in Shopify Log."
+      "description": "Tell Shopify about a refund raised in ERPNext, so the order stops showing the full amount as still refundable and nobody refunds it a second time there.<br><br><b>A successful write-back pays the customer.</b> It is a payment instruction, not a record: on this store the refund is logged against the <code>manual</code> gateway and the Cashfree-OCC app then turns it into a real Cashfree refund, usually within the same minute. Do not read <code>manual</code> as \"no money moved\".<br><br><b>Nothing happens automatically.</b> There is no trigger on the Refund Request — a person presses <b>Refund in Shopify</b> on a submitted, Completed refund, and the call runs then and there rather than in the background, because a payout that returns before it has happened cannot be reported as sent. Enabling this switch does not by itself send anything.<br><br><b>Never let both paths run for one refund.</b> Shopify's refund reaches Cashfree on its own, so a refund also sent through the Cashfree API pays the customer twice. Leave this off until the <b>payment_portals</b> routing guard is in place, which refuses a Cashfree send for a refund whose Sales Order came from Shopify.<br><br>Requires the <b>payment_portals</b> app, which owns the Refund Request DocType. Outcomes are recorded on the document and in Shopify Log; a refund whose result Shopify never confirmed is left <b>Unverified</b> and must not be retried."
     },
     {
       "default": "0",
@@ -846,7 +846,7 @@
   "is_single": 0,
   "issingle": 0,
   "links": [],
-  "modified": "2026-09-04 10:00:00.000000",
+  "modified": "2026-09-04 12:00:00.000000",
   "modified_by": "Administrator",
   "module": "Shopify Integration",
   "name": "Shopify Settings",

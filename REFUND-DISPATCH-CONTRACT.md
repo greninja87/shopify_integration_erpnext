@@ -371,7 +371,12 @@ It covers:
   without complaining and did not say what happened, so "nothing happened" is an
   assumption, not a fact;
 - a response whose `refundCreate` payload is missing or unintelligible;
-- any unexpected exception raised after the mutation was posted.
+- any unexpected exception raised after the mutation was posted;
+- **a worker that never came back at all** — killed mid-request by a container
+  restart, an OOM or an eviction. The document is moved to `Unverified` and
+  committed *before* the mutation is posted, precisely so this case leaves the
+  correct answer behind rather than a retryable one. You will not see a result
+  dict for it; you will find the state on the document.
 
 **What `payment_portals` must do:** treat the refund as *possibly paid*. Do not
 retry. Do not fall back to Cashfree — that is the double-payout. Map it to
@@ -563,6 +568,37 @@ So the other side can rely on it rather than defend against it:
    still needs the user's hands. Do not enable the toggle to run it.
 
 ## 10. Changes on this side that this document reflects
+
+### Post-review fixes (2026-09-04), no version bump
+
+A code review of the whole feature found one defect that mattered to this
+contract and several that did not reach it.
+
+**The one that did:** `Unverified` was only ever reached from a *caught*
+exception, so a worker killed during `refundCreate` left the row at `Pending` —
+indistinguishable from one that never posted. After the 30-minute stale-claim
+window the refund was re-sent, and since a partial refund leaves the order
+enough headroom to take another, Shopify paid the customer twice. The
+`sent` flag that classified the failure was a local variable and died with the
+worker. Fixed by committing `Unverified` **before** posting the mutation: the
+risky state is now entered before the risk, a clean rejection (`userErrors`,
+401/403) moves the row back to `Failed`, and a worker that never returns leaves
+the answer a person has to resolve rather than one a retry will act on.
+
+**`no_refundable_transactions` was unreachable**, and an order whose every
+transaction is a refund, a void or fully refunded was reported as
+`insufficient_refundable`. Both codes now mean what §6 always said they meant —
+this makes the code match the published contract rather than changing it, which
+is why the version is unchanged.
+
+Also, and not caller-visible: the possibly-paid warning now leads its message
+instead of trailing it, because the field it is stored in keeps only the first
+1000 characters and a verbose GraphQL error could push the words "do NOT retry"
+off the end; `resolve_unverified_writeback` and `writeback_now` now check
+availability before permission, as `write_back_refund` already did; and the
+Shopify Settings description no longer tells an admin the write-back is enqueued
+and fires when a Refund Request reaches Completed, neither of which has been true
+since the dispatcher was deferred.
 
 ### Version 3 — authorisation belongs to the caller (2026-09-04)
 

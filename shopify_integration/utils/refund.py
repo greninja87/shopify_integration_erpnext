@@ -173,8 +173,10 @@ REASON_CODES = {
         "no_api_credentials",
         "not_installed",
         "refund_request_missing",
-        # Reserved for execute_refund_payout's optional expected_amount
-        # cross-check, which is not built yet — see the contract's §9.
+        # Reserved for the optional expected_amount cross-check on
+        # write_back_refund, which is not built yet — see the contract's §9.2,
+        # including the expected_amount_checked acknowledgement it cannot ship
+        # without.
         "amount_mismatch",
     }),
     OUTCOME_FAILED_UNSENT: frozenset({
@@ -343,7 +345,14 @@ def plan_refund(nodes, amount) -> dict:
 
     :return: {"transactions": [{"parentId", "kind", "gateway", "amount"}],
               "gateways": [gateway names actually allocated, in order],
-              "allocated": float, "problem": str | None}
+              "allocated": float, "problem": str | None,
+              "problem_code": str}
+
+    `problem_code` is a reason_code from the published vocabulary, because the
+    caller hands it straight to payment_portals.  It exists because three
+    different refusals used to share one slug: an order with no refundable rows
+    at all was reported as merely short of headroom, and the documented
+    `no_refundable_transactions` was unreachable.
 
     `gateways` carries only the gateways that were actually allocated against —
     a parent left untouched contributes nothing, however large its headroom.
@@ -358,9 +367,9 @@ def plan_refund(nodes, amount) -> dict:
     looks settled and is not.  The message names both figures, since the only
     useful next question is "short by how much".
     """
-    def empty(problem):
-        return {"transactions": [], "gateways": [],
-                "allocated": 0.0, "problem": problem}
+    def empty(problem, problem_code):
+        return {"transactions": [], "gateways": [], "allocated": 0.0,
+                "problem": problem, "problem_code": problem_code}
 
     wanted = _paise(amount)
     parents = refundable_parents(nodes)
@@ -369,14 +378,24 @@ def plan_refund(nodes, amount) -> dict:
     if wanted <= 0:
         return empty(
             f"The refund amount is {_money(wanted)} — there is nothing to record "
-            f"in Shopify."
+            f"in Shopify.",
+            "nothing_to_refund",
+        )
+
+    if not parents:
+        return empty(
+            f"No transaction on this order can take a refund — every row is a "
+            f"refund, a void, unsuccessful, or already fully refunded. The "
+            f"refund is {_money(wanted)}.",
+            "no_refundable_transactions",
         )
 
     if available < wanted:
         return empty(
             f"Shopify shows only {_money(available)} still refundable on this "
             f"order, but the refund is {_money(wanted)}. Nothing was sent — a "
-            f"partial refund in Shopify would look settled when it is not."
+            f"partial refund in Shopify would look settled when it is not.",
+            "insufficient_refundable",
         )
 
     transactions = []
@@ -406,6 +425,7 @@ def plan_refund(nodes, amount) -> dict:
         "gateways": gateways,
         "allocated": flt(_money(wanted - remaining)),
         "problem": None,
+        "problem_code": "",
     }
 
 
@@ -442,11 +462,6 @@ def build_refund_input(order_gid, plan, note, notify=False, fallback_note="") ->
     return {"input": payload}
 
 
-def idempotency_key(refund_name: str, amount) -> str:
-    """A key that changes when the refund changes, so a retry cannot double up."""
-    return f"{refund_name}:{_money(_paise(amount))}"
-
-
 def build_refund_mutation(key: str = "") -> str:
     """
     The refundCreate document, with the @idempotent directive only when asked.
@@ -457,6 +472,12 @@ def build_refund_mutation(key: str = "") -> str:
     write-back rather than degrade.  It is therefore off unless a caller passes
     a key, and the stored-GID guard plus the worker claim carry idempotency on
     their own.  Turn it on once a live response has confirmed it.
+
+    No key is generated anywhere yet, deliberately — a helper that minted one
+    while nothing sent it would read as though retries were already protected.
+    When this is switched on, the key should be the Refund Request name and the
+    amount in minor units (name plus net_refund_amount to two places), so it
+    changes whenever the refund does.
 
     Quotes are stripped from the key rather than escaped: a key is ours to
     generate, so a quote in one is a bug, and silently breaking out of the
@@ -561,6 +582,30 @@ def _claim(refund_name: str) -> bool:
     return True
 
 
+def _unverified_warning(shopify_order_id, detail: str = "") -> str:
+    """
+    The text for a refund whose fate is unknown, warning first.
+
+    Deliberately front-loaded: _release_claim keeps only the first 1000
+    characters, and appending the warning after a verbose Shopify error — the
+    GraphQL error path alone can carry 500 — pushed it off the end of the one
+    field a person reads to learn this refund may already have been paid.  The
+    natural response to a truncated error message is to retry.
+
+    It also has to stand on its own, because the copy written before the mutation
+    is posted is all there is if the worker never comes back to append anything.
+    """
+    warning = (
+        f"POSSIBLY PAID — do NOT retry. This refund request reached Shopify and "
+        f"its outcome is not confirmed, so the customer may already have been "
+        f"paid. Open order {shopify_order_id} in Shopify: if a refund is there, "
+        f"record it with resolve_unverified_writeback; if not, clear it there to "
+        f"allow another attempt."
+    )
+    detail = str(detail or "").strip()
+    return f"{warning}\n\n{detail}" if detail else warning
+
+
 def _release_claim(refund_name: str, status: str, error: str = ""):
     _set_state(refund_name, **{
         WRITEBACK_STATUS_FIELD: status,
@@ -631,7 +676,7 @@ def _ownership(eligibility: dict) -> dict:
     }
 
 
-def check_eligibility(refund_name: str, settings=None) -> dict:
+def check_eligibility(refund_name: str) -> dict:
     """
     Can this Refund Request be written back to Shopify right now?
 
@@ -764,8 +809,12 @@ def check_eligibility(refund_name: str, settings=None) -> dict:
         )
         return out
 
+    # Resolved from the refund's own Sales Order and from nothing else.  This
+    # took a `settings` override until write_back_refund stopped accepting one;
+    # leaving it here would have kept the single route by which a caller could
+    # aim eligibility at an unrelated store's credentials.
     shop_domain = out["shopify_store"]
-    settings = settings or _settings_for_store(shop_domain)
+    settings = _settings_for_store(shop_domain)
     if not settings:
         out["reason_code"] = "writeback_unavailable_for_store"
         out["reason"] = (
@@ -944,12 +993,7 @@ def write_back_refund(refund_name: str, triggered_by: str = "manual") -> dict:
         as a plain failure and must never be retried automatically.  It lands on
         Unverified, which no trigger picks up.
         """
-        message = (
-            f"{message}\n\nPOSSIBLY PAID — the refund request reached Shopify and "
-            f"the outcome could not be confirmed. Do NOT retry. Open order "
-            f"{shopify_order_id} in Shopify: if a refund is there, record it with "
-            f"resolve_unverified_writeback; if not, clear this to retry."
-        )
+        message = _unverified_warning(shopify_order_id, message)
         _release_claim(refund_name, STATUS_UNVERIFIED, message)
         _log(settings, refund_name, shopify_order_id, "Failed", message)
         frappe.log_error(message, f"Shopify: Refund Outcome Unknown — {refund_name}")
@@ -982,7 +1026,15 @@ def write_back_refund(refund_name: str, triggered_by: str = "manual") -> dict:
 
         plan = plan_refund(order.get("transactions"), amount)
         if plan["problem"]:
-            return fail_unsent(plan["problem"], "insufficient_refundable")
+            # check_eligibility has already refused amount <= 0, so only the two
+            # headroom codes can reach here and both belong to failed_unsent.
+            # Pinned rather than assumed: a code from the wrong outcome would
+            # tell payment_portals to branch on something this outcome never
+            # carries.
+            problem_code = plan["problem_code"]
+            if problem_code not in REASON_CODES[OUTCOME_FAILED_UNSENT]:
+                problem_code = "insufficient_refundable"
+            return fail_unsent(plan["problem"], problem_code)
 
         payload = build_refund_input(
             order_gid,
@@ -997,6 +1049,25 @@ def write_back_refund(refund_name: str, triggered_by: str = "manual") -> dict:
                 "this order.",
                 "no_refundable_transactions",
             )
+
+        # ── The durable marker, committed BEFORE the post ────────────────────
+        # `sent` below is a local and dies with the worker.  A process killed
+        # during execute() — a container restart, an OOM, an eviction — would
+        # otherwise leave this row at Pending, which is indistinguishable from
+        # one that never posted: the staleness escape would hand it to the next
+        # caller and Shopify would refund the customer a second time, because a
+        # partial refund leaves the order enough headroom to take another.
+        #
+        # Unverified already means "sent, fate unknown", which is exactly true
+        # from this instant onward, and both check_eligibility and _claim
+        # already refuse it.  So the risky state is entered before the risk
+        # rather than after it, and a worker that never returns leaves behind
+        # the correct answer instead of a retryable one.
+        _set_state(refund_name, **{
+            WRITEBACK_STATUS_FIELD: STATUS_UNVERIFIED,
+            WRITEBACK_ERROR_FIELD: _unverified_warning(shopify_order_id)[:1000],
+        })
+        frappe.db.commit()  # nosemgrep: frappe-manual-commit — must survive a worker that never returns
 
         sent = True
         data = execute(
@@ -1137,14 +1208,19 @@ def resolve_unverified_writeback(refund_name: str, resolution: str,
     decision about whether a customer has been paid, made without evidence in
     hand.
     """
-    frappe.has_permission(REFUND_REQUEST, "submit", doc=refund_name, throw=True)
-
     def refuse(message):
         return {"ok": False, "message": message, "refund_request": refund_name,
                 "contract_version": CONTRACT_VERSION}
 
+    # Availability before permission, for the reason write_back_refund has the
+    # same ordering: on a site without payment_portals, frappe.has_permission has
+    # no DocType to resolve and raises, so "you lack permission" would be the
+    # wrong diagnosis for "this app is inert here" — and the refusal below could
+    # never be reached to say otherwise.
     if not _has_writeback_fields():
         return refuse(_NOT_MIGRATED_REASON)
+
+    frappe.has_permission(REFUND_REQUEST, "submit", doc=refund_name, throw=True)
 
     resolution = str(resolution or "").strip().lower()
     if resolution not in ("paid", "not_paid"):
@@ -1216,8 +1292,16 @@ def writeback_now(refund_name: str) -> dict:
     Runs inline rather than enqueued so the user gets the real outcome back
     instead of an optimistic "queued"; one refund is two GraphQL calls, well
     inside a web request.  Requires submit permission on the document, because
-    this moves money.
+    this moves money — this is the HTTP door, and the only entry point that
+    checks; write_back_refund itself defers authorisation to its caller.
     """
+    # Availability before permission: has_permission on a DocType this site does
+    # not have raises, and "you lack permission" is the wrong diagnosis for "this
+    # app is inert here".  write_back_refund returns the proper refusal, and it
+    # touches nothing on the way to it.
+    if not _has_writeback_fields():
+        return write_back_refund(refund_name, triggered_by="manual")
+
     frappe.has_permission(REFUND_REQUEST, "submit", doc=refund_name, throw=True)
     return write_back_refund(refund_name, triggered_by="manual")
 

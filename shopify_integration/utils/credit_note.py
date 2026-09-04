@@ -7,7 +7,7 @@ Entry points:
       Background job enqueued by api.py when a refunds/create webhook arrives
       and credit_note_creation == "Auto".  Updates the Shopify Log on completion.
 
-  create_credit_note_from_shopify_refund(refund_data, settings) -> str
+  create_credit_note_from_shopify_refund(refund_data, settings) -> str | None
       Core logic: finds the original Sales Invoice, checks idempotency, builds
       the return document, applies naming series / cost center, and inserts /
       submits it.
@@ -67,7 +67,7 @@ def _create_credit_note_background(refund_data: dict, store_name: str, log_name:
 
 # ── Core credit note creation ──────────────────────────────────────────────────
 
-def create_credit_note_from_shopify_refund(refund_data: dict, settings) -> str:
+def create_credit_note_from_shopify_refund(refund_data: dict, settings) -> str | None:
     """
     Create a Credit Note (return Sales Invoice) from a Shopify refund payload.
 

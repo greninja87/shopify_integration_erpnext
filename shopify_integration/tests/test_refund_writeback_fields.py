@@ -176,5 +176,56 @@ class TestRefundWritebackFields(unittest.TestCase):
         self.assertEqual(created_fields(doctype_exists=False), [])
 
 
+# ── The Shopify Settings section this feature adds ────────────────────────────
+
+class TestRefundWritebackSettings(unittest.TestCase):
+    """Guards on the doctype JSON this app owns.  The description is read by an
+    admin on the form where they enable a payout, so it being wrong is not a
+    cosmetic problem."""
+
+    @staticmethod
+    def field(fieldname):
+        import json
+        from pathlib import Path
+
+        path = (
+            Path(__file__).resolve().parents[1]
+            / "shopify_integration" / "doctype" / "shopify_settings"
+            / "shopify_settings.json"
+        )
+        for f in json.loads(path.read_text(encoding="utf-8"))["fields"]:
+            if f.get("fieldname") == fieldname:
+                return f
+        raise AssertionError(f"{fieldname} is missing from Shopify Settings")
+
+    def test_the_toggle_ships_off(self):
+        """A write from any site hits the live storefront and moves real money."""
+        self.assertEqual(self.field("enable_refund_writeback").get("default"), "0")
+
+    def test_the_customer_email_ships_off(self):
+        self.assertEqual(self.field("notify_customer_on_refund").get("default"), "0")
+
+    def test_the_description_does_not_promise_automation(self):
+        """It said the write-back fires "when a Refund Request reaches Completed"
+        and is "enqueued".  Neither is true — there is no doc_events hook and the
+        call is synchronous — so an admin was told refunds would flow on their own
+        when nothing would send one."""
+        description = self.field("section_refund_writeback")["description"].lower()
+        for claim in ("is enqueued", "enqueued and", "automatically once",
+                      "will be sent automatically"):
+            self.assertNotIn(claim, description)
+        self.assertIn("nothing happens automatically", description)
+
+    def test_the_description_says_a_person_has_to_press_the_button(self):
+        description = self.field("section_refund_writeback")["description"].lower()
+        self.assertIn("refund in shopify", description)
+        self.assertIn("pays the customer", description)
+
+    def test_the_description_warns_about_the_double_payout(self):
+        description = self.field("section_refund_writeback")["description"].lower()
+        self.assertIn("twice", description)
+        self.assertIn("payment_portals", description)
+
+
 if __name__ == "__main__":
     unittest.main()

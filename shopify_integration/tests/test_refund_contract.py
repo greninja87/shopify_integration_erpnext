@@ -222,6 +222,33 @@ class TestOutcomeVocabulary(WritebackTestCase):
             self.assertEqual(result["reason_code"], expected_code)
             self.assertEqual(result["outcome"], r.OUTCOME_FAILED_UNSENT)
 
+    def test_no_refundable_transactions_is_actually_emitted(self):
+        """It was documented as live and was dead code: build_refund_input only
+        returns None when plan_refund already set a problem, which had returned
+        one branch earlier."""
+        self.responses = [targets_response([{
+            "id": "gid://shopify/OrderTransaction/99",
+            "kind": "REFUND", "status": "SUCCESS", "gateway": "manual",
+            "amountSet": {"presentmentMoney": {"amount": "12999.00"}},
+            "maximumRefundableV2": {"amount": "12999.00"},
+        }])]
+        result = r.write_back_refund(REFUND)
+
+        self.assertEqual(result["reason_code"], "no_refundable_transactions")
+        self.assertEqual(result["outcome"], r.OUTCOME_FAILED_UNSENT)
+        self.assertNothingSent()
+        self.assertContractual(result, "no_refundable_transactions")
+
+    def test_a_short_order_is_still_insufficient_refundable(self):
+        self.responses = [targets_response([{
+            "id": "gid://shopify/OrderTransaction/99",
+            "kind": "SALE", "status": "SUCCESS", "gateway": "manual",
+            "amountSet": {"presentmentMoney": {"amount": "12999.00"}},
+            "maximumRefundableV2": {"amount": "5000.00"},
+        }])]
+        result = r.write_back_refund(REFUND)
+        self.assertEqual(result["reason_code"], "insufficient_refundable")
+
     def test_every_unknown_failure(self):
         cases = {
             "transport_error_after_send": [

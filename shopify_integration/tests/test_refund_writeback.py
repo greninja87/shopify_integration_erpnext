@@ -773,11 +773,176 @@ class TestEndpoints(WritebackTestCase):
         self.assertFalse(info["can_write_back"])
         self.assertTrue(info["reason"])
 
+    def test_writeback_now_reports_an_unmigrated_site_rather_than_raising(self):
+        frappe_stub.META_FIELDS[r.REFUND_REQUEST] = set()
+        real = frappe.has_permission
+        frappe.has_permission = lambda *a, **k: (_ for _ in ()).throw(
+            Exception("DocType Refund Request not found")
+        )
+        try:
+            result = r.writeback_now(REFUND)
+        finally:
+            frappe.has_permission = real
+
+        self.assertIn("migrate", result["message"].lower())
+        self.assertNothingSent()
+
     def test_the_status_endpoint_survives_an_unmigrated_site(self):
         frappe_stub.META_FIELDS[r.REFUND_REQUEST] = set()
         info = r.get_refund_writeback_status(REFUND)
         self.assertFalse(info["is_shopify"])
         self.assertFalse(info["migrated"])
+
+
+# ── The durable "we posted it" marker ─────────────────────────────────────────
+
+class TestSentMarker(WritebackTestCase):
+    """The `sent` flag is a local, so it cannot survive the worker.  A refund
+    posted by a process that is then killed must not look like one that was
+    never posted, because the stale-claim escape would re-send it — and on a
+    partial refund the order still has headroom, so Shopify would pay twice.
+    """
+
+    def test_the_document_says_unverified_before_the_mutation_is_posted(self):
+        """Written and committed BEFORE the risk, not after it.  Anything after
+        the post cannot run if the process dies during it."""
+        seen = {}
+        real_execute = r.execute
+
+        def watching_execute(settings, query, variables=None, operation=""):
+            if operation == "refundCreate":
+                seen["status"] = frappe_stub.get_doc_values(
+                    r.REFUND_REQUEST, REFUND
+                ).get(r.WRITEBACK_STATUS_FIELD)
+                seen["commits"] = len(frappe_stub.COMMITS)
+            return real_execute(settings, query, variables, operation)
+
+        r.execute = watching_execute
+        result = r.write_back_refund(REFUND)
+
+        self.assertEqual(seen.get("status"), r.STATUS_UNVERIFIED)
+        self.assertGreater(seen.get("commits", 0), 0, "the marker must be committed")
+        # And the happy path still finishes as Done.
+        self.assertEqual(result["status"], r.STATUS_DONE)
+        self.assertEqual(self.stored(r.WRITEBACK_STATUS_FIELD), r.STATUS_DONE)
+
+    def test_a_worker_killed_mid_mutation_leaves_it_unverified(self):
+        """SystemExit models a hard kill: it is a BaseException, so none of the
+        except clauses unwind it.  A real SIGKILL would not even unwind — which
+        is the point of writing the marker first."""
+        self.responses = [targets_response()]
+
+        real_execute = r.execute
+
+        def killed(settings, query, variables=None, operation=""):
+            if operation == "refundCreate":
+                raise SystemExit("worker killed")
+            return real_execute(settings, query, variables, operation)
+
+        r.execute = killed
+        with self.assertRaises(SystemExit):
+            r.write_back_refund(REFUND)
+
+        self.assertEqual(self.stored(r.WRITEBACK_STATUS_FIELD), r.STATUS_UNVERIFIED)
+        self.assertNoGid()
+
+    def test_a_stale_claim_on_a_killed_attempt_is_not_re_sent(self):
+        """The finding, as a test.  Before the marker this re-sent the refund
+        30 minutes later and paid the customer twice."""
+        self.responses = [targets_response()]
+        real_execute = r.execute
+
+        def killed(settings, query, variables=None, operation=""):
+            if operation == "refundCreate":
+                raise SystemExit("worker killed")
+            return real_execute(settings, query, variables, operation)
+
+        r.execute = killed
+        with self.assertRaises(SystemExit):
+            r.write_back_refund(REFUND)
+        r.execute = real_execute
+
+        # Age the row well past the staleness window, as a later caller would
+        # find it, and give the order the headroom a partial refund leaves.
+        self.set_field(**{
+            r.WRITEBACK_AT_FIELD: frappe.utils.add_to_date(
+                frappe.utils.now_datetime(), minutes=-(r.STALE_CLAIM_MINUTES * 4)
+            ),
+        })
+        self.calls = []
+        self.responses = [targets_response(), refund_created()]
+        again = r.write_back_refund(REFUND)
+
+        self.assertNothingSent()
+        self.assertEqual(again["outcome"], r.OUTCOME_FAILED_UNKNOWN)
+        self.assertTrue(again["possibly_paid"])
+        self.assertFalse(again["retry_safe"])
+        self.assertFalse(r._claim(REFUND), "a killed attempt must not be re-claimable")
+
+    def test_the_marker_alone_already_warns_against_retrying(self):
+        """Nothing appends the fuller message when the process dies, so the text
+        written before the post has to stand on its own."""
+        self.responses = [targets_response()]
+        real_execute = r.execute
+
+        def killed(settings, query, variables=None, operation=""):
+            if operation == "refundCreate":
+                raise SystemExit("worker killed")
+            return real_execute(settings, query, variables, operation)
+
+        r.execute = killed
+        with self.assertRaises(SystemExit):
+            r.write_back_refund(REFUND)
+
+        recorded = self.stored(r.WRITEBACK_ERROR_FIELD).lower()
+        self.assertIn("not retry", recorded)
+        self.assertIn("possibly paid", recorded)
+
+    def test_a_clean_rejection_after_the_marker_goes_back_to_failed(self):
+        """userErrors and a 401/403 are decided by Shopify, so the marker must
+        not leave them parked in Unverified for a person to clear by hand."""
+        for responses, code in (
+            ([targets_response(),
+              refund_created(user_errors=[{"field": None, "message": "too large"}])],
+             "rejected_by_shopify"),
+            ([targets_response(), ShopifyAPIError("forbidden", 403)], "not_authorised"),
+        ):
+            self.seed()
+            self.responses = list(responses)
+            result = r.write_back_refund(REFUND)
+
+            self.assertEqual(result["reason_code"], code)
+            self.assertEqual(result["outcome"], r.OUTCOME_FAILED_UNSENT, code)
+            self.assertEqual(
+                self.stored(r.WRITEBACK_STATUS_FIELD), r.STATUS_FAILED, code
+            )
+            self.assertTrue(result["retry_safe"], code)
+
+    def test_a_failure_before_the_post_never_reaches_unverified(self):
+        for responses in ([ShopifyAPIError("boom")], [targets_response(order=False)]):
+            self.seed()
+            self.responses = list(responses)
+            r.write_back_refund(REFUND)
+            self.assertEqual(self.stored(r.WRITEBACK_STATUS_FIELD), r.STATUS_FAILED)
+
+
+# ── The warning must survive truncation ───────────────────────────────────────
+
+class TestUnverifiedMessage(WritebackTestCase):
+    def test_a_huge_upstream_error_cannot_push_the_warning_out_of_the_field(self):
+        """_release_claim stores only the first 1000 characters, so the warning
+        goes first — appended, a verbose GraphQL error pushed it off the end of
+        the one field a person reads to learn not to retry."""
+        self.responses = [
+            targets_response(),
+            ShopifyAPIError("refundCreate returned GraphQL errors: " + "x" * 4000),
+        ]
+        r.write_back_refund(REFUND)
+
+        recorded = self.stored(r.WRITEBACK_ERROR_FIELD)
+        self.assertLessEqual(len(recorded), 1000)
+        self.assertIn("POSSIBLY PAID", recorded)
+        self.assertIn("not retry", recorded.lower())
 
 
 # ── Unverified: blocked, and not a dead end ───────────────────────────────────
@@ -890,6 +1055,23 @@ class TestUnverified(WritebackTestCase):
             self.assertEqual(
                 self.stored(r.REFUND_GID_FIELD), "gid://shopify/Refund/original", status
             )
+
+    def test_it_reports_an_unmigrated_site_rather_than_raising(self):
+        """Availability before permission: frappe.has_permission on a DocType
+        that does not exist raises, and "you lack permission" is the wrong
+        diagnosis for "this app is inert here"."""
+        frappe_stub.META_FIELDS[r.REFUND_REQUEST] = set()
+        real = frappe.has_permission
+        frappe.has_permission = lambda *a, **k: (_ for _ in ()).throw(
+            Exception("DocType Refund Request not found")
+        )
+        try:
+            result = r.resolve_unverified_writeback(REFUND, "not_paid")
+        finally:
+            frappe.has_permission = real
+
+        self.assertFalse(result["ok"])
+        self.assertIn("migrate", result["message"].lower())
 
     def test_it_needs_submit_permission(self):
         self.unverify()
