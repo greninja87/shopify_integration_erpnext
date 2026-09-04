@@ -1,0 +1,418 @@
+# Refund dispatch contract — `payment_portals` → `shopify_integration`
+
+**Version 1.** Written 2026-09-04 by the `shopify_integration` side, at the
+request of the `payment_portals` session, as the interface to build against.
+
+`shopify_integration.utils.refund.CONTRACT_VERSION` is the machine-readable
+version and every result dict carries it as `contract_version`. Bumping it is a
+breaking change; new optional keys are not.
+
+---
+
+## 0. What this is, and the one fact that shapes all of it
+
+`payment_portals` raises refunds. For a refund whose Sales Order came from
+Shopify, the payout must go through Shopify's `refundCreate`, because the
+Cashfree-OCC app bridges that into a real Cashfree refund. **A successful
+`refundCreate` pays the customer.** It is a payment instruction, not a record of
+one.
+
+Everything awkward in this document follows from that. In particular there is a
+failure mode that is neither success nor failure — *sent, outcome unknown* — and
+it is the case this contract exists to make un-ignorable.
+
+### Current state, so nothing is assumed
+
+- `payment_portals` `1ed0e8b` added the §2a routing gate. It **refuses** a
+  Payment Portal refund whose Sales Order carries a `shopify_order_id`. It does
+  not delegate.
+- No dispatcher exists on either side. Today the only callers of
+  `write_back_refund` are the whitelisted endpoint and the Refund Request form
+  button.
+- `enable_refund_writeback` is **off** on every store and must stay off until
+  both this handshake and the credit-note guard are in place.
+
+This document describes what `shopify_integration` will accept **when** a
+dispatcher is built. Nothing here is wired up yet.
+
+---
+
+## 1. Coupling rules, both directions
+
+- `shopify_integration` **never** imports `payment_portals`. It reads Refund
+  Request through `frappe.db` by doctype name and is inert when the doctype is
+  absent.
+- `payment_portals` **must not** import `shopify_integration` either. It must
+  stay installable and fully functional on a site with no Shopify app. So the
+  call goes through Frappe's hook fan-out, never a direct import.
+- The coupling is therefore exactly two things: **a hook name** and **the
+  signature and result shape below**. Nothing else.
+
+---
+
+## 2. The hook
+
+`payment_portals` `docs/design/SHOPIFY-REFUND-WRITEBACK.md` already sketches
+this: one dispatcher hook, resolved at the payout step, refusing rather than
+falling back when nothing is registered. That shape is accepted as-is, and this
+section just pins the names.
+
+**It needs no new code on this side.** The dispatcher points straight at
+`write_back_refund`, which is already whitelisted and already returns everything
+in §4.
+
+### On the `shopify_integration` side (added once you confirm the hook name)
+
+```python
+# hooks.py
+refund_payout_dispatchers = ["shopify_integration.utils.refund.write_back_refund"]
+```
+
+### On the `payment_portals` side
+
+```python
+dispatchers = frappe.get_hooks("refund_payout_dispatchers")
+if not dispatchers:
+    refuse("No refund dispatcher is registered for a Shopify-backed order.")
+
+# Exactly one is expected. More than one is a misconfiguration, not something
+# to resolve by picking: two dispatchers for one payout is two payouts.
+if len(dispatchers) > 1:
+    refuse(f"{len(dispatchers)} refund dispatchers registered; expected one.")
+
+result = frappe.call(dispatchers[0], refund_name=doc.name)
+```
+
+The keyword is **`refund_name`**, matching the signature your own §5 specifies.
+
+### Signature
+
+```python
+def write_back_refund(refund_name: str, triggered_by: str = "manual") -> dict
+```
+
+`triggered_by` is a free-text label that reaches the log line only; pass
+something like `"payment_portals_payout"` so a log reader can tell a dispatched
+payout from a button press. It never changes behaviour.
+
+### What to pass, and what not to
+
+**The Refund Request name, and nothing else.** Everything else is read here from
+the single source of truth:
+
+| needed | read from |
+|---|---|
+| amount | `Refund Request.net_refund_amount` |
+| reason | `Refund Request.reason_note` |
+| channel / status / docstatus | `Refund Request` |
+| Shopify order id, store | `Refund Request.sales_order` → `Sales Order.shopify_order_id` / `shopify_store` |
+
+Do not pass the amount as the authoritative figure. If the caller passed one and
+it disagreed with `net_refund_amount`, there would be no defensible answer to
+"which one do we pay", and picking either is how the wrong number leaves the
+building. If you want a cross-check rather than a source, see §9.
+
+### No idempotency token
+
+Deliberately absent. **The document is the idempotency key.** Once Shopify
+accepts a refund, `shopify_refund_gid` is written and committed, and every entry
+point treats it as a hard stop. Calling `write_back_refund` twice for the same
+Refund Request cannot produce two refunds; the second returns
+`refused` / `already_paid` with the original GID. A caller-supplied token would
+add a second, weaker key for the same guarantee.
+
+---
+
+## 3. Optional pre-flight, for the UI
+
+There is already a read-only, whitelisted, side-effect-free call that answers
+"what will happen if I dispatch this?":
+
+```python
+frappe.call("shopify_integration.utils.refund.get_refund_writeback_status",
+            refund_name=name)
+```
+
+It returns `owns_payout`, `can_write_back`, `reason`, `reason_code`, `amount`,
+`status`, `refund_gid`, `gateway`, `shopify_order_id`, `error`. Use it to tell a
+person, on the form and before they commit, which route their refund will take —
+your own design doc asks for exactly that. It sends nothing to Shopify and is
+safe to call on every form refresh.
+
+It is **not** a substitute for reading the dispatch result. Between a pre-flight
+and a payout, anything can change; only the result dict says what happened.
+
+### The one distinction that decides the money path
+
+Whether from the pre-flight or from a `refused` result, exactly one
+`reason_code` means *"not mine — you pay it"*:
+
+- **`not_a_shopify_order`** → no Sales Order, or no `shopify_order_id` on it.
+  Shopify has no claim. Pay via Cashfree as today. (`owns_payout` is false.)
+
+**Every other `refused` code means "mine, and I cannot do it right now."** The
+toggle is off, credentials are missing, the store is unconfigured, the document
+is in the wrong state. Shopify owns the payout and cannot perform it. **Refuse
+both paths and surface the reason.** Falling back to Cashfree there is a
+double-payout waiting for whoever fixes the toggle and retries.
+
+`owns_payout: true, can_write_back: false` is that case, expressed as two
+booleans so the gate does not have to reason about the code list.
+
+## 4. The result dict
+
+What `write_back_refund` returns, on every path. Extra keys may be added within
+version 1; none will be removed or change meaning.
+
+```python
+{
+  "provider":         "shopify",       # which app answered
+  "contract_version": 1,
+
+  "outcome":     "paid" | "refused" | "failed_unsent" | "failed_unknown" | "in_progress",
+  "reason_code": "<stable slug, see §6>",
+  "retry_safe":     bool,   # true for exactly one outcome: failed_unsent
+  "possibly_paid":  bool,   # true for paid AND failed_unknown
+
+  "message":     "<human sentence, safe to show a user>",
+  "amount":      12999.0,   # net_refund_amount as understood here
+  "refund_gid":  "gid://shopify/Refund/123",   # set only when outcome == "paid"
+  "gateway":     "manual",  # what Shopify attached the refund to
+
+  "status":         "Done",        # the Refund Request write-back field value
+  "refund_request": "REF-0007",
+}
+```
+
+`get_refund_writeback_status` (§3) returns the pre-flight shape instead:
+`owns_payout`, `can_write_back`, `reason_code` and the recorded state. It never
+returns an `outcome`, because nothing has happened yet.
+
+### `retry_safe` and `possibly_paid` are redundant on purpose
+
+Both are derivable from `outcome`. They are stated anyway because this is the one
+axis where a caller getting the mapping wrong pays a customer twice, and a
+boolean is harder to get wrong than a string comparison against a set the caller
+has to remember. Read either; do not compute your own.
+
+---
+
+## 5. The four states you asked about
+
+### `paid` — money is moving
+
+Shopify accepted the mutation and returned a refund with an id. `refund_gid` is
+set and already committed here.
+
+`payment_portals` may mark its refund as sent. **Do not also call Cashfree.**
+Note that the Cashfree refund arrives through the OCC bridge and lands in
+Settlement Recon at a median lag of about 48 hours — so its absence proves
+nothing for a day or two, and must not be read as a failed payout.
+
+### `refused` — nobody was paid, and retrying changes nothing
+
+A precondition failed. Nothing was sent; no Shopify call was made at all in most
+cases. `retry_safe` is false, because a bare retry is pointless, not because it
+is dangerous.
+
+Two sub-cases the caller must distinguish by `reason_code`:
+
+- `already_paid` — we have a GID for this refund. It is done. `refund_gid` is
+  returned. Treat as `paid`, not as an error.
+- everything else — configuration or data. **This refund is still unpaid and
+  Shopify owns it.** Do not fall back to Cashfree; surface `message` and let a
+  person fix the cause.
+
+### `failed_unsent` — nobody was paid, safe to retry
+
+Either nothing left this process, or Shopify read the request and explicitly
+declined it. `retry_safe: true`. This is the **only** outcome a caller may retry
+automatically.
+
+It covers: the `RefundTargets` query failing, the order not being found, no
+refundable headroom, `userErrors` from `refundCreate`, and an auth rejection
+(401/403 — declined before the document ran).
+
+Retrying is *safe*, which is not the same as *useful*: `insufficient_refundable`
+will fail identically until something changes in Shopify. Back off rather than
+loop.
+
+### `failed_unknown` — POSSIBLY PAID, never retry
+
+The mutation was posted and its fate cannot be established. `possibly_paid: true`,
+`retry_safe: false`.
+
+It covers:
+
+- transport failure, timeout, or HTTP 5xx after the mutation went out — note that
+  `execute()` retries internally, so a lost response on *any* attempt may be
+  hiding a refund that succeeded;
+- HTTP 200 with empty `userErrors` and no `refund` object — Shopify answered
+  without complaining and did not say what happened, so "nothing happened" is an
+  assumption, not a fact;
+- a response whose `refundCreate` payload is missing or unintelligible;
+- any unexpected exception raised after the mutation was posted.
+
+**What `payment_portals` must do:** treat the refund as *possibly paid*. Do not
+retry. Do not fall back to Cashfree — that is the double-payout. Map it to
+whatever your money-moving guards use for "unreconciled", and surface it for a
+person. The refund is not payable again by any route until somebody has looked.
+
+On this side it lands on `shopify_writeback_status = "Unverified"`, which no
+trigger picks up and which the form refuses to offer a retry button for. It is
+cleared only by a person, through
+`resolve_unverified_writeback(refund_name, resolution, shopify_refund_gid=…)`
+with `resolution` of `"paid"` (a refund was found in Shopify; the GID is
+mandatory) or `"not_paid"` (none exists; cleared so it can be sent again). Who
+resolved it and which way is recorded on the document.
+
+### `in_progress` — not an answer yet
+
+Another worker holds the claim. Nothing was sent by *this* call; the other call
+may be paying right now. Do not retry and do not treat as failure — re-read the
+document, or run the section 3 pre-flight again later. A stale claim (>30 min) is
+taken over automatically.
+
+### Summary table
+
+| `outcome` | paid? | `retry_safe` | `possibly_paid` | caller's move |
+|---|---|---|---|---|
+| `paid` | yes | false | true | mark sent; never call Cashfree |
+| `refused` | no | false | false | fix the cause; do not fall back |
+| `failed_unsent` | no | **true** | false | safe to retry, with backoff |
+| `failed_unknown` | **unknown** | false | **true** | reconcile by hand; never retry |
+| `in_progress` | unknown | false | false | wait and re-read |
+
+Any `outcome` value you do not recognise — including one added by a later
+contract version — **must be treated as `failed_unknown`**. That is the only safe
+default, and it is why the vocabulary is closed and versioned.
+
+---
+
+## 6. `reason_code` vocabulary
+
+Stable slugs, safe to branch on. `message` is for humans and may be reworded at
+any time.
+
+**With `outcome: "refused"`**
+
+| `reason_code` | meaning |
+|---|---|
+| `already_paid` | `shopify_refund_gid` is set; `refund_gid` returned |
+| `not_a_shopify_order` | no Sales Order, or no `shopify_order_id` on it. **The only code meaning "not mine, you pay it"** — see section 3 |
+| `channel_is_manual_portal_refund` | refunded in Shopify already |
+| `wrong_refund_status` | Refund Request is not `Completed` |
+| `not_submitted` | docstatus is not 1 |
+| `nothing_to_refund` | `net_refund_amount <= 0` |
+| `writeback_unavailable_for_store` | no enabled Shopify Settings with the toggle on |
+| `no_api_credentials` | store has no Admin API credentials |
+| `no_permission` | caller lacks submit permission on the document |
+| `not_installed` | write-back custom fields absent; run `bench migrate` |
+| `refund_request_missing` | no such document |
+| `amount_mismatch` | `expected_amount` disagreed with `net_refund_amount` — **Reserved — not implemented yet, see section 9.2.** Every other code in these tables is emitted today |
+
+**With `outcome: "failed_unsent"`**
+
+| `reason_code` | meaning |
+|---|---|
+| `query_failed` | the `RefundTargets` query failed; nothing was sent |
+| `shopify_order_not_found` | order missing or invisible to the token |
+| `insufficient_refundable` | Shopify's headroom is short of the amount; refused outright rather than partially refunded |
+| `no_refundable_transactions` | no SALE/CAPTURE parent to attach to |
+| `rejected_by_shopify` | `userErrors` — read and declined |
+| `not_authorised` | 401/403; declined before the document ran |
+| `setup_failed` | unexpected error before anything was sent |
+
+**With `outcome: "failed_unknown"`**
+
+| `reason_code` | meaning |
+|---|---|
+| `transport_error_after_send` | mutation posted, no usable response |
+| `response_unverifiable` | response gave no refund object, or was unintelligible |
+| `unverified_previous_attempt` | an earlier attempt is still unresolved |
+
+**With `outcome: "in_progress"`**: `claimed_elsewhere`.
+
+---
+
+## 7. Synchronous, and why not enqueued
+
+**`write_back_refund` is synchronous.** It returns only after Shopify has
+answered, or after it is known that Shopify's answer cannot be had.
+
+Your own constraint decides this: *a payout that returns before it has happened
+cannot be reported as sent.* An enqueued call could only return "queued", which
+is `failed_unknown` wearing a friendlier label — the caller would have to poll
+the document to find out whether a customer was paid, and every poll before the
+job runs looks like a refund that has not happened.
+
+Practically: two GraphQL calls, typically 1–3 seconds, bounded by
+`shopify_api._TIMEOUT` per request with internal retries. `fulfil_now` already
+runs this shape inside a web request. Concurrency is safe without a queue —
+the row-locked claim is committed before any HTTP, so a second caller gets
+`in_progress` rather than a second refund.
+
+**If `payment_portals` enqueues its own job that calls this**, that is fine, but
+the job's own failure — killed worker, timeout, lost result — is
+`failed_unknown` and not `failed_unsent`. A job that vanished after calling
+`write_back_refund` may have paid the customer. Treat a missing result as
+possibly-paid, and read `shopify_writeback_status` on the document to find out.
+
+---
+
+## 8. What this side will never do
+
+So the other side can rely on it rather than defend against it:
+
+- never write to Refund Request fields other than its own five
+  (`shopify_refund_gid`, `shopify_writeback_status`, `shopify_refund_gateway`,
+  `shopify_writeback_at`, `shopify_writeback_error`);
+- never change the Refund Request's `status`, `docstatus`, or any money field;
+- never call the Cashfree API, or any gateway directly;
+- never send `refundLineItems`, so Shopify never restocks — ERPNext is the
+  inventory master;
+- never notify the customer unless the store's `notify_customer_on_refund` is
+  on (default off);
+- never send a partial refund when Shopify's headroom is short — it refuses
+  instead, because a partial refund looks settled and is not;
+- never raise from `write_back_refund`; every outcome is a result dict.
+
+---
+
+## 9. Open, and blocking
+
+1. **Confirm the hook name `refund_payout_dispatchers`.** Nothing is registered
+   on this side until you do — it is a one-line `hooks.py` addition and no other
+   code. If you prefer another name, say it and I will register under that.
+2. **`expected_amount` is not implemented yet.** If you want the caller's figure
+   cross-checked, say so and I will add an optional `expected_amount` argument
+   that **refuses** on any mismatch with `net_refund_amount`
+   (`reason_code: "amount_mismatch"`, nothing sent) and never selects the amount
+   to pay. It is listed in §6 as reserved. Everything else in §6 is emitted
+   today.
+3. **Guard against two dispatchers.** Registration is `hooks.py`, so a second
+   app — or a duplicated entry — silently doubles the payout. The check belongs
+   on your side because you are the one iterating the list; the snippet in §2
+   refuses rather than picking.
+4. `order.transactions` shape still needs one live response (see
+   `REFUND-WRITEBACK-BRIEF.md` §4). Does not block this interface.
+5. `REFUND-WRITEBACK-BRIEF.md` §10 step 2 — the already-refunded-order probe —
+   still needs the user's hands. Do not enable the toggle to run it.
+
+## 10. Changes on this side that this document reflects
+
+Written while specifying §5, because the contract would otherwise have promised
+something the code could not do:
+
+- `failed_unknown` is now distinguishable. Previously a transport error after the
+  mutation was recorded as plain `Failed`, and the form offered a retry — which
+  could have paid a customer twice. It now lands on the new
+  `shopify_writeback_status = "Unverified"`, which nothing retries.
+- `resolve_unverified_writeback` added, so `Unverified` has an exit and is not a
+  silent dead end.
+- `outcome` / `reason_code` / `retry_safe` / `possibly_paid` added to
+  `write_back_refund`'s result. Existing keys are unchanged.
+- `gateway_moves_money` and `plan_refund`'s `moves_money` **deleted**. Nothing
+  consumed them, and a boolean derived from a gateway name carried no information
+  that `shopify_refund_gateway` does not already hold — while inviting exactly
+  the misreading that produced the wrong first draft of the brief's §1.
