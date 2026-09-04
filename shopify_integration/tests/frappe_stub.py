@@ -276,7 +276,17 @@ def install():
     frappe.get_meta      = lambda doctype: _Meta(doctype)
     frappe.get_all       = lambda *a, **k: []
     frappe.get_doc       = _get_doc
-    frappe.whitelist     = lambda *a, **k: (lambda fn: fn)
+    # Marks what it decorates, so a test can assert which functions are
+    # reachable over HTTP.  For a module that moves money that is a real
+    # property, not a detail: an accidental @frappe.whitelist() on the payout
+    # function is a payout anyone logged in can trigger.
+    def _whitelist(*a, **k):
+        def decorate(fn):
+            fn.__is_whitelisted__ = True
+            return fn
+        return decorate
+
+    frappe.whitelist     = _whitelist
     frappe.enqueue       = _noop
     frappe.get_traceback = lambda *a, **k: "traceback"
 

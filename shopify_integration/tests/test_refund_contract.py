@@ -18,6 +18,7 @@ believed.  So:
 """
 
 import io
+import re
 import unittest
 from pathlib import Path
 
@@ -73,6 +74,26 @@ class TestContractDocument(unittest.TestCase):
             f"**Version {r.CONTRACT_VERSION}.**", self.text,
             f"the code says contract version {r.CONTRACT_VERSION}",
         )
+
+    def test_every_contract_version_literal_in_the_document_matches(self):
+        """The header alone is not enough.  The §4 result-dict example carried
+        `contract_version: 1` through two bumps, because only the header was
+        pinned — and the example is the part a reader copies."""
+        literals = re.findall(r"contract_version\"?\s*:\s*(\d+)", self.text)
+        self.assertTrue(literals, "no contract_version literal found to check")
+        for found in literals:
+            self.assertEqual(
+                int(found), r.CONTRACT_VERSION,
+                f"the document shows contract_version {found}, the code says "
+                f"{r.CONTRACT_VERSION}",
+            )
+
+    def test_no_prose_pins_the_document_to_a_stale_version(self):
+        """"Extra keys may be added within version 1" outlived version 1.  Any
+        such sentence has to be written version-free, or it goes stale silently
+        every time this is bumped."""
+        for stale in (f"within version {n}" for n in range(1, r.CONTRACT_VERSION)):
+            self.assertNotIn(stale, self.text, stale)
 
     def test_the_contract_names_the_hook_functions_it_promises(self):
         for name in ("write_back_refund", "get_refund_writeback_status",
@@ -159,14 +180,6 @@ class TestOutcomeVocabulary(WritebackTestCase):
         self.seed()
         frappe_stub.META_FIELDS[r.REFUND_REQUEST] = set()
         self.assertContractual(r.write_back_refund(REFUND), "not_installed")
-
-    def test_no_permission(self):
-        real = frappe.has_permission
-        frappe.has_permission = lambda *a, **k: False
-        try:
-            self.assertContractual(r.write_back_refund(REFUND), "no_permission")
-        finally:
-            frappe.has_permission = real
 
     def test_in_progress(self):
         self.set_field(**{
@@ -269,9 +282,9 @@ EXPECTED_OWNER = {
     "not_a_shopify_order": r.OWNER_CALLER,
 
     # Undeterminable: we refused before we could read what deciding it needs.
+    # Both are "this app cannot answer", never "not mine".
     "not_installed": r.OWNER_UNKNOWN,
     "refund_request_missing": r.OWNER_UNKNOWN,
-    "no_permission": r.OWNER_UNKNOWN,
 
     # Success carries no code.
     "": r.OWNER_SHOPIFY,
@@ -395,15 +408,20 @@ class TestRoutingLive(WritebackTestCase):
         self.assertEqual(result["payout_owner"], r.OWNER_UNKNOWN)
         self.assertFalse(result["caller_must_pay"])
 
-    def test_no_permission_reports_unknown_not_caller(self):
+    def test_there_is_no_permission_refusal_to_route_at_all(self):
+        """no_permission is gone from the vocabulary along with the check that
+        emitted it.  A caller payment_portals has authorised must never be
+        refused here, because "unknown" then leaves neither app willing to pay."""
+        self.assertNotIn(
+            "no_permission",
+            set().union(*r.REASON_CODES.values()),
+        )
         real = frappe.has_permission
         frappe.has_permission = lambda *a, **k: False
         try:
-            result = r.write_back_refund(REFUND)
+            self.assertTrue(r.write_back_refund(REFUND)["ok"])
         finally:
             frappe.has_permission = real
-        self.assertEqual(result["payout_owner"], r.OWNER_UNKNOWN)
-        self.assertFalse(result["caller_must_pay"])
 
     def test_a_gid_settles_ownership_even_if_the_order_link_is_gone(self):
         """An amended Sales Order can lose its shopify_order_id; a refund Shopify

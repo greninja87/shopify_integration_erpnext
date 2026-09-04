@@ -549,22 +549,38 @@ class TestGuards(WritebackTestCase):
         frappe_stub.META_FIELDS[r.REFUND_REQUEST] = set()
         self.assertSkipped(r.write_back_refund(REFUND), "migrate")
 
-    def test_an_unmigrated_site_says_migrate_and_not_no_permission(self):
-        """On a site with no payment_portals, frappe.has_permission on the
-        missing DocType fails too — so the availability check has to come first
-        or the diagnosis is wrong."""
-        frappe_stub.META_FIELDS[r.REFUND_REQUEST] = set()
+    def test_the_payout_never_consults_the_permission_system_at_all(self):
+        """Not "the check is lenient" — there is no check.  Two permission models
+        over one payout deadlocked, so authorisation belongs to whoever
+        dispatches this.  Asserted by making any call to frappe.has_permission
+        blow up, rather than by reading the source."""
+        called = []
+
         real = frappe.has_permission
-        frappe.has_permission = lambda *a, **k: (_ for _ in ()).throw(
-            Exception("DocType Refund Request not found")
-        )
+
+        def explode(*a, **k):
+            called.append((a, k))
+            raise AssertionError(
+                "write_back_refund consulted frappe.has_permission; a caller "
+                "payment_portals authorised can then still be refused here"
+            )
+
+        frappe.has_permission = explode
         try:
             result = r.write_back_refund(REFUND)
         finally:
             frappe.has_permission = real
 
+        self.assertEqual(called, [])
+        self.assertTrue(result["ok"], result)
+
+    def test_an_unmigrated_site_says_migrate(self):
+        frappe_stub.META_FIELDS[r.REFUND_REQUEST] = set()
+        result = r.write_back_refund(REFUND)
+
         self.assertIn("migrate", result["message"].lower())
-        self.assertNotIn("permission", result["message"].lower())
+        self.assertEqual(result["reason_code"], "not_installed")
+        self.assertEqual(result["payout_owner"], r.OWNER_UNKNOWN)
 
     def test_a_nonexistent_refund_request_is_skipped(self):
         self.assertSkipped(r.write_back_refund("REF-NOPE"))
@@ -676,9 +692,29 @@ class TestEndpoints(WritebackTestCase):
             frappe.has_permission = real
         self.assertTrue(checked, "writeback_now must check permission before paying anybody")
 
-    def test_write_back_refund_refuses_a_caller_without_submit_permission(self):
-        """It is whitelisted and it pays a customer, so it cannot rely on the
-        caller having checked."""
+    def test_the_payout_function_is_not_reachable_over_http(self):
+        """write_back_refund pays a customer.  Whitelisting it would put that one
+        HTTP call away from anyone logged in; writeback_now is the door, and it
+        checks permission."""
+        self.assertFalse(
+            getattr(r.write_back_refund, "__is_whitelisted__", False),
+            "write_back_refund is whitelisted — a payout is one HTTP call away",
+        )
+        self.assertTrue(getattr(r.writeback_now, "__is_whitelisted__", False))
+        self.assertTrue(
+            getattr(r.get_refund_writeback_status, "__is_whitelisted__", False)
+        )
+        self.assertTrue(
+            getattr(r.resolve_unverified_writeback, "__is_whitelisted__", False)
+        )
+
+    def test_write_back_refund_does_not_second_guess_the_caller(self):
+        """Authorisation belongs to whoever dispatches it.  An earlier version
+        checked submit permission here as well, and two permission models over
+        one payout deadlocked: payment_portals authorises on PAYOUT_ROLES, so a
+        Refund Approver without doctype submit permission passed its gate and
+        failed this one — and the resulting "unknown" meant neither app would pay
+        the refund."""
         real = frappe.has_permission
         frappe.has_permission = lambda *a, **k: False
         try:
@@ -686,21 +722,24 @@ class TestEndpoints(WritebackTestCase):
         finally:
             frappe.has_permission = real
 
-        self.assertFalse(result["ok"])
-        self.assertEqual(result["status"], r.STATUS_SKIPPED)
-        self.assertIn("permission", result["message"].lower())
-        self.assertNothingSent()
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["outcome"], r.OUTCOME_PAID)
 
-    def test_a_refused_caller_leaves_no_mark_on_the_document(self):
+    def test_the_http_door_still_refuses_an_unauthorised_person(self):
         real = frappe.has_permission
-        frappe.has_permission = lambda *a, **k: False
+
+        def deny(*a, **k):
+            if k.get("throw"):
+                raise frappe.PermissionError("not allowed")
+            return False
+
+        frappe.has_permission = deny
         try:
-            r.write_back_refund(REFUND)
+            with self.assertRaises(frappe.PermissionError):
+                r.writeback_now(REFUND)
         finally:
             frappe.has_permission = real
-
-        self.assertEqual(self.stored(r.WRITEBACK_STATUS_FIELD), "")
-        self.assertEqual(frappe_stub.WRITES, [])
+        self.assertNothingSent()
 
     def test_write_back_refund_takes_no_settings_argument(self):
         """An HTTP caller must not be able to aim this at another store's

@@ -39,9 +39,10 @@ That refusing gate lives in payment_portals (portal_channel_blocked, third gate,
 commit 1ed0e8b) and is not this app's to write.  Note what it does and does not
 do: it **refuses** a Payment Portal refund on a Shopify order, pointing the
 reader at Manual Portal Refund.  It does not delegate to this module, and no
-dispatcher exists yet — so nothing calls write_back_refund except the whitelisted
-entry point and the form button.  See REFUND-DISPATCH-CONTRACT.md for the
-handshake that would change that.
+dispatcher exists yet — so the only thing that calls write_back_refund is
+writeback_now, the whitelisted endpoint behind the form button.  See
+REFUND-DISPATCH-CONTRACT.md for the handshake that would change that, and for
+why write_back_refund itself is deliberately not whitelisted.
 
 Snapmint needs no guard here.  The discriminator is not visible in the
 transaction nodes — OCC and Snapmint orders both read "manual" — and it does not
@@ -92,7 +93,12 @@ REFUND_REQUEST = "Refund Request"
 #    bool(shopify_order_id), which several guards never populated, so it read
 #    False — "not a Shopify order" — for refunds that were, including ones
 #    Shopify had already paid.  Callers should branch on caller_must_pay.
-CONTRACT_VERSION = 2
+# 3: the no_permission code is gone, and with it the submit-permission check in
+#    write_back_refund.  Two permission models guarding one payout deadlocked:
+#    a caller payment_portals had authorised could still be refused here, and
+#    the resulting "unknown" left neither app willing to pay.  Authorisation now
+#    belongs to the caller; writeback_now still guards the HTTP door.
+CONTRACT_VERSION = 3
 
 # Refund Request state fields, created by this app as Custom Fields.
 REFUND_GID_FIELD      = "shopify_refund_gid"
@@ -165,7 +171,6 @@ REASON_CODES = {
         "nothing_to_refund",
         "writeback_unavailable_for_store",
         "no_api_credentials",
-        "no_permission",
         "not_installed",
         "refund_request_missing",
         # Reserved for execute_refund_payout's optional expected_amount
@@ -819,7 +824,6 @@ def _log(settings, refund_name, shopify_order_id, status, message, payload=None)
         )
 
 
-@frappe.whitelist()
 def write_back_refund(refund_name: str, triggered_by: str = "manual") -> dict:
     """
     Tell Shopify about one booked ERPNext refund.
@@ -829,24 +833,33 @@ def write_back_refund(refund_name: str, triggered_by: str = "manual") -> dict:
     a payout and not as bookkeeping.  Nothing calls this automatically: there is
     no doc_events hook, deliberately, because deciding to pay somebody belongs
     with whatever owns the refund's money path, not with a save handler here.
-    Today the only caller is the form button; a dispatcher on the payment_portals
-    side is the intended one.
+    Today the only caller is the form button, via writeback_now; a dispatcher on
+    the payment_portals side is the intended one.
 
     Idempotent and safe to call twice: shopify_refund_gid being set is a hard
     stop, and the worker claim stops two callers racing.  Never raises — every
     outcome comes back as a result dict so the caller can log it.
 
-    Whitelisted, so it checks submit permission on the document itself rather
-    than trusting the caller to have done it.  It deliberately takes no
-    `settings` argument: the store is resolved from the refund's own Sales Order,
-    so an HTTP caller cannot aim this at a different store's credentials.
+    **Authorisation is the caller's, and deliberately so.**  This is not
+    whitelisted: it is not reachable over HTTP, so every caller is in-process and
+    trusted, and by the time a dispatcher gets here payment_portals has already
+    authorised the payout against its own PAYOUT_ROLES.  An earlier version did
+    check submit permission on the Refund Request, which created a deadlock —
+    somebody holding Refund Approver but not doctype submit permission passed
+    that gate and failed this one, and the resulting "unknown" meant neither app
+    would pay the refund, for a reason that explained nothing.  Two permission
+    models guarding one payout is one too many.  The HTTP door is writeback_now,
+    which does check.
 
-    :return: {"ok", "status", "refund_gid", "gateway", "message",
-              "refund_request"}
+    It also takes no `settings` argument: the store is resolved from the refund's
+    own Sales Order, so no caller can aim this at another store's credentials.
+
+    :return: the result dict described in REFUND-DISPATCH-CONTRACT.md §4
     """
     # Ownership as far as it is known at the moment result() is called.  Set once
-    # eligibility has run; before that — not installed, no permission — it is
-    # genuinely undeterminable and must not read as "not ours".
+    # eligibility has run; before that — the app is not installed here, or there
+    # is no such document — it is genuinely undeterminable and must not read as
+    # "not ours".
     owner = {"payout_owner": OWNER_UNKNOWN}
 
     def result(ok, status, message, outcome, reason_code="",
@@ -870,27 +883,9 @@ def write_back_refund(refund_name: str, triggered_by: str = "manual") -> dict:
             "contract_version": CONTRACT_VERSION,
         }
 
-    # Availability first.  On a site without payment_portals — or one where the
-    # patch has not run — frappe.has_permission on a missing DocType fails, and
-    # "you lack permission" would be the wrong diagnosis for "this app is inert
-    # here".
     if not _has_writeback_fields():
         return result(False, STATUS_SKIPPED, _NOT_MIGRATED_REASON,
                       OUTCOME_REFUSED, reason_code="not_installed")
-
-    # Refused before anything else is read or written: an unauthorised caller
-    # must not be able to pay a customer, nor to leave a mark on the document
-    # saying they tried.  Checked without throw so the never-raises contract
-    # holds.
-    try:
-        permitted = frappe.has_permission(REFUND_REQUEST, "submit", doc=refund_name)
-    except Exception:
-        permitted = False
-    if not permitted:
-        return result(False, STATUS_SKIPPED,
-                      f"You do not have submit permission on {REFUND_REQUEST} "
-                      f"{refund_name}, so no refund was sent.",
-                      OUTCOME_REFUSED, reason_code="no_permission")
 
     try:
         eligibility = check_eligibility(refund_name)

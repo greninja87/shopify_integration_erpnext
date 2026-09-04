@@ -1,6 +1,6 @@
 # Refund dispatch contract — `payment_portals` → `shopify_integration`
 
-**Version 2.** Written 2026-09-04 by the `shopify_integration` side, at the
+**Version 3.** Written 2026-09-04 by the `shopify_integration` side, at the
 request of the `payment_portals` session, as the interface to build against.
 
 > **Version 2 corrects a routing bug found on `electrobotictest`, and changes
@@ -10,6 +10,13 @@ request of the `payment_portals` session, as the interface to build against.
 > Portal Refund Shopify had **already paid**. A gate branching on it would have
 > paid that customer a second time. If you integrated against version 1, read
 > §3 again: branch on **`caller_must_pay`**, not on `owns_payout`.
+>
+> **Version 3 removes the `no_permission` refusal, and the permission check that
+> produced it.** It deadlocked: `payment_portals` authorises on `PAYOUT_ROLES`,
+> this app checked submit permission on Refund Request, and a Refund Approver
+> without doctype submit permission passed one gate and failed the other — which
+> came back `unknown`, so neither app would pay the refund, for a reason that
+> explained nothing. Authorisation is the caller's now. See §2.
 
 `shopify_integration.utils.refund.CONTRACT_VERSION` is the machine-readable
 version and every result dict carries it as `contract_version`. Bumping it is a
@@ -34,9 +41,9 @@ it is the case this contract exists to make un-ignorable.
 - `payment_portals` `1ed0e8b` added the §2a routing gate. It **refuses** a
   Payment Portal refund whose Sales Order carries a `shopify_order_id`. It does
   not delegate.
-- No dispatcher exists on either side. Today the only callers of
-  `write_back_refund` are the whitelisted endpoint and the Refund Request form
-  button.
+- No dispatcher exists on either side. Today the only caller of
+  `write_back_refund` is `writeback_now`, the whitelisted endpoint behind the
+  Refund Request form button.
 - `enable_refund_writeback` is **off** on every store and must stay off until
   both this handshake and the credit-note guard are in place.
 
@@ -66,8 +73,11 @@ falling back when nothing is registered. That shape is accepted as-is, and this
 section just pins the names.
 
 **It needs no new code on this side.** The dispatcher points straight at
-`write_back_refund`, which is already whitelisted and already returns everything
-in §4.
+`write_back_refund`, which already returns everything in §4.
+
+`frappe.call` resolves a dotted path through `frappe.get_attr` and does not
+require the target to be whitelisted, so this works on a plain function — and
+`write_back_refund` is deliberately **not** whitelisted. See below.
 
 ### On the `shopify_integration` side (added once you confirm the hook name)
 
@@ -102,6 +112,31 @@ def write_back_refund(refund_name: str, triggered_by: str = "manual") -> dict
 `triggered_by` is a free-text label that reaches the log line only; pass
 something like `"payment_portals_payout"` so a log reader can tell a dispatched
 payout from a button press. It never changes behaviour.
+
+### Authorisation is yours, and this app does not re-check it
+
+`write_back_refund` performs **no permission check**, and is **not whitelisted**,
+so it is not reachable over HTTP. Every caller is in-process and trusted, and by
+the time you dispatch, you have already authorised the payout against
+`PAYOUT_ROLES`.
+
+Version 2 did check submit permission on the Refund Request, and you were right
+that it was a real integration risk rather than a theoretical one: our permission
+models can diverge, a Refund Approver without doctype submit permission would
+pass your gate and fail this one, and the `unknown` that produced meant **neither
+app would pay the refund** — with a message about doctype permissions that
+explained nothing about why. Two permission models guarding one payout is one too
+many, and the one that should win is the one that owns the money path.
+
+The HTTP door is `writeback_now`, which is whitelisted and does require submit
+permission on the Refund Request. That is the form button a person presses, and
+the conventional Frappe check for acting on a document from its own form. If you
+want that button available to a role that lacks doctype submit permission, the
+answer is Frappe permissions on Refund Request — not a role list hardcoded in
+this app, which would couple it to your configuration.
+
+A test asserts that `write_back_refund` is not whitelisted, because an
+accidental decorator there is a payout one HTTP call away from anyone logged in.
 
 ### What to pass, and what not to
 
@@ -180,10 +215,10 @@ was refunded in Shopify already. Shopify owns the payout. **Refuse both paths
 and surface the reason.** Falling back to Cashfree there is a double-payout
 waiting for whoever fixes the cause and retries.
 
-`payout_owner: "unknown"` means this app could not read what deciding it needs —
-it is not installed, the document does not exist, or the caller lacked
-permission. It is deliberately *not* `caller`: answering "not mine" without
-having looked is what version 1 did wrong.
+`payout_owner: "unknown"` means this app could not read what deciding it needs:
+it is not installed here, or the document does not exist. It is deliberately
+*not* `caller` — answering "not mine" without having looked is what version 1 did
+wrong.
 
 #### Do not use `owns_payout` as a boolean
 
@@ -201,13 +236,13 @@ It is `true` only when ownership was determined as Shopify's. It no longer goes
 
 ## 4. The result dict
 
-What `write_back_refund` returns, on every path. Extra keys may be added within
-version 1; none will be removed or change meaning.
+What `write_back_refund` returns, on every path. Extra keys may be added without
+a version bump; none will be removed or change meaning without one.
 
 ```python
 {
   "provider":         "shopify",       # which app answered
-  "contract_version": 1,
+  "contract_version": 3,
 
   "outcome":     "paid" | "refused" | "failed_unsent" | "failed_unknown" | "in_progress",
   "reason_code": "<stable slug, see §6>",
@@ -352,7 +387,6 @@ any time.
 | `nothing_to_refund` | `net_refund_amount <= 0` |
 | `writeback_unavailable_for_store` | no enabled Shopify Settings with the toggle on |
 | `no_api_credentials` | store has no Admin API credentials |
-| `no_permission` | caller lacks submit permission on the document |
 | `not_installed` | write-back custom fields absent; run `bench migrate` |
 | `refund_request_missing` | no such document |
 | `amount_mismatch` | `expected_amount` disagreed with `net_refund_amount` — **Reserved — not implemented yet, see section 9.2.** Every other code in these tables is emitted today |
@@ -382,9 +416,9 @@ any time.
 ### Ownership per code
 
 `caller_must_pay` is true for `not_a_shopify_order` and nothing else.
-`payout_owner` is `unknown` for `not_installed`, `refund_request_missing` and
-`no_permission` — the three refusals that happen before this app can read enough
-to decide. Every other code above is `shopify`, including all the
+`payout_owner` is `unknown` for exactly two codes — `not_installed` and
+`refund_request_missing` — the refusals that happen before this app can read
+enough to decide. Every other code above is `shopify`, including all the
 `failed_unsent` and `failed_unknown` ones: a refund that failed to send is still
 Shopify's to pay.
 
@@ -430,7 +464,10 @@ So the other side can rely on it rather than defend against it:
   on (default off);
 - never send a partial refund when Shopify's headroom is short — it refuses
   instead, because a partial refund looks settled and is not;
-- never raise from `write_back_refund`; every outcome is a result dict.
+- never raise from `write_back_refund`; every outcome is a result dict;
+- never second-guess your authorisation: `write_back_refund` has no permission
+  check and is not whitelisted, so a caller you have authorised is never refused
+  here on permission grounds.
 
 ---
 
@@ -455,6 +492,27 @@ So the other side can rely on it rather than defend against it:
    still needs the user's hands. Do not enable the toggle to run it.
 
 ## 10. Changes on this side that this document reflects
+
+### Version 3 — authorisation belongs to the caller (2026-09-04)
+
+Raised from the `payment_portals` side as an integration risk, and it was a real
+one. Version 2's `no_permission` → `unknown` mapping was safe in isolation and
+broken in combination: your payout gate requires `Refund Approver` or
+`System Manager`; this app required submit permission on Refund Request. A user
+with the former and not the latter passes your gate, gets refused here, and
+`unknown` means refuse-both-paths — a refund neither app will pay, explained by a
+message about the wrong permission model.
+
+The fix is not to align the two checks but to remove one. By the time a
+dispatcher reaches `write_back_refund`, the payout is already authorised;
+re-deciding it here adds no safety and one failure mode. So the check is gone,
+`no_permission` is gone from the vocabulary, and — the part that makes this safe
+rather than merely convenient — `write_back_refund` is no longer whitelisted, so
+it is not reachable over HTTP at all. The whitelisted door is `writeback_now`,
+which still checks.
+
+That leaves `unknown` meaning exactly two things, both of them "this app cannot
+answer": not installed, and no such document.
 
 ### Version 2 — the routing fix (2026-09-04, after the `electrobotictest` deploy)
 
