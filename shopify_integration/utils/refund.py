@@ -87,7 +87,12 @@ REFUND_REQUEST = "Refund Request"
 
 # Bumped when the shape of write_back_refund's result dict changes in a way a
 # caller has to care about.  See REFUND-DISPATCH-CONTRACT.md.
-CONTRACT_VERSION = 1
+#
+# 2: owns_payout became three-state and its truth table changed.  In 1 it was
+#    bool(shopify_order_id), which several guards never populated, so it read
+#    False — "not a Shopify order" — for refunds that were, including ones
+#    Shopify had already paid.  Callers should branch on caller_must_pay.
+CONTRACT_VERSION = 2
 
 # Refund Request state fields, created by this app as Custom Fields.
 REFUND_GID_FIELD      = "shopify_refund_gid"
@@ -123,6 +128,26 @@ OUTCOME_IN_PROGRESS    = "in_progress"     # another worker holds the claim
 
 # Only one outcome is ever safe to retry automatically.
 _RETRY_SAFE_OUTCOMES = (OUTCOME_FAILED_UNSENT,)
+
+# ── Who owes this customer the money ─────────────────────────────────────────
+#
+# Three states, not two.  The first version of this was a bool derived from
+# shopify_order_id, and it was wrong on the live site: several guards return
+# before the Sales Order is ever looked up, so a blank order id there meant "not
+# determined" and read as "not a Shopify order".  A Manual Portal Refund — a
+# refund Shopify has ALREADY paid — came back as the caller's to pay, which is
+# the double payout this contract exists to prevent.
+#
+# So ownership is settled before any guard that could return without looking,
+# and "we could not tell" is its own answer rather than being folded into "no".
+OWNER_SHOPIFY = "shopify"   # Shopify's payout; it may already have made it
+OWNER_CALLER  = "caller"    # not a Shopify order; the caller pays it
+OWNER_UNKNOWN = "unknown"   # undeterminable (app not installed, no such document)
+
+# The ONLY reason_code that means "not mine, you pay it".  A constant because
+# the contract's routing rule is a biconditional with it, and
+# tests/test_refund_contract.py enumerates REASON_CODES to pin that.
+REASON_NOT_OURS = "not_a_shopify_order"
 
 # The closed reason_code vocabulary, per outcome, and the single source of truth
 # for REFUND-DISPATCH-CONTRACT.md — tests/test_refund_contract.py asserts the
@@ -576,23 +601,61 @@ def _settings_for_store(shop_domain: str, require_enabled: bool = True):
 
 # ── Eligibility ───────────────────────────────────────────────────────────────
 
+def _ownership(eligibility: dict) -> dict:
+    """
+    The routing keys, in the one shape a caller cannot misread.
+
+    `caller_must_pay` is a **positive** assertion of the dangerous action, and
+    that is the whole point of its existence.  The predecessor of these keys was
+    a single bool, and the natural way to use it — `if not owns_payout: pay()` —
+    silently did the wrong thing for every value that meant "we could not tell".
+    A flag that is true only for the one code meaning "not mine" defaults to the
+    safe direction on anything unknown, unrecognised, or added later.
+
+    `owns_payout` is kept for the caller already reading it, and is now
+    three-state: True, False, or None when undeterminable.  `not owns_payout` is
+    NOT a safe test — None is falsy.  Branch on `caller_must_pay`.
+    """
+    owner = eligibility.get("payout_owner") or OWNER_UNKNOWN
+    return {
+        "payout_owner": owner,
+        "caller_must_pay": owner == OWNER_CALLER,
+        "owns_payout": {
+            OWNER_SHOPIFY: True, OWNER_CALLER: False, OWNER_UNKNOWN: None,
+        }[owner],
+    }
+
+
 def check_eligibility(refund_name: str, settings=None) -> dict:
     """
     Can this Refund Request be written back to Shopify right now?
 
-    Returns {"ok", "reason", "settings", "shopify_order_id", "amount", "note",
-             "status", "refund_gid"}.  Read-only — safe to call from the client
-    on every form refresh.
+    Returns {"ok", "reason", "reason_code", "payout_owner", "settings",
+             "shopify_order_id", "shopify_store", "amount", "note", "status",
+             "refund_gid"}.  Read-only — safe to call from the client on every
+    form refresh.
 
     Every guard in the brief's §6 lives here, and every one returns a reason
     rather than raising.  A payout path that throws on an edge case is worse
     than one that refuses.
+
+    **Ownership is settled before any guard that can return**, and the order is
+    load-bearing.  Leave "is this even a Shopify order?" until after the other
+    checks and the guards that fire first return without ever looking — which is
+    exactly how this reported a Manual Portal Refund, a refund Shopify had
+    already paid, as the caller's to pay.  Deciding it first also keeps the
+    contract's routing invariant exact: `payout_owner == OWNER_CALLER` if and
+    only if `reason_code == REASON_NOT_OURS`.
     """
-    out = {"ok": False, "reason": "", "reason_code": "", "settings": None,
-           "shopify_order_id": "", "amount": 0.0, "note": "", "status": "",
-           "refund_gid": ""}
+    out = {"ok": False, "reason": "", "reason_code": "",
+           "payout_owner": OWNER_UNKNOWN, "settings": None,
+           "shopify_order_id": "", "shopify_store": "", "amount": 0.0,
+           "note": "", "status": "", "refund_gid": ""}
 
     if not _has_writeback_fields():
+        # Ownership stays unknown, not "not ours": without our fields we cannot
+        # read what deciding it needs, and answering "not ours" here would invite
+        # the caller to pay a refund Shopify may already have paid.
         out["reason_code"] = "not_installed"
         out["reason"] = _NOT_MIGRATED_REASON
         return out
@@ -614,14 +677,45 @@ def check_eligibility(refund_name: str, settings=None) -> dict:
     out["amount"] = flt(row.get("net_refund_amount"))
     out["note"] = str(row.get("reason_note") or "")
 
-    # Idempotency first, and deliberately before everything else: it is the one
-    # guard that must hold even if the document has since been edited into a
-    # state the other guards would reject.
+    # ── Ownership, before every guard that could return without looking ──────
+    sales_order = str(row.get("sales_order") or "").strip()
+    order = (frappe.db.get_value(
+        "Sales Order", sales_order, ["shopify_order_id", "shopify_store"], as_dict=True
+    ) or {}) if sales_order else {}
+    out["shopify_order_id"] = str(order.get("shopify_order_id") or "").strip()
+    out["shopify_store"] = str(order.get("shopify_store") or "").strip()
+
+    # A stored GID is proof Shopify accepted a refund for this document, so it
+    # settles ownership by itself — including when the Sales Order has since been
+    # amended and lost its order id, which would otherwise read as "not ours"
+    # for a refund Shopify demonstrably made.
+    out["payout_owner"] = (
+        OWNER_SHOPIFY if (out["refund_gid"] or out["shopify_order_id"])
+        else OWNER_CALLER
+    )
+
+    # Idempotency next, and deliberately before the rest: it is the one guard
+    # that must hold even if the document has since been edited into a state the
+    # other guards would reject.
     if out["refund_gid"]:
         out["reason_code"] = "already_paid"
         out["reason"] = (
             f"Already written back to Shopify as {out['refund_gid']}. No further "
             f"refund is ever sent for this document."
+        )
+        return out
+
+    # Second, so that every guard below is reached only by a refund already
+    # known to be Shopify's.  That is what makes payout_owner trustworthy on all
+    # of those paths, rather than only on the ones that happened to look.
+    if out["payout_owner"] == OWNER_CALLER:
+        out["reason_code"] = REASON_NOT_OURS
+        out["reason"] = (
+            f"Sales Order {sales_order} has no Shopify order id — this is a "
+            f"payment link or a direct gateway payment, and its refund does not "
+            f"go through Shopify."
+        ) if sales_order else (
+            "No Sales Order on this refund, so no Shopify order to refund."
         )
         return out
 
@@ -665,27 +759,7 @@ def check_eligibility(refund_name: str, settings=None) -> dict:
         )
         return out
 
-    sales_order = str(row.get("sales_order") or "").strip()
-    if not sales_order:
-        out["reason_code"] = "not_a_shopify_order"
-        out["reason"] = "No Sales Order on this refund, so no Shopify order to refund."
-        return out
-
-    order = frappe.db.get_value(
-        "Sales Order", sales_order, ["shopify_order_id", "shopify_store"], as_dict=True
-    ) or {}
-    shopify_order_id = str(order.get("shopify_order_id") or "").strip()
-    if not shopify_order_id:
-        out["reason_code"] = "not_a_shopify_order"
-        out["reason"] = (
-            f"Sales Order {sales_order} has no Shopify order id — this is a "
-            f"payment link or a direct gateway payment, and its refund does not "
-            f"go through Shopify."
-        )
-        return out
-    out["shopify_order_id"] = shopify_order_id
-
-    shop_domain = str(order.get("shopify_store") or "").strip()
+    shop_domain = out["shopify_store"]
     settings = settings or _settings_for_store(shop_domain)
     if not settings:
         out["reason_code"] = "writeback_unavailable_for_store"
@@ -770,12 +844,18 @@ def write_back_refund(refund_name: str, triggered_by: str = "manual") -> dict:
     :return: {"ok", "status", "refund_gid", "gateway", "message",
               "refund_request"}
     """
+    # Ownership as far as it is known at the moment result() is called.  Set once
+    # eligibility has run; before that — not installed, no permission — it is
+    # genuinely undeterminable and must not read as "not ours".
+    owner = {"payout_owner": OWNER_UNKNOWN}
+
     def result(ok, status, message, outcome, reason_code="",
                refund_gid="", gateway="", amount=0.0):
         return {
             "ok": ok,
             "outcome": outcome,
             "reason_code": reason_code,
+            **_ownership(owner),
             # Derivable from `outcome`, stated anyway so a caller cannot get the
             # mapping wrong on the one axis where being wrong pays twice.
             "retry_safe": outcome in _RETRY_SAFE_OUTCOMES,
@@ -814,6 +894,7 @@ def write_back_refund(refund_name: str, triggered_by: str = "manual") -> dict:
 
     try:
         eligibility = check_eligibility(refund_name)
+        owner["payout_owner"] = eligibility["payout_owner"]
         if not eligibility["ok"]:
             # An already-written refund keeps its Done status and its GID; every
             # other refusal is recorded as a Skip with its reason.
@@ -1164,9 +1245,14 @@ def get_refund_writeback_status(refund_name: str) -> dict:
     ) or {}
 
     return {
-        "is_shopify": bool(eligibility["shopify_order_id"]),
+        # True only when we actually determined it.  A guard that returned before
+        # the Sales Order lookup used to leave this false, which read as "not a
+        # Shopify order" for orders that plainly were — check payout_owner, not
+        # this, when the answer decides where money goes.
+        "is_shopify": eligibility["payout_owner"] == OWNER_SHOPIFY,
         "migrated": True,
         "shopify_order_id": eligibility["shopify_order_id"],
+        "shopify_store": eligibility["shopify_store"],
         "status": eligibility["status"],
         "refund_gid": eligibility["refund_gid"],
         "gateway": row.get(REFUND_GATEWAY_FIELD) or "",
@@ -1175,12 +1261,7 @@ def get_refund_writeback_status(refund_name: str) -> dict:
         "amount": eligibility["amount"],
         "can_write_back": eligibility["ok"],
         "reason": eligibility["reason"],
-        # For a caller deciding the money path, not just a form drawing a banner.
-        # `owns_payout` answers the only question that matters before paying:
-        # is this refund Shopify's to pay?  It is true even when can_write_back
-        # is false — Shopify owning a payout it cannot currently perform is
-        # exactly the case where falling back to another route double-pays later.
         "reason_code": eligibility["reason_code"],
-        "owns_payout": bool(eligibility["shopify_order_id"]),
+        **_ownership(eligibility),
         "contract_version": CONTRACT_VERSION,
     }

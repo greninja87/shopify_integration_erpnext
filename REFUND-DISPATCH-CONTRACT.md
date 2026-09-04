@@ -1,7 +1,15 @@
 # Refund dispatch contract — `payment_portals` → `shopify_integration`
 
-**Version 1.** Written 2026-09-04 by the `shopify_integration` side, at the
+**Version 2.** Written 2026-09-04 by the `shopify_integration` side, at the
 request of the `payment_portals` session, as the interface to build against.
+
+> **Version 2 corrects a routing bug found on `electrobotictest`, and changes
+> the meaning of `owns_payout`.** Version 1 derived it from `shopify_order_id`,
+> which several guards returned without ever populating — so it read `false`,
+> "not a Shopify order", for refunds that were Shopify's, including a Manual
+> Portal Refund Shopify had **already paid**. A gate branching on it would have
+> paid that customer a second time. If you integrated against version 1, read
+> §3 again: branch on **`caller_must_pay`**, not on `owns_payout`.
 
 `shopify_integration.utils.refund.CONTRACT_VERSION` is the machine-readable
 version and every result dict carries it as `contract_version`. Bumping it is a
@@ -133,31 +141,63 @@ frappe.call("shopify_integration.utils.refund.get_refund_writeback_status",
             refund_name=name)
 ```
 
-It returns `owns_payout`, `can_write_back`, `reason`, `reason_code`, `amount`,
-`status`, `refund_gid`, `gateway`, `shopify_order_id`, `error`. Use it to tell a
-person, on the form and before they commit, which route their refund will take —
-your own design doc asks for exactly that. It sends nothing to Shopify and is
-safe to call on every form refresh.
+It returns `payout_owner` and `caller_must_pay` (the routing answer), plus
+`can_write_back`, `reason`, `reason_code`, `amount`, `status`, `refund_gid`,
+`gateway`, `shopify_order_id`, `shopify_store`, `is_shopify` and `error`. Use it
+to tell a person, on the form and before they commit, which route their refund
+will take — your own design doc asks for exactly that. It sends nothing to
+Shopify and is safe to call on every form refresh.
 
 It is **not** a substitute for reading the dispatch result. Between a pre-flight
 and a payout, anything can change; only the result dict says what happened.
 
 ### The one distinction that decides the money path
 
-Whether from the pre-flight or from a `refused` result, exactly one
-`reason_code` means *"not mine — you pay it"*:
+Every result — pre-flight or dispatch — carries `payout_owner`, one of three
+values, and `caller_must_pay`, a bool.
 
-- **`not_a_shopify_order`** → no Sales Order, or no `shopify_order_id` on it.
-  Shopify has no claim. Pay via Cashfree as today. (`owns_payout` is false.)
+| `payout_owner` | `caller_must_pay` | meaning | your move |
+|---|---|---|---|
+| `caller` | **true** | not a Shopify order | pay via Cashfree as today |
+| `shopify` | false | Shopify's payout — possibly already made | never pay it yourself |
+| `unknown` | false | could not be determined | never pay it yourself |
 
-**Every other `refused` code means "mine, and I cannot do it right now."** The
-toggle is off, credentials are missing, the store is unconfigured, the document
-is in the wrong state. Shopify owns the payout and cannot perform it. **Refuse
-both paths and surface the reason.** Falling back to Cashfree there is a
-double-payout waiting for whoever fixes the toggle and retries.
+**Branch on `caller_must_pay`, and only on that.** It is a *positive* assertion
+of the one dangerous action, so anything unknown, unrecognised, or added in a
+later version defaults to the safe direction on its own.
 
-`owns_payout: true, can_write_back: false` is that case, expressed as two
-booleans so the gate does not have to reason about the code list.
+The invariant, which `tests/test_refund_contract.py` pins by enumerating the
+whole vocabulary:
+
+```
+payout_owner == "caller"   <=>   reason_code == "not_a_shopify_order"
+```
+
+Exactly one code puts the payout on you. **Every other `refused` code means
+"mine, and I cannot do it right now"** — the toggle is off, credentials are
+missing, the store is unconfigured, the document is in the wrong state, or it
+was refunded in Shopify already. Shopify owns the payout. **Refuse both paths
+and surface the reason.** Falling back to Cashfree there is a double-payout
+waiting for whoever fixes the cause and retries.
+
+`payout_owner: "unknown"` means this app could not read what deciding it needs —
+it is not installed, the document does not exist, or the caller lacked
+permission. It is deliberately *not* `caller`: answering "not mine" without
+having looked is what version 1 did wrong.
+
+#### Do not use `owns_payout` as a boolean
+
+It is kept for a caller already reading it, and it is now three-state: `true`,
+`false`, or **`null`** when undeterminable. `if not owns_payout` is therefore
+**not** a safe test — `null` is falsy, and that branch pays a customer whose
+refund may already have been paid. Use `caller_must_pay`.
+
+#### `is_shopify` is a UI flag
+
+It is `true` only when ownership was determined as Shopify's. It no longer goes
+`false` merely because a guard returned early — `shopify_order_id` and
+`shopify_store` are now populated on every path that can see them — but
+`payout_owner` is the field to route on.
 
 ## 4. The result dict
 
@@ -174,6 +214,10 @@ version 1; none will be removed or change meaning.
   "retry_safe":     bool,   # true for exactly one outcome: failed_unsent
   "possibly_paid":  bool,   # true for paid AND failed_unknown
 
+  "payout_owner":    "shopify" | "caller" | "unknown",   # see §3
+  "caller_must_pay": bool,   # THE routing flag; true only for not_a_shopify_order
+  "owns_payout":     True | False | None,                # diagnostic; see §3
+
   "message":     "<human sentence, safe to show a user>",
   "amount":      12999.0,   # net_refund_amount as understood here
   "refund_gid":  "gid://shopify/Refund/123",   # set only when outcome == "paid"
@@ -184,9 +228,11 @@ version 1; none will be removed or change meaning.
 }
 ```
 
-`get_refund_writeback_status` (§3) returns the pre-flight shape instead:
-`owns_payout`, `can_write_back`, `reason_code` and the recorded state. It never
-returns an `outcome`, because nothing has happened yet.
+`get_refund_writeback_status` (§3) returns the same three routing keys plus
+`is_shopify`, `can_write_back`, `reason`, `reason_code`, `amount`,
+`shopify_order_id`, `shopify_store`, `status`, `refund_gid`, `gateway`,
+`written_back_at` and `error`. It never returns an `outcome`, because nothing
+has happened yet.
 
 ### `retry_safe` and `possibly_paid` are redundant on purpose
 
@@ -299,7 +345,7 @@ any time.
 | `reason_code` | meaning |
 |---|---|
 | `already_paid` | `shopify_refund_gid` is set; `refund_gid` returned |
-| `not_a_shopify_order` | no Sales Order, or no `shopify_order_id` on it. **The only code meaning "not mine, you pay it"** — see section 3 |
+| `not_a_shopify_order` | no Sales Order, or no `shopify_order_id` on it. **The only code with `caller_must_pay: true`** — see section 3 |
 | `channel_is_manual_portal_refund` | refunded in Shopify already |
 | `wrong_refund_status` | Refund Request is not `Completed` |
 | `not_submitted` | docstatus is not 1 |
@@ -332,6 +378,15 @@ any time.
 | `unverified_previous_attempt` | an earlier attempt is still unresolved |
 
 **With `outcome: "in_progress"`**: `claimed_elsewhere`.
+
+### Ownership per code
+
+`caller_must_pay` is true for `not_a_shopify_order` and nothing else.
+`payout_owner` is `unknown` for `not_installed`, `refund_request_missing` and
+`no_permission` — the three refusals that happen before this app can read enough
+to decide. Every other code above is `shopify`, including all the
+`failed_unsent` and `failed_unknown` ones: a refund that failed to send is still
+Shopify's to pay.
 
 ---
 
@@ -400,6 +455,36 @@ So the other side can rely on it rather than defend against it:
    still needs the user's hands. Do not enable the toggle to run it.
 
 ## 10. Changes on this side that this document reflects
+
+### Version 2 — the routing fix (2026-09-04, after the `electrobotictest` deploy)
+
+Three live calls returned the same `owns_payout` with opposite meanings:
+`not_a_shopify_order`, and two `channel_is_manual_portal_refund` — the latter
+being refunds Shopify had already paid. All three said `owns_payout: false`.
+
+Cause: ownership was derived from `shopify_order_id`, but the channel, status,
+docstatus and amount guards all returned *before* the Sales Order was looked up.
+A blank order id there meant "never looked", and was reported as "not a Shopify
+order". The same defect made `is_shopify` false for `NG-SO2627-1022` and
+`NG-SO2627-2160`, which are both Shopify orders.
+
+Fixed by settling ownership **before any guard that can return**, which required
+reordering: the ownership check now runs second, immediately after the
+idempotency guard. Guard order is load-bearing for the invariant — leave the
+ownership test after `nothing_to_refund` and a zero-amount non-Shopify refund
+comes back `caller`-owned with the wrong `reason_code`, breaking the
+biconditional again.
+
+Also: a stored `shopify_refund_gid` now settles ownership on its own, so a refund
+Shopify demonstrably paid stays Shopify's even if its Sales Order was later
+amended and lost the order id.
+
+`caller_must_pay` was added because the underlying mistake was shape, not just
+data: a bool that must never be read with `not` is a trap, and the natural
+idiom — `if not owns_payout: pay()` — silently did the wrong thing for every
+undeterminable case. A positive flag for the dangerous action fails safe.
+
+### Version 1
 
 Written while specifying §5, because the contract would otherwise have promised
 something the code could not do:
