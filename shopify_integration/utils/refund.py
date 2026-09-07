@@ -35,14 +35,22 @@ pays the customer twice.  The split is by order origin: a refund whose Sales Ord
 carries a shopify_order_id is Shopify's payout, and a payment-link or direct
 Cashfree payment stays with the Cashfree API.
 
-That refusing gate lives in payment_portals (portal_channel_blocked, third gate,
-commit 1ed0e8b) and is not this app's to write.  Note what it does and does not
-do: it **refuses** a Payment Portal refund on a Shopify order, pointing the
-reader at Manual Portal Refund.  It does not delegate to this module, and no
-dispatcher exists yet — so the only thing that calls write_back_refund is
-writeback_now, the whitelisted endpoint behind the form button.  See
-REFUND-DISPATCH-CONTRACT.md for the handshake that would change that, and for
-why write_back_refund itself is deliberately not whitelisted.
+That routing gate lives in payment_portals (portal_channel_blocked) and is not
+this app's to write.  It still refuses a *Payment Portal* refund on a Shopify
+order; what changed in 3bc6164 is that it now points the reader at the new
+"Shopify" refund channel, which delegates here, instead of at a manual refund in
+the Shopify admin.
+
+Two callers reach write_back_refund, and both are deliberate:
+
+  * payment_portals' send step, through the refund_payout_dispatchers hook
+    registered in hooks.py.  It arrives with status Queued.
+  * writeback_now, the whitelisted endpoint behind the form button.  It arrives
+    with status Approved.
+
+write_back_refund itself is NOT whitelisted, so registering the hook opened no
+HTTP door — a payout one call away from anyone logged in is exactly what that
+protects against.  See REFUND-DISPATCH-CONTRACT.md §2 and §2b.
 
 Snapmint needs no guard here.  The discriminator is not visible in the
 transaction nodes — OCC and Snapmint orders both read "manual" — and it does not
@@ -98,7 +106,19 @@ REFUND_REQUEST = "Refund Request"
 #    a caller payment_portals had authorised could still be refused here, and
 #    the resulting "unknown" left neither app willing to pay.  Authorisation now
 #    belongs to the caller; writeback_now still guards the HTTP door.
-CONTRACT_VERSION = 3
+# 4: the state this accepts is inverted.  Until now it demanded status
+#    "Completed" — booked and paid — on the reasoning "Shopify is told once
+#    ERPNext has booked the refund, not before".  That is write-back ordering and
+#    it contradicts §0 of this app's own contract: a successful refundCreate PAYS
+#    the customer.  payment_portals sets Completed only when the Payment Entry is
+#    posted, so book-then-call paid the customer AFTER ERPNext had recorded
+#    paying them.  Dispatch now runs at Approved/Queued on the new "Shopify"
+#    refund channel, mirroring the Cashfree send path in that app, and the gate
+#    is a positive allow-list on the channel — which also closes a hazard the old
+#    one left open (a Bank Transfer refund on a Shopify order was accepted, and
+#    writing that back pays a NEFT refund a second time through the OCC bridge).
+#    Two new refused codes: channel_does_not_dispatch, already_booked.
+CONTRACT_VERSION = 4
 
 # Refund Request state fields, created by this app as Custom Fields.
 REFUND_GID_FIELD      = "shopify_refund_gid"
@@ -166,7 +186,17 @@ REASON_CODES = {
         "already_paid",
         "not_a_shopify_order",
         "channel_is_manual_portal_refund",
+        # The channel pays this refund some other way — Cashfree's own API, or a
+        # bank transfer — so telling Shopify to pay it as well pays the customer
+        # twice.  Distinct from channel_is_manual_portal_refund, which means
+        # Shopify has already paid it.
+        "channel_does_not_dispatch",
         "wrong_refund_status",
+        # Completed with a Payment Entry: ERPNext has booked this refund, so a
+        # payout now would land after its own record.  Its own code because a
+        # booking with no GID means something paid it outside this flow, which
+        # is a person's problem and not a status to correct.
+        "already_booked",
         "not_submitted",
         "nothing_to_refund",
         "writeback_unavailable_for_store",
@@ -196,13 +226,41 @@ REASON_CODES = {
     OUTCOME_IN_PROGRESS: frozenset({"claimed_elsewhere"}),
 }
 
-# The Refund Request status that means booked and paid.  Only then is ERPNext
-# sure enough to tell Shopify.
-REFUND_BOOKED_STATUS = "Completed"
+# ── Which refund this app may pay, and in what state ────────────────────────
+#
+# The one refund channel that dispatches a payout through Shopify.  Added to
+# payment_portals in 3bc6164 precisely so the dispatch case is identifiable
+# without inference: before it, a Payment Portal refund on a Shopify-backed
+# order was simply refused and a person was told to go and refund it by hand.
+#
+# An ALLOW-LIST rather than a set of exclusions, and for the same reason
+# caller_must_pay is a positive flag: the dangerous action needs a positive
+# assertion, so an unrecognised channel — including one a later payment_portals
+# adds — refuses on its own instead of paying.  The old gate excluded only
+# CHANNEL_FROM_SHOPIFY, which left Bank Transfer accepted: money already sent by
+# NEFT, written back to Shopify, paid a second time through the OCC bridge.
+CHANNEL_DISPATCH = "Shopify"
 
 # A refund that came *from* Shopify is already recorded there; writing it back
-# would duplicate it.
+# would duplicate it.  NOT the same as CHANNEL_DISPATCH and the two must never be
+# conflated: this one records a refund Shopify made, that one asks Shopify to
+# make one.
 CHANNEL_FROM_SHOPIFY = "Manual Portal Refund"
+
+# The Refund Request statuses a payout may be dispatched from.
+#
+# Both, and only both.  `Approved` is payment_portals' SENDABLE_STATUSES in full
+# — what a person sees on the form and what a refusal returns the document to —
+# and `Queued` is what send_refund_to_portal commits before enqueueing the job,
+# so a dispatched payout arrives here on Queued and never on Approved.  Omitting
+# either breaks one of the two callers.
+#
+# Everything else refuses, including:
+#   Processing  a call has already gone out; a GID or an Unverified row is the
+#               record of it, and a second send is a second payout
+#   Failed      not re-sendable in payment_portals either
+#   Completed   ERPNext has already booked it — see already_booked
+DISPATCHABLE_STATUSES = frozenset({"Approved", "Queued"})
 
 # Transaction kinds a refund can attach itself to.  An AUTHORIZATION has taken
 # no money, a VOID has given it back already, and a REFUND row is the result of
@@ -713,6 +771,11 @@ def check_eligibility(refund_name: str) -> dict:
     row = frappe.db.get_value(
         REFUND_REQUEST, refund_name,
         ["docstatus", "status", "refund_channel", "sales_order",
+         # Read to tell "not booked yet" from "booked already", which are
+         # opposite answers on a Completed row — see already_booked.  A field
+         # payment_portals owns; it has existed on Refund Request since the
+         # doctype did, so it needs no capability probe.
+         "payment_entry",
          "net_refund_amount", "reason_note",
          REFUND_GID_FIELD, WRITEBACK_STATUS_FIELD],
         as_dict=True,
@@ -784,20 +847,62 @@ def check_eligibility(refund_name: str) -> dict:
         out["reason"] = "Only a submitted Refund Request is written back."
         return out
 
-    if (row.get("status") or "") != REFUND_BOOKED_STATUS:
-        out["reason_code"] = "wrong_refund_status"
-        out["reason"] = (
-            f"Refund status is '{row.get('status') or 'blank'}', not "
-            f"'{REFUND_BOOKED_STATUS}' — Shopify is told once ERPNext has booked "
-            f"and paid the refund, not before."
-        )
-        return out
+    # ── The channel, before the status ──────────────────────────────────────
+    #
+    # Judged first because it is the more informative refusal: a Bank Transfer
+    # refund is not dispatchable in ANY status, so complaining about the status
+    # would name the wrong problem and send somebody off to change a field that
+    # would not help.
+    channel = (row.get("refund_channel") or "").strip()
 
-    if (row.get("refund_channel") or "") == CHANNEL_FROM_SHOPIFY:
+    if channel == CHANNEL_FROM_SHOPIFY:
         out["reason_code"] = "channel_is_manual_portal_refund"
         out["reason"] = (
             f"Refund channel is '{CHANNEL_FROM_SHOPIFY}' — this refund was made "
             f"in Shopify already, so writing it back would refund it twice."
+        )
+        return out
+
+    if channel != CHANNEL_DISPATCH:
+        out["reason_code"] = "channel_does_not_dispatch"
+        out["reason"] = (
+            f"Refund channel is '{channel or 'blank'}', not '{CHANNEL_DISPATCH}' "
+            f"— that channel pays the customer by another route, so asking "
+            f"Shopify to pay as well would refund them twice. Only a "
+            f"'{CHANNEL_DISPATCH}' refund is dispatched here."
+        )
+        return out
+
+    # ── The state, which is BEFORE the booking and not after it ─────────────
+    #
+    # See CONTRACT_VERSION 4.  A successful refundCreate pays the customer, so
+    # the accepted state has to be the one that precedes ERPNext's own record of
+    # the payment.
+    status = (row.get("status") or "").strip()
+    if status not in DISPATCHABLE_STATUSES:
+        booked = str(row.get("payment_entry") or "").strip()
+        if status == "Completed" and booked:
+            # Its own code, and not a status complaint: this is either a payout
+            # about to land after its own booking, or — since no GID is set,
+            # which the guard above would have caught — a refund something paid
+            # outside this flow.  Both need a person, neither needs a field
+            # changed.
+            out["reason_code"] = "already_booked"
+            out["reason"] = (
+                f"ERPNext has already booked this refund as {booked}, and no "
+                f"Shopify refund is recorded against it. Paying it now would "
+                f"pay the customer after the books said they were paid. Check "
+                f"what settled this refund before sending anything."
+            )
+            return out
+
+        out["reason_code"] = "wrong_refund_status"
+        out["reason"] = (
+            f"Refund status is '{status or 'blank'}', and a refund is dispatched "
+            f"to Shopify from "
+            f"{' or '.join(sorted(DISPATCHABLE_STATUSES))} — the payout happens "
+            f"before ERPNext books it, because a successful Shopify refund is "
+            f"what pays the customer."
         )
         return out
 

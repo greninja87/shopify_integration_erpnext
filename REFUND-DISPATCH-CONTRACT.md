@@ -1,7 +1,8 @@
 # Refund dispatch contract — `payment_portals` → `shopify_integration`
 
-**Version 3.** Written 2026-09-04 by the `shopify_integration` side, at the
+**Version 4.** Written 2026-09-04 by the `shopify_integration` side, at the
 request of the `payment_portals` session, as the interface to build against.
+Revised 2026-09-07.
 
 > **Version 2 corrects a routing bug found on `electrobotictest`, and changes
 > the meaning of `owns_payout`.** Version 1 derived it from `shopify_order_id`,
@@ -10,6 +11,18 @@ request of the `payment_portals` session, as the interface to build against.
 > Portal Refund Shopify had **already paid**. A gate branching on it would have
 > paid that customer a second time. If you integrated against version 1, read
 > §3 again: branch on **`caller_must_pay`**, not on `owns_payout`.
+>
+> **Version 4 inverts the state this app accepts, and it is the change most
+> likely to surprise an integrator.** Versions 1–3 required the Refund Request
+> to be `Completed` — booked and paid — on the reasoning "Shopify is told once
+> ERPNext has booked the refund, not before". That is *write-back* ordering, and
+> it contradicts §0 of this very document: a successful `refundCreate` **pays
+> the customer**. `payment_portals` sets `Completed` only when the Payment Entry
+> is posted, so book-then-call paid the customer *after* the books said they
+> were paid. Dispatch now runs from **`Approved` or `Queued`** on the new
+> **`Shopify`** refund channel, and the gate is a positive allow-list on that
+> channel. Two new refused codes, `channel_does_not_dispatch` and
+> `already_booked`. See §2b and §10.
 >
 > **Version 3 removes the `no_permission` refusal, and the permission check that
 > produced it.** It deadlocked: `payment_portals` authorises on `PAYOUT_ROLES`,
@@ -38,17 +51,22 @@ it is the case this contract exists to make un-ignorable.
 
 ### Current state, so nothing is assumed
 
-- `payment_portals` `1ed0e8b` added the §2a routing gate. It **refuses** a
-  Payment Portal refund whose Sales Order carries a `shopify_order_id`. It does
-  not delegate.
-- No dispatcher exists on either side. Today the only caller of
-  `write_back_refund` is `writeback_now`, the whitelisted endpoint behind the
-  Refund Request form button.
-- `enable_refund_writeback` is **off** on every store and must stay off until
-  both this handshake and the credit-note guard are in place.
-
-This document describes what `shopify_integration` will accept **when** a
-dispatcher is built. Nothing here is wired up yet.
+- `payment_portals` `3bc6164` added a fourth refund channel, **`Shopify`**, and
+  built the whole calling side: `actions/refund_dispatch.py` resolves the hook,
+  refuses on zero registered and on more than one, and reads the result dict
+  through the frappe-free readings in `services/refund_dispatch_rules.py`. A
+  `Payment Portal` refund on a Shopify-backed order is still refused there — it
+  is the `Shopify` channel that dispatches.
+- **The dispatcher IS now registered on this side** (`hooks.py`,
+  `refund_payout_dispatchers`), as of contract version 4. Before that nothing was
+  registered and every `Shopify`-channel refund refused with "No refund
+  dispatcher is registered".
+- `write_back_refund` is still **not whitelisted**, so registering it did not
+  open an HTTP door. The door is `writeback_now`, behind the Refund Request form
+  button, and it checks submit permission.
+- `enable_refund_writeback` is **off** on every store, and that is now the only
+  switch in front of a real payout. The credit-note guard is in place; the
+  `payment_portals` routing guard is in place. What remains unproven is §9.5.
 
 ---
 
@@ -190,6 +208,63 @@ it disagreed with `net_refund_amount`, there would be no defensible answer to
 "which one do we pay", and picking either is how the wrong number leaves the
 building. If you want a cross-check rather than a source, see §9.
 
+## 2b. The state this app accepts, and why it is not the booked one
+
+**New in version 4, and it replaces the rule versions 1–3 stated.**
+
+| the Refund Request must have | value |
+|---|---|
+| `refund_channel` | **`Shopify`** — exactly that, nothing else |
+| `status` | **`Approved`** or **`Queued`** |
+| `docstatus` | `1` |
+| `shopify_refund_gid` | blank |
+| `shopify_writeback_status` | not `Unverified` |
+
+### Why `Approved`, and not `Completed`
+
+Because of §0, and it took a contradiction to see it. A successful
+`refundCreate` **is the payout**. `Completed` is set in exactly one place in
+`payment_portals` — `_record_on_refund`, when the refund's Payment Entry is
+posted. So requiring `Completed` meant: book the refund, *then* ask Shopify to
+pay it, and the customer is paid after the books already said they were. On a
+Cashfree-OCC order both halves of that are true and together they cannot both be
+right.
+
+The correct order is the one the Cashfree send path in your own app already
+uses:
+
+```
+approve  ->  dispatch to Shopify  ->  money moves  ->  THEN book in ERPNext
+```
+
+`Queued` is in the set because `send_refund_to_portal` commits `Queued` and then
+enqueues the job, so a **dispatched** payout arrives here on `Queued` and never
+on `Approved`. `Approved` is in it because that is what a person sees on the
+form, and what a refusal returns the document to — `SENDABLE_STATUSES` is
+`Approved` alone.
+
+### Why the channel is an allow-list
+
+`caller_must_pay` is a positive flag because the natural idiom around a negative
+one silently did the dangerous thing. The channel gate is an allow-list for the
+same reason. The old gate excluded only `Manual Portal Refund`, which left
+**`Bank Transfer` accepted** — money already sent by NEFT, written back to
+Shopify, and paid a second time through the OCC bridge. #6518's ₹12,999 is that
+shape. A channel this app does not recognise — including one a later
+`payment_portals` adds — now refuses on its own.
+
+The channel is judged **before** the status, deliberately: a `Bank Transfer`
+refund is undispatchable in every status, so a status complaint would name the
+wrong problem and send somebody to change a field that would not help.
+
+### What did not change
+
+Ownership is still settled **second**, immediately after the idempotency guard
+and before both new refusals. That ordering is what makes the §3 biconditional
+hold, and `tests/test_refund_dispatch_gate.py` pins it from this side too: a
+non-Shopify order on an undispatchable channel still comes back
+`not_a_shopify_order` with `caller_must_pay: true`.
+
 ### No idempotency token
 
 Deliberately absent. **The document is the idempotency key.** Once Shopify
@@ -277,7 +352,7 @@ a version bump; none will be removed or change meaning without one.
 ```python
 {
   "provider":         "shopify",       # which app answered
-  "contract_version": 3,
+  "contract_version": 4,
 
   "outcome":     "paid" | "refused" | "failed_unsent" | "failed_unknown" | "in_progress",
   "reason_code": "<stable slug, see §6>",
@@ -426,7 +501,9 @@ any time.
 | `already_paid` | `shopify_refund_gid` is set; `refund_gid` returned |
 | `not_a_shopify_order` | no Sales Order, or no `shopify_order_id` on it. **The only code with `caller_must_pay: true`** — see section 3 |
 | `channel_is_manual_portal_refund` | refunded in Shopify already |
-| `wrong_refund_status` | Refund Request is not `Completed` |
+| `channel_does_not_dispatch` | `refund_channel` is not `Shopify` (and not `Manual Portal Refund`, which has its own code). That channel pays the customer by another route — Cashfree's own API, or a bank transfer — so a Shopify refund on top pays them twice. **New in version 4** |
+| `wrong_refund_status` | Refund Request status is not `Approved` or `Queued`. **Inverted in version 4** — it used to mean "not `Completed`" |
+| `already_booked` | status is `Completed` **and** a `payment_entry` is set: ERPNext has booked this refund and no Shopify refund is recorded against it, so either a payout would land after its own record or something settled it outside this flow. Needs a person, not a corrected field. **New in version 4** |
 | `not_submitted` | docstatus is not 1 |
 | `nothing_to_refund` | `net_refund_amount <= 0` |
 | `writeback_unavailable_for_store` | no enabled Shopify Settings with the toggle on |
@@ -459,7 +536,12 @@ any time.
 
 ### Ownership per code
 
-`caller_must_pay` is true for `not_a_shopify_order` and nothing else.
+`caller_must_pay` is true for `not_a_shopify_order` and nothing else — the two
+codes version 4 adds are both `shopify`. That is worth one sentence, because
+`channel_does_not_dispatch` can read like "somebody else's": it means the refund
+is Shopify's order but is paid by another route, *not* that you should pay it
+through Cashfree. Paying it there is the double refund.
+
 `payout_owner` is `unknown` for exactly two codes — `not_installed` and
 `refund_request_missing` — the refusals that happen before this app can read
 enough to decide. Every other code above is `shopify`, including all the
@@ -517,9 +599,9 @@ So the other side can rely on it rather than defend against it:
 
 ## 9. Open, and blocking
 
-1. **Confirm the hook name `refund_payout_dispatchers`.** Nothing is registered
-   on this side until you do — it is a one-line `hooks.py` addition and no other
-   code. If you prefer another name, say it and I will register under that.
+1. ~~**Confirm the hook name `refund_payout_dispatchers`.**~~ **Confirmed and
+   registered, version 4.** One line in `hooks.py`, and a test refuses to let a
+   second entry land beside it. Nothing else on this side changed for it.
 2. **`expected_amount` is not implemented yet, and must not ship without its
    acknowledgement.** Raised from the `payment_portals` side, and correctly: as
    originally specified it was unsafe. Sending it to a version that does not
@@ -558,16 +640,61 @@ So the other side can rely on it rather than defend against it:
    and neither is emitted today. Everything else in §6 is. Say the word and I
    will build the pair together — a test already refuses to let the parameter
    land without the acknowledgement.
-3. **Guard against two dispatchers.** Registration is `hooks.py`, so a second
-   app — or a duplicated entry — silently doubles the payout. The check belongs
-   on your side because you are the one iterating the list; the snippet in §2
-   refuses rather than picking.
+3. ~~**Guard against two dispatchers.**~~ **Done on both sides.**
+   `actions/refund_dispatch._dispatcher` refuses on a list longer than one
+   rather than picking, and on this side a test parses `hooks.py` and asserts the
+   list has exactly one entry — so a duplicate is caught at test time rather than
+   at payout time.
 4. `order.transactions` shape still needs one live response (see
    `REFUND-WRITEBACK-BRIEF.md` §4). Does not block this interface.
-5. `REFUND-WRITEBACK-BRIEF.md` §10 step 2 — the already-refunded-order probe —
-   still needs the user's hands. Do not enable the toggle to run it.
+5. **The one assumption the whole feature rests on is still unproven: nobody
+   has confirmed the Cashfree-OCC bridge fires for an API-created refund.** It is
+   proven for a refund made *by hand* in the Shopify admin — `#6491` marked
+   refunded 31 Aug 5:02 pm, Cashfree refund `144073385` for the same ₹46,952.16
+   at 17:02:59 the same day. Whether the bridge reacts the same way to
+   `refundCreate` over the Admin API is assumed, and the failure direction is the
+   worst one available: this app would report `paid`, `payment_portals` would
+   book it, and no money would have moved. Prove it on one low-value real order
+   before this is enabled on anything else, and note that
+   `REFUND-WRITEBACK-BRIEF.md` §10 step 2 **cannot** prove it — the headroom
+   guard refuses before the mutation, so the safe probe never posts one.
 
 ## 10. Changes on this side that this document reflects
+
+### Version 4 — dispatch at `Approved`, and an allow-list on the channel (2026-09-07)
+
+Asked for from the `payment_portals` side after it built the whole calling half
+in `3bc6164`, and it is the right call.
+
+**The contradiction.** §0 has said since version 1 that a successful
+`refundCreate` pays the customer. The gate said Shopify is told "once ERPNext has
+booked and paid the refund, not before". Both sentences were in this document at
+the same time and they cannot both hold: `Completed` means the Payment Entry is
+posted, so the sequence was book → call → *then* the money moves. Nobody had put
+the two next to each other, and the toggle being `0` everywhere is what kept it
+theoretical.
+
+**The fix** is to dispatch from `Approved`/`Queued` on the new `Shopify` channel
+— which is symmetry with the Cashfree send path rather than a new idea — and to
+make the channel test an allow-list. See §2b.
+
+**A hazard closed on the way.** The old gate's only channel exclusion was
+`Manual Portal Refund`, so a `Bank Transfer` refund on a Shopify order passed
+both tests and the form button would have written it back. That is a NEFT refund
+paid a second time by the OCC bridge. It was never reachable in practice —
+`enable_refund_writeback` has been `0` on every store — but it was one checkbox
+away, and it is the reason the gate is positive now rather than one exclusion
+longer.
+
+**`already_booked` is separate from `wrong_refund_status` on purpose.** A
+`Completed` row with a Payment Entry and no GID is not a status to correct; it is
+a refund something settled outside this flow, and the message has to send a
+person to find out what rather than to change a field.
+
+**The dispatcher is registered.** One line in `hooks.py`, and a test refuses to
+let a second entry land there — `frappe.get_hooks` returns a list, and two
+dispatchers for one payout is two payouts. Registering it did **not** whitelist
+`write_back_refund`; a test asserts that too.
 
 ### Post-review fixes (2026-09-04), no version bump
 

@@ -541,7 +541,7 @@ def create_refund_request_writeback_custom_fields():
         "fieldtype":    "Section Break",
         "insert_after": _refund_request_anchor(),
         "collapsible":  1,
-        "description":  "What this app told Shopify about this refund. Populated automatically once the refund is Completed, and only for refunds against a Shopify order. A <b>Done</b> here is a payment instruction Shopify accepted, not merely a record of one.",
+        "description":  "What this app told Shopify about this refund. Only ever populated for a refund on the <b>Shopify</b> channel, against a Shopify order &mdash; and only when somebody sends it, either from the Send step or the <b>Refund in Shopify</b> button. A <b>Done</b> here is a payment instruction Shopify accepted, not merely a record of one: the Cashfree-OCC app turns it into a real Cashfree refund, so it is what pays the customer. That is why it happens before ERPNext books the refund, not after.",
     })
     create_or_update_custom_field(doctype, {
         "fieldname":       "shopify_writeback_status",

@@ -1,6 +1,6 @@
 # Refund write-back — handoff
 
-State at `de01e54` (2026-09-04). `main`, clean, pushed. **501 tests passing.**
+State at 2026-09-07, contract **version 4**. `main`, clean. **586 tests passing.**
 
 ```bash
 python -m pytest shopify_integration/tests -q
@@ -11,9 +11,11 @@ Three documents carry the reasoning; this file is only the map.
 - **`REFUND-WRITEBACK-BRIEF.md`** — why the feature exists, the Shopify evidence,
   the GraphQL shapes. Read §1 first: an earlier draft claimed this cannot move
   money and was wrong. §10 step 2 now carries a **correction** — see below.
-- **`REFUND-DISPATCH-CONTRACT.md`** — contract **v3**, the interface
+- **`REFUND-DISPATCH-CONTRACT.md`** — contract **v4**, the interface
   `payment_portals` builds against for the **payout** (ERPNext → Shopify, moves
-  money). §3 (routing) and §5 (failure states) are the load-bearing parts.
+  money). §3 (routing), §5 (failure states) and **§2b (the state this app
+  accepts)** are the load-bearing parts. §2b is new in v4 and it inverted the
+  old gate — read it before assuming a `Completed` refund is dispatchable.
 - **`REFUND-REPORT-CONTRACT.md`** — contract **v1**, the interface for the
   **report** (Shopify → ERPNext, moves nothing). §2 is the load-bearing part:
   this app never concludes a settlement channel.
@@ -27,7 +29,7 @@ once:
 |---|---|---|
 | direction | ERPNext → Shopify | Shopify → ERPNext |
 | **pays a customer** | **yes, on success** | never — no mutation on any path |
-| hook | `refund_payout_dispatchers` (unregistered) | `shopify_refund_observers` (unregistered) |
+| hook | `refund_payout_dispatchers` (**registered**, v4) | `shopify_refund_observers` (unregistered) |
 | gated on `enable_refund_writeback` | yes, and it is `0` | **no, deliberately** |
 | worst failure | a customer paid twice | a refund ERPNext never hears about |
 
@@ -45,11 +47,14 @@ Cashfree); **`#6518` has none, and never will.**
 |---|---|
 | `enable_refund_writeback` | `0` on both stores |
 | `doc_events` for Refund Request | none |
-| `refund_payout_dispatchers` | not registered |
-| only trigger | the **Refund in Shopify** button, via `writeback_now` |
+| `refund_payout_dispatchers` | **registered** (v4) |
+| triggers | the **Refund in Shopify** button via `writeback_now`, and `payment_portals`' Send step via the hook |
 
-Nothing sends a refund without a person pressing that button on a submitted,
-Completed Refund Request in a store whose toggle someone turned on.
+**The toggle is now the only switch in front of a real payout**, which it was
+not before v4 — the unregistered hook was a second one, by accident. Nothing
+sends a refund without a person acting on a submitted `Shopify`-channel refund in
+`Approved` or `Queued`, in a store whose toggle somebody turned on. There is
+still no `doc_events` and nothing automatic.
 
 ## Outstanding
 
@@ -58,10 +63,10 @@ Completed Refund Request in a store whose toggle someone turned on.
    `contract_version: 3` once both are in step.
 2. **`REFUND-WRITEBACK-BRIEF.md` §10 step 2** — the already-refunded-order probe.
    The only live exercise that cannot move money. Needs a person.
-3. **Confirm the hook name** `refund_payout_dispatchers`. One line in `hooks.py`
-   here, nothing else. Then `expected_amount` if the cross-check is wanted —
-   spec in contract §9.2, and a test refuses to let the parameter ship without
-   its acknowledgement.
+3. ~~Confirm the hook name~~ **done in v4** — registered, and a test holds it
+   to exactly one entry. `expected_amount` is still unbuilt if the cross-check is
+   wanted — spec in contract §9.2, and a test refuses to let the parameter ship
+   without its acknowledgement.
 
 4. **Confirm the report hook name** `shopify_refund_observers` and the
    `consumed`-enumeration acknowledgement — `REFUND-REPORT-CONTRACT.md` §8.
@@ -71,6 +76,15 @@ Also unresolved: `order.transactions` needs one live response to settle
 list-vs-connection. `transaction_nodes()` tolerates both meanwhile, and
 `order.refunds` on the backfill path has the same open question and the same
 tolerance.
+
+## The assumption to keep in front of you
+
+**Nobody has confirmed the Cashfree-OCC bridge fires for an API-created
+refund.** Proven for a refund made by hand in the admin; assumed for
+`refundCreate`. If it does not fire, this app reports `paid`, `payment_portals`
+books it, and no money moves — the books say paid and the customer is not. That
+is contract §9.5 and it is the reason the toggle stays `0` until one low-value
+real order has gone end to end.
 
 ## The §10 probe does not do what §10 said
 
@@ -102,6 +116,12 @@ the live transaction shapes. It just cannot clear the mutation.
 - **Guard order in `check_eligibility` is load-bearing.** Ownership is settled
   second, right after idempotency. Move it later and a zero-amount non-Shopify
   refund comes back caller-owned under the wrong code.
+- **The dispatchable state is `Approved`/`Queued`, not `Completed`.** Requiring
+  `Completed` meant booking the refund and *then* asking Shopify to pay it, which
+  on an OCC order pays the customer after the books said they were paid. And the
+  old channel test excluded only `Manual Portal Refund`, which left `Bank
+  Transfer` writable — a NEFT refund paid a second time by the bridge. The gate
+  is a positive allow-list now; do not turn it back into a list of exclusions.
 - **`Unverified` is committed *before* `refundCreate` is posted.** That is what
   makes a killed worker safe; the flag that used to classify the failure was a
   local and died with the process. A clean rejection moves the row back to

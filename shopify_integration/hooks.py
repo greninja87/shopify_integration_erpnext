@@ -94,3 +94,24 @@ scheduler_events = {
 # Whitelisted API endpoint for Shopify webhooks
 # Accessed via: /api/method/shopify_integration.api.shopify_webhook
 # ----------------------------------------------------------
+
+# ----------------------------------------------------------
+# Refund payout dispatcher
+# ----------------------------------------------------------
+# payment_portals resolves this hook at the send step of a "Shopify" channel
+# refund and delegates the payout to whatever is registered.  Nothing registered
+# means it REFUSES rather than falling back to the Cashfree API, because a
+# Shopify-backed order refunded through Cashfree pays the customer twice.
+#
+# The target is deliberately NOT whitelisted: a successful refundCreate pays a
+# customer, and whitelisting it would put that one HTTP call away from anyone
+# logged in.  frappe.call resolves a dotted path through frappe.get_attr and does
+# not require a whitelist, so the in-process hook path works without one.  The
+# HTTP door is writeback_now, which does check submit permission.
+#
+# EXACTLY ONE entry.  frappe.get_hooks returns a list and two dispatchers for one
+# payout is two payouts; the caller refuses on a longer list, and
+# tests/test_refund_dispatch_gate.py refuses to let a second one land here.
+#
+# See REFUND-DISPATCH-CONTRACT.md §2.
+refund_payout_dispatchers = ["shopify_integration.utils.refund.write_back_refund"]

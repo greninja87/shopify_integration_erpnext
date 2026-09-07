@@ -119,8 +119,14 @@ class WritebackTestCase(unittest.TestCase):
         frappe_stub.set_doc(r.REFUND_REQUEST, REFUND, {
             "name": REFUND,
             "docstatus": 1,
-            "status": "Completed",
-            "refund_channel": "Payment Portal",
+            # A refund payment_portals has authorised and not yet booked, on the
+            # channel that dispatches a payout.  Approved rather than Completed
+            # since CONTRACT_VERSION 4: refundCreate PAYS the customer, so the
+            # dispatchable state is the one before ERPNext records the payment,
+            # not after it.  See tests/test_refund_dispatch_gate.py.
+            "status": "Approved",
+            "refund_channel": r.CHANNEL_DISPATCH,
+            "payment_entry": "",
             "sales_order": "SO-0001",
             "net_refund_amount": 12999.0,
             "reason_note": "Damaged in transit",
@@ -499,8 +505,14 @@ class TestGuards(WritebackTestCase):
         self.set_field(refund_channel=r.CHANNEL_FROM_SHOPIFY)
         self.assertSkipped(r.write_back_refund(REFUND), "shopify")
 
-    def test_a_refund_that_is_not_completed_is_skipped(self):
-        for status in ("Draft", "Approved", "Queued", "Processing", "Failed", "Cancelled"):
+    def test_a_refund_in_an_undispatchable_status_is_skipped(self):
+        """Was `..._that_is_not_completed_...` until CONTRACT_VERSION 4, when the
+        gate inverted: `Approved` and `Queued` are now the states a payout is
+        dispatched from, and `Completed` is refused because ERPNext has by then
+        already recorded the payment.  The full sweep, including the
+        `already_booked` case and the channel allow-list, is in
+        tests/test_refund_dispatch_gate.py."""
+        for status in ("Draft", "Processing", "Failed", "Cancelled", "Completed"):
             self.seed()
             self.set_field(status=status)
             self.assertSkipped(r.write_back_refund(REFUND))

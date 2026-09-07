@@ -165,7 +165,10 @@ class TestOutcomeVocabulary(WritebackTestCase):
         cases = {
             "already_paid": {r.REFUND_GID_FIELD: REFUND_GID},
             "channel_is_manual_portal_refund": {"refund_channel": r.CHANNEL_FROM_SHOPIFY},
-            "wrong_refund_status": {"status": "Approved"},
+            "channel_does_not_dispatch": {"refund_channel": "Bank Transfer"},
+            "wrong_refund_status": {"status": "Completed"},
+            "already_booked": {"status": "Completed",
+                               "payment_entry": "ACC-PAY-0001"},
             "not_submitted": {"docstatus": 0},
             "nothing_to_refund": {"net_refund_amount": 0},
             "not_a_shopify_order": {"sales_order": ""},
@@ -398,6 +401,11 @@ EXPECTED_OWNER = {
     # right now; that does NOT make it somebody else's.
     "already_paid": r.OWNER_SHOPIFY,
     "channel_is_manual_portal_refund": r.OWNER_SHOPIFY,
+    # Shopify's order, paid by another route or already booked.  Neither is the
+    # caller's to pay through Cashfree, which is what caller_must_pay would
+    # invite -- so both sit on the Shopify side of the biconditional.
+    "channel_does_not_dispatch": r.OWNER_SHOPIFY,
+    "already_booked": r.OWNER_SHOPIFY,
     "wrong_refund_status": r.OWNER_SHOPIFY,
     "not_submitted": r.OWNER_SHOPIFY,
     "nothing_to_refund": r.OWNER_SHOPIFY,
@@ -520,7 +528,9 @@ class TestRoutingLive(WritebackTestCase):
 
     def test_the_order_id_is_populated_on_every_guard_that_can_see_it(self):
         for fields in ({"refund_channel": r.CHANNEL_FROM_SHOPIFY},
-                       {"status": "Approved"},
+                       {"refund_channel": "Bank Transfer"},
+                       {"status": "Completed"},
+                       {"status": "Completed", "payment_entry": "ACC-PAY-0001"},
                        {"docstatus": 0},
                        {"net_refund_amount": 0},
                        {r.WRITEBACK_STATUS_FIELD: r.STATUS_UNVERIFIED}):
@@ -578,7 +588,9 @@ class TestRoutingLive(WritebackTestCase):
     def test_routing_on_every_guard(self):
         cases = (
             {"refund_channel": r.CHANNEL_FROM_SHOPIFY},
-            {"status": "Approved"},
+            {"refund_channel": "Bank Transfer"},
+            {"status": "Completed"},
+            {"status": "Completed", "payment_entry": "ACC-PAY-0001"},
             {"docstatus": 0},
             {"net_refund_amount": 0},
             {"sales_order": ""},

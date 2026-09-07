@@ -340,6 +340,15 @@ def writeback_now(refund_name: str) -> dict        # whitelisted, for the retry 
 
 ## 6. Triggers and guards
 
+> **Settled 2026-09-07, contract version 4 — and this section was right while
+> the code was not.** The paragraph below argued that `Completed` is wrong for a
+> payout because it is set by booking. The shipped gate nevertheless required
+> `Completed` for three contract versions, so book-then-call was what the code
+> actually did. It is fixed: dispatch now runs from `Approved`/`Queued` on
+> `payment_portals`' new `Shopify` refund channel, and the dispatcher hook is
+> registered. `REFUND-DISPATCH-CONTRACT.md` §2b is the current statement of the
+> accepted state; the reasoning below is why.
+
 **The trigger changed with §1, and this is the part still needing the user's
 yes.** An earlier draft fired on `on_update_after_submit` when
 `status == "Completed"`. That was right for a write-back that only *recorded*
@@ -365,15 +374,24 @@ Those all live in `payment_portals`.
 
 So `write_back_refund(refund_name)` should be written as a **callable payout
 function returning a result dict** — which §5 already specifies — and *not*
-wired to `doc_events` yet. Build it, test it, expose it whitelisted, and leave
-the wiring until the `payment_portals` side of the interface exists. Everything
-else in this brief is unaffected.
+wired to `doc_events` yet. Build it, test it, and leave the wiring until the
+`payment_portals` side of the interface exists. Everything else in this brief is
+unaffected.
+
+*Done as described, with one correction: "expose it whitelisted" was wrong and
+was not followed.* `write_back_refund` pays a customer, so whitelisting it would
+put a payout one HTTP call away from anyone logged in. The whitelisted door is
+`writeback_now`, which checks submit permission; the hook path needs no
+whitelist because `frappe.call` resolves a dotted path through `frappe.get_attr`.
+There is still no `doc_events` entry and nothing automatic.
 
 **Guards, all of them:**
 
 | guard | why |
 |---|---|
-| `refund_channel == "Manual Portal Refund"` → **skip** | that refund came *from* Shopify already; writing it back duplicates it there |
+| `refund_channel != "Shopify"` → **skip** | an allow-list, added in contract v4. Every other channel pays the customer by another route, so a Shopify refund on top pays them twice — including `Bank Transfer`, which the original exclusion-based version of this table left writable |
+| `refund_channel == "Manual Portal Refund"` → **skip, with its own code** | that refund came *from* Shopify already; writing it back duplicates it there. Kept separate from the row above because the two send a reader to different places |
+| `status not in {"Approved", "Queued"}` → **skip** | the payout precedes the booking, per this section. `Completed` **with** a `payment_entry` gets its own code, `already_booked`: ERPNext has recorded a payment that no Shopify refund accounts for |
 | `shopify_refund_gid` already set → **skip** | idempotency; survives a retry, a requeue and an amended doc |
 | no `sales_order`, or no `shopify_order_id` on it → **skip** | not a Shopify order (payment links, direct Cashfree) |
 | store not resolvable, or its Shopify Settings disabled → **skip, loudly** | record it; do not fail silently |
