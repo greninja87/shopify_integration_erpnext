@@ -469,10 +469,46 @@ OCC bridge, real money. Treat every call as a payout.
 
 1. Ship with `enable_refund_writeback` **off**. Do not turn it on yourself.
 2. First live exercise: an order that is **already fully refunded** (e.g.
-   `#6518`, or `#6491`, both fully refunded). Shopify must refuse with a
-   `userErrors` about exceeding the refundable amount. That exercises
-   credentials, query, mutation and error handling, and it is the only step that
-   cannot move money. Confirm the refusal, then stop.
+   `#6518`, or `#6491`, both fully refunded). It cannot move money. Confirm the
+   refusal, then stop.
+
+   > **Corrected 2026-09-07.** This step used to claim Shopify "must refuse with
+   > a `userErrors` about exceeding the refundable amount", and that the probe
+   > therefore "exercises credentials, query, mutation and error handling". The
+   > second half was wrong, and the first never happens.
+   >
+   > **The mutation is never posted.** `plan_refund` finds no parent with
+   > headroom, returns `no_refundable_transactions`, and `write_back_refund`
+   > takes `fail_unsent` about thirty lines *above* `refundCreate`
+   > (`utils/refund.py`, the guard at the `plan["problem"]` branch versus
+   > `sent = True` further down). Shopify is never asked, so there are no
+   > `userErrors` to read, and the `Unverified`-before-post commit that makes a
+   > killed worker safe is not entered either.
+   >
+   > So the probe exercises **credentials, the `RefundTargets` query, this app's
+   > reading of a real order's transactions, and the refusal path** — and not
+   > the mutation, the `userErrors` handling, or `rejected_by_shopify`.
+   >
+   > **And there is no other order that would exercise them safely.** Asking for
+   > more than remains is refused as `insufficient_refundable`, also before the
+   > post. This app's headroom guard is strictly more conservative than
+   > Shopify's, so **every order on which `refundCreate` actually posts is one
+   > Shopify will accept — and a real customer gets paid.** `rejected_by_shopify`
+   > is reachable only through a genuine divergence between our arithmetic and
+   > Shopify's, which cannot be arranged deliberately.
+   >
+   > `tests/test_refund_writeback.py::TestTheSafeProbeNeverReachesTheMutation`
+   > pins all of this, and was mutation-checked: making `_headroom` always ample
+   > fails every one of those tests.
+   >
+   > What this changes downstream: `payment_portals`' handoff open items 1 and 2
+   > both rest on there being a safe live exercise of the mutation before the
+   > dispatcher is built. There is not. Either the dispatcher is built against
+   > an assumption that only a real payout can test, or the first real payout is
+   > chosen deliberately as the test — the user's call, on the user's order, per
+   > step 3. It is still worth running the probe: credentials and the live
+   > transaction shapes are the genuinely unknown parts, and
+   > `order.transactions` list-vs-connection is still unsettled.
 3. Everything past that point moves customer money and belongs to the user, not
    to you. Hand them §10 and let them choose the order and the moment. `#6601`
    has ₹27,000 of headroom — precisely the sort of order not to experiment on.

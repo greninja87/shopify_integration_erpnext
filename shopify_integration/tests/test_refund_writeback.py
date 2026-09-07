@@ -1126,5 +1126,109 @@ class TestCreditNoteLoopGuard(WritebackTestCase):
         )
 
 
+class TestTheSafeProbeNeverReachesTheMutation(WritebackTestCase):
+    """What the section 10 "safe probe" actually exercises.
+
+    REFUND-WRITEBACK-BRIEF.md section 10 step 2 proposed a first live exercise
+    against an already-fully-refunded order (#6518 or #6491), on the grounds
+    that Shopify "must refuse with a userErrors about exceeding the refundable
+    amount", and that this "exercises credentials, query, mutation and error
+    handling".
+
+    The first half is true and the second is not.  This app's own headroom guard
+    refuses first, before refundCreate is posted at all -- so the mutation and
+    the userErrors path are never entered, and neither is the Unverified
+    pre-commit that makes a killed worker safe.
+
+    That matters beyond documentation tidiness: the guard is strictly more
+    conservative than Shopify's, so any order on which refundCreate actually
+    posts is an order Shopify will accept -- and a real customer gets paid.
+    There is therefore no safe live exercise of the mutation, which is what both
+    open items in payment_portals' handoff assumed there was.
+    """
+
+    def fully_refunded_order(self):
+        """#6518 after its refund: a SALE parent with zero headroom left."""
+        return targets_response(transactions=[{
+            "id": "gid://shopify/OrderTransaction/99",
+            "kind": "SALE",
+            "status": "SUCCESS",
+            "gateway": "manual",
+            "formattedGateway": "Manual",
+            "amountSet": {"presentmentMoney": {"amount": "12999.00",
+                                               "currencyCode": "INR"}},
+            "maximumRefundableV2": {"amount": "0.00", "currencyCode": "INR"},
+            "parentTransaction": None,
+        }])
+
+    def test_an_already_refunded_order_is_refused_before_anything_is_sent(self):
+        self.responses = [self.fully_refunded_order()]
+        result = r.write_back_refund(REFUND)
+
+        self.assertEqual(result["outcome"], r.OUTCOME_FAILED_UNSENT)
+        self.assertEqual(result["reason_code"], "no_refundable_transactions")
+        self.assertTrue(result["retry_safe"])
+        self.assertFalse(result["possibly_paid"])
+
+    def test_exactly_one_graphql_call_is_made_and_it_is_the_query(self):
+        """The heart of the correction.  Two calls would mean the mutation went
+        out; one means the guard refused first."""
+        self.responses = [self.fully_refunded_order()]
+        r.write_back_refund(REFUND)
+
+        self.assertEqual(len(self.calls), 1,
+                         "the mutation was posted after all")
+        self.assertEqual(self.calls[0]["operation"], "RefundTargets")
+        self.assertNotIn("refundCreate", self.calls[0]["query"])
+
+    def test_the_row_never_enters_the_possibly_paid_state(self):
+        """Unverified is committed immediately before the post.  If the probe
+        reached the mutation this would be set, and clearing it needs a person."""
+        self.assertNotIn(
+            r.STATUS_UNVERIFIED,
+            [w[2].get(r.WRITEBACK_STATUS_FIELD)
+             for w in frappe_stub.WRITES if isinstance(w[2], dict)],
+        )
+        self.responses = [self.fully_refunded_order()]
+        r.write_back_refund(REFUND)
+
+        statuses = [w[2].get(r.WRITEBACK_STATUS_FIELD)
+                    for w in frappe_stub.WRITES if isinstance(w[2], dict)]
+        self.assertNotIn(r.STATUS_UNVERIFIED, statuses)
+        self.assertIn(r.STATUS_FAILED, statuses)
+
+    def test_a_partial_refund_short_of_headroom_is_also_refused_unsent(self):
+        """So the conclusion is not specific to a fully refunded order: asking
+        for more than remains never reaches the mutation either.  Every route to
+        refundCreate is a route Shopify accepts."""
+        self.responses = [targets_response(transactions=[{
+            "id": "gid://shopify/OrderTransaction/99",
+            "kind": "SALE", "status": "SUCCESS", "gateway": "manual",
+            "formattedGateway": "Manual",
+            "amountSet": {"presentmentMoney": {"amount": "12999.00",
+                                               "currencyCode": "INR"}},
+            "maximumRefundableV2": {"amount": "5000.00", "currencyCode": "INR"},
+            "parentTransaction": None,
+        }])]
+        result = r.write_back_refund(REFUND)
+
+        self.assertEqual(result["outcome"], r.OUTCOME_FAILED_UNSENT)
+        self.assertEqual(result["reason_code"], "insufficient_refundable")
+        self.assertEqual(len(self.calls), 1)
+
+    def test_what_the_probe_does_still_exercise(self):
+        """Not a nihilistic finding.  The probe is still worth running: it
+        proves the credentials, the RefundTargets query, and this app's reading
+        of a real order's transactions -- which is where the genuinely unknown
+        shapes are."""
+        self.responses = [self.fully_refunded_order()]
+        r.write_back_refund(REFUND)
+
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.calls[0]["operation"], "RefundTargets")
+        self.assertIn("maximumRefundableV2", self.calls[0]["query"])
+        self.assertEqual(self.calls[0]["variables"]["orderId"], ORDER_GID)
+
+
 if __name__ == "__main__":
     unittest.main()
