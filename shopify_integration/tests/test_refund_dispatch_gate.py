@@ -55,7 +55,16 @@ class TestTheDispatchGate(WritebackTestCase):
         """`send_refund_to_portal` commits `Queued` and then enqueues the job, so
         a dispatched payout reaches here on `Queued`, never on `Approved`.
         Missing this would refuse every dispatch while the form button worked —
-        and the refusal would read as a status problem, not a missing state."""
+        and the refusal would read as a status problem, not a missing state.
+
+        The trap, confirmed from the payment_portals side 2026-09-07:
+        `execute_queued_refund` passes
+        `status="Approved" if refund.status == "Queued" else refund.status` to its
+        own `sending_allowed` re-check.  That is an argument normalisation and it
+        is never stored, so reading it as "the document is `Approved` by now" is
+        wrong.  This test is what stands between that misreading and a gate that
+        refuses every dispatch.
+        """
         self.set_field(refund_channel=r.CHANNEL_DISPATCH, status="Queued")
         result = r.write_back_refund(REFUND)
         self.assertTrue(result["ok"], result)

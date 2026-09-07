@@ -243,6 +243,18 @@ on `Approved`. `Approved` is in it because that is what a person sees on the
 form, and what a refusal returns the document to — `SENDABLE_STATUSES` is
 `Approved` alone.
 
+> **One line on your side makes this look wrong, and it is worth naming because
+> acting on it would refuse every dispatched payout.** `execute_queued_refund`
+> passes `status="Approved" if refund.status == "Queued" else refund.status` to
+> its own `sending_allowed` re-check. That is a normalisation **in the argument**
+> and it is never written back, so the stored status is still `Queued` when
+> `_dispatch_to_storefront` calls in here. Anyone reading that line as evidence
+> the document has been promoted to `Approved` would narrow this set to
+> `{Approved}` — and then every dispatch refuses `wrong_refund_status` while the
+> form button keeps working, which reads as a status bug rather than a missing
+> state. Confirmed from that side 2026-09-07; a test here fails if either state
+> is dropped.
+
 ### Why the channel is an allow-list
 
 `caller_must_pay` is a positive flag because the natural idiom around a negative

@@ -255,6 +255,19 @@ CHANNEL_FROM_SHOPIFY = "Manual Portal Refund"
 # so a dispatched payout arrives here on Queued and never on Approved.  Omitting
 # either breaks one of the two callers.
 #
+# DO NOT "simplify" this to {"Approved"} on the strength of reading
+# execute_queued_refund.  That job passes
+#
+#     status="Approved" if refund.status == "Queued" else refund.status
+#
+# to its own sending_allowed re-check — an argument normalisation, and it is
+# never written back.  The stored status is still `Queued` when
+# _dispatch_to_storefront calls in here, so a reader who takes that line as
+# evidence the document has been promoted would refuse every dispatched payout
+# while the form button carried on working.  Confirmed from that side
+# 2026-09-07.  tests/test_refund_dispatch_gate.py fails if either state is
+# dropped.
+#
 # Everything else refuses, including:
 #   Processing  a call has already gone out; a GID or an Unverified row is the
 #               record of it, and a second send is a second payout
