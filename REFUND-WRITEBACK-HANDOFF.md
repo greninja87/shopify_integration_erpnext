@@ -6,14 +6,38 @@ State at `de01e54` (2026-09-04). `main`, clean, pushed. **501 tests passing.**
 python -m pytest shopify_integration/tests -q
 ```
 
-Two documents carry the reasoning; this file is only the map.
+Three documents carry the reasoning; this file is only the map.
 
 - **`REFUND-WRITEBACK-BRIEF.md`** — why the feature exists, the Shopify evidence,
   the GraphQL shapes. Read §1 first: an earlier draft claimed this cannot move
-  money and was wrong.
+  money and was wrong. §10 step 2 now carries a **correction** — see below.
 - **`REFUND-DISPATCH-CONTRACT.md`** — contract **v3**, the interface
-  `payment_portals` builds against. §3 (routing) and §5 (failure states) are the
-  load-bearing parts.
+  `payment_portals` builds against for the **payout** (ERPNext → Shopify, moves
+  money). §3 (routing) and §5 (failure states) are the load-bearing parts.
+- **`REFUND-REPORT-CONTRACT.md`** — contract **v1**, the interface for the
+  **report** (Shopify → ERPNext, moves nothing). §2 is the load-bearing part:
+  this app never concludes a settlement channel.
+
+## The two directions are not symmetrical
+
+Keeping them apart is the whole safety story, so the difference is worth stating
+once:
+
+| | write-back (`utils/refund.py`) | report (`utils/refund_report.py`) |
+|---|---|---|
+| direction | ERPNext → Shopify | Shopify → ERPNext |
+| **pays a customer** | **yes, on success** | never — no mutation on any path |
+| hook | `refund_payout_dispatchers` (unregistered) | `shopify_refund_observers` (unregistered) |
+| gated on `enable_refund_writeback` | yes, and it is `0` | **no, deliberately** |
+| worst failure | a customer paid twice | a refund ERPNext never hears about |
+
+The report exists for what `payment_portals` cannot see, and only that. It does
+**not** create a Payment Entry: `payment_portals` already detects the Cashfree
+refund on its own, and two recorders for one refund is two Payment Entries. What
+it cannot detect is a refund with no Cashfree row at all — #6518's ₹12,999 NEFT,
+and every Snapmint refund. Confirmed read-only on the test site, 2026-09-07:
+`#6491` has a Gateway Transaction refund row (`144073385-…`, ₹46,952.16,
+Cashfree); **`#6518` has none, and never will.**
 
 ## It is inert, deliberately
 
@@ -39,8 +63,33 @@ Completed Refund Request in a store whose toggle someone turned on.
    spec in contract §9.2, and a test refuses to let the parameter ship without
    its acknowledgement.
 
+4. **Confirm the report hook name** `shopify_refund_observers` and the
+   `consumed`-enumeration acknowledgement — `REFUND-REPORT-CONTRACT.md` §8.
+   Nothing is registered on either side until `payment_portals` does.
+
 Also unresolved: `order.transactions` needs one live response to settle
-list-vs-connection. `transaction_nodes()` tolerates both meanwhile.
+list-vs-connection. `transaction_nodes()` tolerates both meanwhile, and
+`order.refunds` on the backfill path has the same open question and the same
+tolerance.
+
+## The §10 probe does not do what §10 said
+
+Corrected 2026-09-07, and it changes what items 1 and 2 above are waiting for.
+
+The "safe probe" was described as exercising credentials, query, **mutation** and
+error handling. It does not reach the mutation: `plan_refund` finds no parent
+with headroom and `write_back_refund` refuses about thirty lines above
+`refundCreate`. Shopify is never asked, so there are no `userErrors` to read and
+the `Unverified`-before-post commit is never entered either.
+
+Worse for the plan: the headroom guard is **strictly more conservative than
+Shopify's**, so every order on which `refundCreate` actually posts is one Shopify
+will accept — and a real customer gets paid. **There is no safe live exercise of
+the mutation.** Both open items above assumed there was one.
+
+The probe is still worth running for credentials, the `RefundTargets` query and
+the live transaction shapes. It just cannot clear the mutation.
+`TestTheSafeProbeNeverReachesTheMutation` pins this and was mutation-checked.
 
 ## Four traps, each already paid for once
 
