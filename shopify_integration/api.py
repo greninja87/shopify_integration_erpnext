@@ -19,6 +19,7 @@ import json
 
 import frappe
 from frappe.utils.password import get_decrypted_password
+from shopify_integration.utils.refund_report import report_refund_from_webhook
 from shopify_integration.utils.webhook import log_webhook, update_log_status
 from shopify_integration.utils.sales_order import create_sales_order_from_shopify
 from shopify_integration.shopify_integration.doctype.shopify_settings.shopify_settings import (
@@ -157,6 +158,23 @@ def shopify_webhook():
             shopify_order_id = str(order_data.get("order_id", ""))
             refund_id        = str(order_data.get("id", ""))
 
+            # ── Report the refund to whichever app records refunds ───────────
+            # Independent of the credit-note settings below, and of
+            # enable_refund_writeback: this moves no money and creates no ledger
+            # document, it only hands over the facts payment_portals cannot see
+            # (a refund that never reached Cashfree, plus the Shopify refund's
+            # own note, line items, restock and staff user).  Never raises, so
+            # it cannot turn a refund we already have into a webhook retry.
+            # See utils/refund_report.py and REFUND-REPORT-CONTRACT.md.
+            report = report_refund_from_webhook(
+                order_data,
+                shop_domain=shop_domain,
+                shopify_order_name=_log_order_name,
+            )
+            report_note = "" if report.get("delivered") else (
+                f" Refund report: {report.get('message', '')}"
+            )
+
             if settings.get("enable_sales_invoice") and settings.get("enable_credit_note"):
                 if settings.get("credit_note_creation") == "Auto":
                     job_id = f"shopify_refund_{refund_id}"
@@ -174,7 +192,7 @@ def shopify_webhook():
                         log_name=log_name,
                         shopify_order_id=shopify_order_id,
                         status="Received",
-                        error="Enqueued for credit note creation.",
+                        error="Enqueued for credit note creation." + report_note,
                     )
                 else:
                     # Manual mode — log it so the user knows to act
@@ -182,14 +200,14 @@ def shopify_webhook():
                         log_name=log_name,
                         shopify_order_id=shopify_order_id,
                         status="Skipped",
-                        error="Credit Note creation is set to Manual — create the Credit Note yourself in ERPNext against the Sales Invoice for this order.",
+                        error="Credit Note creation is set to Manual — create the Credit Note yourself in ERPNext against the Sales Invoice for this order." + report_note,
                     )
             else:
                 update_log_status(
                     log_name=log_name,
                     shopify_order_id=shopify_order_id,
                     status="Skipped",
-                    error="Credit Note creation is not enabled for this store.",
+                    error="Credit Note creation is not enabled for this store." + report_note,
                 )
 
             frappe.db.commit()  # nosemgrep: frappe-manual-commit — must commit before returning HTTP 200 to Shopify

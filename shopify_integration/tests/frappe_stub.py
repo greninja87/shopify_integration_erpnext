@@ -21,6 +21,7 @@ the test rather than a silent pass.
 """
 
 import datetime
+import inspect
 import sys
 import types
 
@@ -45,6 +46,12 @@ CACHE_TTL = {}
 COLUMNS = {}
 # every doc dict inserted via frappe.get_doc({...}).insert(), in order
 INSERTS = []
+# hook name -> list of values, standing in for frappe.get_hooks()
+HOOKS = {}
+# dotted path -> callable, the targets frappe.call() can resolve
+ATTRS = {}
+# every frappe.call: (dotted_path, kwargs_as_passed, kwargs_actually_received)
+CALLS = []
 
 
 def reset():
@@ -60,6 +67,9 @@ def reset():
     COLUMNS.clear()
     COLUMNS["Address"] = {"gstin", "gst_category"}
     INSERTS.clear()
+    HOOKS.clear()
+    ATTRS.clear()
+    CALLS.clear()
     META_FIELDS.clear()
     META_FIELDS["Payment Entry"] = {
         "custom_gateway_reference",
@@ -253,6 +263,44 @@ def _get_doc(doctype, name=None, **k):
     )
 
 
+def register_observer(path, fn, hook="shopify_refund_observers"):
+    """Make `fn` resolvable at `path` and registered under `hook`.
+
+    Returns the path, so a test can register several and assert on order.
+    """
+    ATTRS[path] = fn
+    HOOKS.setdefault(hook, []).append(path)
+    return path
+
+
+def _frappe_call(path, *args, **kwargs):
+    """Stand-in for frappe.call, INCLUDING its kwarg filtering.
+
+    Real frappe.call does `fn(*args, **newargs)` where newargs is the caller's
+    kwargs filtered to the parameters the resolved function declares -- an
+    argument the target does not accept is dropped with no TypeError and no
+    warning.  That silent drop is the failure this seam's acknowledgement exists
+    to catch, so the fake reproduces it rather than passing everything through.
+    A stub that forwarded every kwarg would let the bug through green tests.
+    """
+    fn = ATTRS.get(path) if not callable(path) else path
+    if fn is None:
+        raise AttributeError(f"no such attribute: {path}")
+
+    params = inspect.signature(fn).parameters
+    takes_everything = any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+    if takes_everything:
+        received = dict(kwargs)
+    else:
+        received = {k: v for k, v in kwargs.items() if k in params}
+
+    CALLS.append((path if not callable(path) else getattr(fn, "__name__", "?"),
+                  dict(kwargs), dict(received)))
+    return fn(*args, **received)
+
+
 def install():
     """Install the fake into sys.modules and return it.  Idempotent."""
     if "frappe" in sys.modules and getattr(sys.modules["frappe"], "_is_shopify_stub", False):
@@ -288,6 +336,11 @@ def install():
 
     frappe.whitelist     = _whitelist
     frappe.enqueue       = _noop
+    frappe.get_hooks     = lambda name=None, *a, **k: (
+        list(HOOKS.get(name, [])) if name else dict(HOOKS)
+    )
+    frappe.call          = _frappe_call
+    frappe.get_attr      = lambda path: ATTRS[path]
     frappe.get_traceback = lambda *a, **k: "traceback"
 
     # Real frappe.throw raises ValidationError. A no-op stub would let code that
