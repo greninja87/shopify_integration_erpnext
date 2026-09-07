@@ -226,6 +226,42 @@ class TestRefundWritebackSettings(unittest.TestCase):
         self.assertIn("twice", description)
         self.assertIn("payment_portals", description)
 
+    # ── notify_customer_on_refund ────────────────────────────────────────────
+    # Its default was pinned above from the start; its description was not, and
+    # that is how a false claim survived in it.  The description is the whole of
+    # what an admin has to go on when deciding whether to email a customer.
+
+    def test_the_notify_description_does_not_claim_erpnext_already_emails(self):
+        """It said "ERPNext already emails about the refund", so the toggle was
+        off to avoid a duplicate.  There is no such email: no Notification on
+        Refund Request, none on Payment Entry, and "Credit Note Submitted" on
+        Sales Invoice is disabled (checked on the test site, 2026-09-07).
+
+        A wrong reason is worse than none here, because it argues the opposite
+        way once an admin checks it: finding no ERPNext email, they would
+        reasonably switch this on believing they were restoring one the customer
+        used to get.
+        """
+        description = self.field("notify_customer_on_refund")["description"].lower()
+        for claim in ("already emails", "already sends", "two refund emails",
+                      "duplicate email"):
+            self.assertNotIn(claim, description)
+
+    def test_the_notify_description_says_it_would_be_the_only_email(self):
+        description = self.field("notify_customer_on_refund")["description"].lower()
+        self.assertIn("only", description)
+        self.assertIn("erpnext", description)
+
+    def test_the_notify_description_warns_the_email_precedes_the_money(self):
+        """The real reason to leave it off, and it survives an admin checking
+        it: Shopify emails the moment refundCreate succeeds, which is before the
+        OCC bridge has turned it into a Cashfree refund.  If the bridge fails,
+        the customer has been told they were refunded when they were not -- and
+        an Unverified write-back is the same problem with nobody knowing."""
+        description = self.field("notify_customer_on_refund")["description"].lower()
+        self.assertIn("before", description)
+        self.assertIn("unverified", description)
+
 
 if __name__ == "__main__":
     unittest.main()
