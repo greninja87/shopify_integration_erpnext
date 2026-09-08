@@ -119,6 +119,117 @@ class TestContractDocument(unittest.TestCase):
         self.assertIn("dropped silently", prose)
         self.assertIn("positive acknowledgement in the result", prose)
 
+    def test_the_delivery_guarantee_is_never_stated_as_one_post(self):
+        """"`refundCreate` is posted AT MOST ONCE" is false as a headline, and
+        it is the headline a future reader reasons from.  An exhausted 429
+        posts the identical mutation five times — all five refused, which is
+        precisely why it is safe.  The property is weaker than the slogan: at
+        most one post that could have EXECUTED, and the safety argument rests
+        on the refusal, not on the post count.
+
+        So every "at most once" in this document has to carry the
+        qualification within reach of itself.  A reader who stops at the phrase
+        must not come away with the stronger claim."""
+        for match in re.finditer(r"(?i)at most once", self.prose):
+            tail = self.prose[match.end():match.end() + 90].lower()
+            self.assertIn(
+                "execut", tail,
+                f"an unqualified 'at most once' at offset {match.start()}: "
+                f"...{self.prose[match.start():match.start() + 110]}...",
+            )
+
+    def test_the_document_says_a_refusal_can_be_re_posted(self):
+        """The other half of the same accuracy: the retry table has to be
+        readable as "some failures ARE re-posted", or the qualification above
+        has nothing to point at."""
+        prose = self.prose.lower()
+        self.assertIn("429", prose)
+        self.assertRegex(self.prose, r"(?i)re-?post")
+
+    # ── What `rate_limited` covers, and what a 429 now costs ─────────────────
+    #
+    # Round 3's narrowing.  The client no longer certifies a bare HTTP 429 as
+    # a refusal, so the document must not describe `rate_limited` as covering
+    # one — payment_portals reads these tables to decide whether a customer
+    # might already have been paid, and "429 -> retry-safe" is the reading that
+    # pays them twice.
+
+    def retry_table(self) -> str:
+        """The §7a "re-posted?" table, sliced out so a row can be pinned
+        without the §5 summary table's `| yes |` cells joining in."""
+        start = self.text.index("## 7a.")
+        return self.text[start:self.text.index("## 8.", start)]
+
+    def test_an_http_429_is_no_longer_documented_as_a_re_posted_refusal(self):
+        """The row said "HTTP 429 | yes | the request was refused, not run".
+        That is a premise about somebody else's infrastructure: Shopify's own
+        throttling is a 200 body, so a 429 on `graphql.json` may be a CDN, a
+        WAF or an egress proxy in front of the store."""
+        table = self.retry_table()
+        self.assertNotIn(
+            "| HTTP 429 | yes |", table,
+            "the contract still promises a 429 is re-posted for the payout",
+        )
+        self.assertIn("| HTTP 429 | **no** |", table)
+
+    def test_exactly_one_failure_is_documented_as_re_posted(self):
+        """And it is Shopify's own pre-execution refusal.  Stated as a count
+        because the danger is a second `yes` appearing beside it: every other
+        row is a failure that may be hiding a committed mutation."""
+        table = self.retry_table()
+        self.assertEqual(
+            table.count("| yes |"), 1,
+            "more than one failure is documented as re-posted for a mutation "
+            "that pays a customer",
+        )
+        row = [line for line in table.splitlines() if "| yes |" in line][0]
+        self.assertIn("THROTTLED", row)
+
+    def test_rate_limited_is_documented_as_shopifys_own_refusal_only(self):
+        """The §6 row is what a caller reads to decide the slug means "nobody
+        was paid".  It has to name Shopify's structured GraphQL refusal and
+        must not offer an HTTP 429 as another way in."""
+        rows = [line for line in self.text.splitlines()
+                if line.startswith("| `rate_limited` |")]
+        self.assertEqual(len(rows), 1, rows)
+        row = rows[0]
+        self.assertIn("THROTTLED", row)
+        self.assertNotIn(
+            "429", row,
+            "the rate_limited row still offers an HTTP 429 as a retry-safe "
+            "refusal; the client no longer certifies one",
+        )
+
+    def test_the_contract_says_where_an_http_rate_limit_now_lands(self):
+        """payment_portals reads this document, and the consequence is
+        operational: a 429 on the refund path parks the row on `Unverified`
+        and needs a person.  That is deliberate, so it has to be written down
+        next to the claim rather than left to be discovered."""
+        match = re.search(r"(?i)http-layer rate limit", self.prose)
+        self.assertIsNotNone(
+            match,
+            "the contract does not say what an HTTP-layer rate limit on a "
+            "refund now costs",
+        )
+        window = self.prose[match.start():match.start() + 400]
+        self.assertIn("Unverified", window, window)
+        self.assertRegex(window, r"(?i)human|person", window)
+
+    def test_the_dispatcher_is_not_described_as_deferred(self):
+        """It was registered in `f431c17`, so payment_portals' Send step
+        reaches `write_back_refund` on its own and the form button is no longer
+        the only trigger.  A document that still says otherwise tells an
+        integrator their own dispatch cannot be firing."""
+        self.assertNotRegex(
+            self.prose, r"(?i)(dispatcher|write-back) was deferred",
+            "the contract still describes the dispatcher as deferred",
+        )
+        self.assertNotRegex(
+            self.prose, r"(?i)the (form )?button is the only",
+            "the contract still calls the form button the only trigger",
+        )
+        self.assertIn("refund_payout_dispatchers", self.text)
+
     def test_the_unimplemented_parts_are_marked_as_such(self):
         """The other side is building against this; a promised function that does
         not exist has to say so, not be discovered."""
@@ -211,7 +322,30 @@ class TestOutcomeVocabulary(WritebackTestCase):
         cases = {
             "query_failed": [ShopifyAPIError("boom")],
             "shopify_order_not_found": [targets_response(order=False)],
-            "not_authorised": [targets_response(), ShopifyAPIError("nope", 403)],
+            "not_authorised": [
+                targets_response(),
+                ShopifyAPIError("nope", 403, proves_not_executed=True),
+            ],
+            # The ONE remaining flavour of "Shopify refused this without
+            # running it": a 200 body whose extensions.code is THROTTLED, in
+            # the shape the GraphQL spec reserves for a request refused before
+            # execution began.  A bare HTTP 429 was the other one until round 3
+            # and is not proof of anything — Shopify throttles GraphQL with a
+            # 200 body, so a 429 on that endpoint may be a CDN or a proxy in
+            # front of the store, which knows nothing about the document behind
+            # it.  It now lands on failed_unknown / Unverified.
+            #
+            # proves_not_executed is what carries the claim, and the client is
+            # the only place that can make it: a THROTTLED body that shows
+            # execution began has the same code and the opposite meaning.  A
+            # fixture that omitted the flag and relied on the code — or on the
+            # status — being read here would be testing the inferences this
+            # side now refuses.
+            "rate_limited": [targets_response(),
+                             ShopifyAPIError("returned GraphQL errors: "
+                                             "throttled", 200,
+                                             error_codes=["THROTTLED"],
+                                             proves_not_executed=True)],
             "rejected_by_shopify": [
                 targets_response(),
                 refund_created(user_errors=[{"field": None, "message": "no"}]),
@@ -224,6 +358,40 @@ class TestOutcomeVocabulary(WritebackTestCase):
             self.assertContractual(result, expected_code)
             self.assertEqual(result["reason_code"], expected_code)
             self.assertEqual(result["outcome"], r.OUTCOME_FAILED_UNSENT)
+
+    def test_an_exhausted_throttle_is_also_contractual(self):
+        """The same outcome reached by the other route: HTTP 200, an
+        extensions.code of THROTTLED, and a body whose `data` is None.  That is
+        Shopify refusing to run the document, and `proves_not_executed` on the
+        exception is what says so — the code alone cannot, because the
+        THROTTLED body that DOES carry `data` may hide a committed mutation and
+        raises with the flag False."""
+        self.responses = [
+            targets_response(),
+            ShopifyAPIError("GraphQL errors: throttled", 200,
+                            error_codes=["THROTTLED"], proves_not_executed=True),
+        ]
+        result = r.write_back_refund(REFUND)
+
+        self.assertContractual(result, "rate_limited")
+        self.assertEqual(result["reason_code"], "rate_limited")
+        self.assertEqual(result["outcome"], r.OUTCOME_FAILED_UNSENT)
+
+    def test_the_throttle_that_may_have_committed_is_contractual_too(self):
+        """The other side of that fork, and the one the vocabulary must not let
+        slip into a retry-safe outcome."""
+        self.responses = [
+            targets_response(),
+            ShopifyAPIError("GraphQL errors: throttled", 200,
+                            error_codes=["THROTTLED"]),
+        ]
+        result = r.write_back_refund(REFUND)
+
+        self.assertContractual(result, "response_unverifiable")
+        self.assertEqual(result["reason_code"], "response_unverifiable")
+        self.assertEqual(result["outcome"], r.OUTCOME_FAILED_UNKNOWN)
+        self.assertFalse(result["retry_safe"])
+        self.assertTrue(result["possibly_paid"])
 
     def test_no_refundable_transactions_is_actually_emitted(self):
         """It was documented as live and was dead code: build_refund_input only
@@ -418,6 +586,7 @@ EXPECTED_OWNER = {
     "no_refundable_transactions": r.OWNER_SHOPIFY,
     "rejected_by_shopify": r.OWNER_SHOPIFY,
     "not_authorised": r.OWNER_SHOPIFY,
+    "rate_limited": r.OWNER_SHOPIFY,
     "setup_failed": r.OWNER_SHOPIFY,
     "transport_error_after_send": r.OWNER_SHOPIFY,
     "response_unverifiable": r.OWNER_SHOPIFY,

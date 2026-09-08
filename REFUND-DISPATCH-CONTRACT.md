@@ -1,9 +1,38 @@
 # Refund dispatch contract — `payment_portals` → `shopify_integration`
 
-**Version 4.** Written 2026-09-04 by the `shopify_integration` side, at the
+**Version 5.** Written 2026-09-04 by the `shopify_integration` side, at the
 request of the `payment_portals` session, as the interface to build against.
-Revised 2026-09-07.
+Revised 2026-09-08.
 
+> **Version 5 adds no key and changes one thing: at most one post of
+> `refundCreate` can ever have executed.** Note the shape of that claim — it is
+> *not* "posted once". `execute()` may still POST the identical mutation five
+> times, on the one failure Shopify itself certifies as a refusal *before* the
+> document ran; what makes that safe is that Shopify *refused* all five, not
+> that there was one. Every post-send "nothing was sent"
+> answer this document gives you — `rejected_by_shopify`, `not_authorised`, and
+> the new `rate_limited` — used to describe the *last of up to five* attempts
+> **that could each have run**, because `execute()` retried on a lost answer.
+> `failed_unsent` was therefore a hope rather than a fact: attempt 1 can create
+> the refund, lose its response to the socket timeout, and attempt 2 be declined
+> for exceeding the refundable amount *precisely because attempt 1 consumed it*
+> — and you would have been told the refund was unsent and safe to retry. Only
+> one post can now have run, so those answers describe it and no other. One new
+> `reason_code`, inside the existing `failed_unsent` outcome: `rate_limited`. If
+> you branch on `outcome` alone, nothing on your side changes. See §7a and §10.
+>
+> **Revised 2026-09-08: a bare HTTP 429 is no longer one of those refusals.**
+> Shopify throttles GraphQL with an HTTP *200* body, so a 429 on `graphql.json`
+> may just as well be a CDN, a WAF or an egress proxy in front of the store —
+> and a layer like that knows nothing about whether the mutation behind it ran.
+> `rate_limited` therefore now means exactly one thing: **Shopify refused the
+> document before executing it, on its own structured GraphQL throttle error.**
+> An HTTP-layer rate limit on a refund is `response_unverifiable` /
+> `failed_unknown` instead: it parks the row on `Unverified` and needs a human.
+> That is deliberate, and it is the cost we chose — the alternative asserted a
+> premise about infrastructure nobody here controls, and the price of that
+> premise being wrong is a second real refund. See §7a.
+>
 > **Version 2 corrects a routing bug found on `electrobotictest`, and changes
 > the meaning of `owns_payout`.** Version 1 derived it from `shopify_order_id`,
 > which several guards returned without ever populating — so it read `false`,
@@ -277,14 +306,30 @@ hold, and `tests/test_refund_dispatch_gate.py` pins it from this side too: a
 non-Shopify order on an undispatchable channel still comes back
 `not_a_shopify_order` with `caller_must_pay: true`.
 
-### No idempotency token
+### No idempotency token, in either direction
 
-Deliberately absent. **The document is the idempotency key.** Once Shopify
-accepts a refund, `shopify_refund_gid` is written and committed, and every entry
-point treats it as a hard stop. Calling `write_back_refund` twice for the same
-Refund Request cannot produce two refunds; the second returns
-`refused` / `already_paid` with the original GID. A caller-supplied token would
-add a second, weaker key for the same guarantee.
+Deliberately absent both ways, and version 5 makes the second half explicit
+because the first half was doing all the talking.
+
+**From you: the document is the idempotency key.** Once Shopify accepts a
+refund, `shopify_refund_gid` is written and committed, and every entry point
+treats it as a hard stop. Calling `write_back_refund` twice for the same Refund
+Request cannot produce two refunds; the second returns `refused` /
+`already_paid` with the original GID. A caller-supplied token would add a
+second, weaker key for the same guarantee.
+
+**Towards Shopify: there is no `@idempotent` key on the mutation either**, and
+that absence is the whole reason §7a exists. `refundCreate` accepts
+`@idempotent(key: "…")`, but it could not be confirmed against the configured
+API version, and an unknown directive is a **query-level** error — so switching
+it on unverified would not degrade gracefully, it would fail *every* write-back
+with a GraphQL error. `build_refund_mutation()` is therefore called with no key,
+Shopify cannot recognise a second POST of the same document as the same refund,
+and the protection is not a key but a delivery rule: **at most one post of the
+mutation can have executed** — five refused posts are still one that could have
+run, and the refusal is what carries it. See §7a. If a live response ever confirms the directive, the key
+will be the Refund Request name plus the amount in minor units, and this
+paragraph changes with it.
 
 ---
 
@@ -395,7 +440,7 @@ a version bump; none will be removed or change meaning without one.
 ```python
 {
   "provider":         "shopify",       # which app answered
-  "contract_version": 4,
+  "contract_version": 5,
 
   "outcome":     "paid" | "refused" | "failed_unsent" | "failed_unknown" | "in_progress",
   "reason_code": "<stable slug, see §6>",
@@ -468,8 +513,18 @@ declined it. `retry_safe: true`. This is the **only** outcome a caller may retry
 automatically.
 
 It covers: the `RefundTargets` query failing, the order not being found, no
-refundable headroom, `userErrors` from `refundCreate`, and an auth rejection
-(401/403 — declined before the document ran).
+refundable headroom, `userErrors` from `refundCreate`, an auth rejection
+(401/403), and Shopify's own cost refusal — a `THROTTLED` GraphQL body that
+outlived the internal retries **and that the client identified as a refusal
+before execution began** rather than a partly-executed document. A bare HTTP
+429 is *not* in this list; see the `failed_unknown` note below and §7a.
+
+The last three are Shopify producing an answer *instead of* running the
+mutation, and they are `failed_unsent` **only because at most one post of that
+mutation could have executed** — under the old retries, the answer you were
+shown could have been a rejection caused by an earlier attempt that had already
+paid the customer. That is §7a, and it is the load-bearing part of this
+outcome.
 
 Retrying is *safe*, which is not the same as *useful*: `insufficient_refundable`
 will fail identically until something changes in Shopify. Back off rather than
@@ -482,9 +537,21 @@ The mutation was posted and its fate cannot be established. `possibly_paid: true
 
 It covers:
 
-- transport failure, timeout, or HTTP 5xx after the mutation went out — note that
-  `execute()` retries internally, so a lost response on *any* attempt may be
-  hiding a refund that succeeded;
+- transport failure, timeout, or HTTP 5xx after the mutation went out. None of
+  these is evidence about the mutation: the POST may have been delivered and
+  executed with only its *answer* lost, and a 502 or 503 from Shopify's edge can
+  arrive after the refund has committed. Since version 5 the mutation is not
+  re-posted on any of them (§7a), so this is one lost answer rather than up to
+  five — which makes it no less POSSIBLY PAID;
+- **an HTTP 429**, as of 2026-09-08. Shopify throttles GraphQL with a 200 body,
+  so a 429 on `graphql.json` is as likely to come from a CDN, a WAF or an egress
+  proxy sitting in front of the store, and such a layer says nothing about
+  whether the document behind it ran. So an HTTP-layer rate limit on a refund
+  parks the row on `Unverified` and needs a human to open the order in Shopify.
+  It is deliberate: the alternative — reporting it as retry-safe — rests on a
+  premise about infrastructure nobody here owns, and pays a customer twice when
+  that premise is wrong. Shopify's *own* rate limiting is the `THROTTLED`
+  200-body, and that is still `rate_limited` / `failed_unsent`;
 - HTTP 200 with empty `userErrors` and no `refund` object — Shopify answered
   without complaining and did not say what happened, so "nothing happened" is an
   assumption, not a fact;
@@ -508,6 +575,23 @@ cleared only by a person, through
 with `resolution` of `"paid"` (a refund was found in Shopify; the GID is
 mandatory) or `"not_paid"` (none exists; cleared so it can be sent again). Who
 resolved it and which way is recorded on the document.
+
+The GID is **validated**, not merely required: it must be the refund's numeric
+id or the full `gid://shopify/Refund/<digits>`, and anything else is refused
+with nothing written. A `Done` row carrying the *wrong* id fails the
+credit-note guard exactly as a blank one does — while looking settled — so a
+mis-paste would let the `refunds/create` webhook build a second Credit Note for
+the refund Shopify really made. Refusing costs a retype.
+
+**One side effect worth knowing, because it is a silence rather than a
+message.** While an `Unverified` row stands, this app also **withholds refund
+*reports*** for that Shopify order — the other direction, `refunds/create` →
+your observer, in `REFUND-REPORT-CONTRACT.md` §5a. A refund appearing on that
+order may be the one we posted and never confirmed, and reporting it could give
+a refund that already has a Payment Entry a second one. Each withheld report is
+written to the Error Log with the order and what to do, so resolving the row is
+what un-blocks both directions at once; if the refund turns out not to be ours,
+`backfill_now` on the order reports it.
 
 ### `in_progress` — not an answer yet
 
@@ -564,16 +648,25 @@ any time.
 | `insufficient_refundable` | Shopify's headroom is short of the amount; refused outright rather than partially refunded |
 | `no_refundable_transactions` | no SALE/CAPTURE parent to attach to |
 | `rejected_by_shopify` | `userErrors` — read and declined |
-| `not_authorised` | 401/403; declined before the document ran |
+| `not_authorised` | 401/403 — refused at the auth layer, so the document was never reached. Sound only under §7a |
+| `rate_limited` | Shopify's own cost refusal: a `THROTTLED` GraphQL body that outlived the internal retries **and that the client vouched for as a refusal before execution began**, after the mutation was posted. Shopify answered *instead of* running the document, so nobody was paid and a retry is safe — but back off before you take it, because an immediate retry earns another. Two things carrying the same `THROTTLED` code are **not** this: a body that shows execution began, and an HTTP-layer rate limit. Both are `response_unverifiable`, because the document may have committed. **New in version 5**, and **narrowed 2026-09-08** to Shopify's own structured refusal only |
 | `setup_failed` | unexpected error before anything was sent |
 
 **With `outcome: "failed_unknown"`**
 
 | `reason_code` | meaning |
 |---|---|
-| `transport_error_after_send` | mutation posted, no usable response |
-| `response_unverifiable` | response gave no refund object, or was unintelligible |
+| `transport_error_after_send` | mutation posted and **the transport itself failed** — a reset, a socket timeout, DNS or TLS. Nothing was read back at all, so there is no HTTP status on the failure |
+| `response_unverifiable` | mutation posted and **something answered, unusably**: no refund object, a `refundCreate` payload missing from a response Shopify sent in full, an HTTP 400/404/**429**/5xx, or a 200-with-errors that was not a proven refusal (including the `THROTTLED` body that may carry a committed mutation) |
 | `unverified_previous_attempt` | an earlier attempt is still unresolved |
+
+The split between the first two is on evidence, not on wording: no HTTP status
+means the network broke, a status means something replied. Both are
+`failed_unknown`, both are **possibly paid**, and neither is ever retried
+automatically — so the split changes what a person is sent to look at, not what
+either side may do. Until 2026-09-08 every non-refusal post-send failure was
+filed as `transport_error_after_send`, which told a reader the network had
+failed on rows where Shopify had answered in full.
 
 **With `outcome: "in_progress"`**: `claimed_elsewhere`.
 
@@ -584,6 +677,11 @@ codes version 4 adds are both `shopify`. That is worth one sentence, because
 `channel_does_not_dispatch` can read like "somebody else's": it means the refund
 is Shopify's order but is paid by another route, *not* that you should pay it
 through Cashfree. Paying it there is the double refund.
+
+`rate_limited`, version 5's addition, is `shopify` too. A refund Shopify
+declined to accept *this second* is still Shopify's to pay; paying it through
+Cashfree because Shopify said "not now" is the same double payout by a sillier
+route.
 
 `payout_owner` is `unknown` for exactly two codes — `not_installed` and
 `refund_request_missing` — the refusals that happen before this app can read
@@ -618,6 +716,80 @@ possibly-paid, and read `shopify_writeback_status` on the document to find out.
 
 ---
 
+## 7a. Delivery guarantee — at most one post of `refundCreate` can have executed
+
+**New in version 5.** This is the fact underneath every "nothing was sent"
+answer in §5 and §6, and it did not hold before.
+
+**Read the heading exactly.** It does not say the mutation is posted once, and
+that weaker claim is the whole of the guarantee: one failure still puts the
+identical document back on the wire up to five times, and all five are safe
+*because Shopify refused them*. The safety argument rests on the refusal, never
+on the post count. A reader who remembers it as "posted once" will eventually
+conclude the retries were the danger and that turning them back on for the
+refusals costs nothing — and they will be reasoning from something this
+document never said.
+
+The mutation is posted with `idempotent=False`. That means *retry only on
+failures that prove Shopify never ran the document*, and exactly one failure
+does:
+
+| failure after the POST | re-posted? | why |
+|---|---|---|
+| transport error, timeout, reset | **no** | only the answer is known to be lost; the document may have run |
+| HTTP 5xx | **no** | Shopify's edge can answer 502/503 after the mutation committed |
+| HTTP 429 | **no** | says a rate limiter refused the request, not *which* one: Shopify throttles GraphQL with a 200 body, so this may be a CDN, a WAF or a proxy in front of the store, which knows nothing about the document behind it |
+| HTTP 200 + `THROTTLED`, refused **before execution** — no `data` key, no `errors[].path` | yes | Shopify's own cost refusal, in the shape the GraphQL spec reserves for a request it declined to run |
+| HTTP 200 + `THROTTLED`, execution **began** | **no** | same error code, opposite meaning: the document resolved part way and then blew the cost budget, so it may have committed |
+
+The three "no" rows are the change, and the last is the one that reads as a
+contradiction and is not: `THROTTLED` is not one fact. Which of the two it was
+is decided by the client, on the response body, and travels to this side as
+`proves_not_executed` on the exception — never re-derived here from the error
+code *or from the status*, because the shapes carry the same code and the wrong
+reading reports a paid refund as never-sent. Collapsing the surviving row into a
+single attempt would be the blunt fix and the wrong one: re-posting after a
+*refusal* cannot pay anybody twice, and dropping that retry would turn Shopify's
+ordinary cost limiting into rows a human has to reconcile by hand. When the
+choice really is between "might pay twice" and "might need a human to look",
+this side chooses the human — and for everything except the proven refusal, that
+is now the choice being made.
+
+**What the 429 row costs, since it is the row that changed direction.** An
+HTTP-layer rate limit on a refund now parks the row on `Unverified` and needs a
+human to open the order in Shopify, where before it came back retry-safe. That
+is deliberate. The old row asserted "a rate limiter rejects without executing",
+which is a premise about infrastructure nobody here controls — Shopify's own
+throttling is the 200-body two rows down — and the price of that premise being
+wrong is a second real refund through the Cashfree-OCC bridge. Hand work is
+recoverable; a double payout is not.
+
+**What this buys you.** Exactly one request can ever have executed, so the
+answer this side reads describes that request and no other. `failed_unsent` from
+a `userErrors`, a 401/403 or Shopify's own pre-execution `THROTTLED` refusal
+therefore means *nobody was paid*, full stop, and `retry_safe: true` is a fact
+rather than an inference from the last of several attempts.
+
+**What it does not change.** A transport failure or a 5xx *after* the post is
+still `failed_unknown` / `Unverified`, and **must never be retried
+automatically** — by you or by anything here. It is one lost answer instead of
+five, and a lost answer is not a lost refund. The `Unverified` marker is
+committed to the Refund Request *before* the POST, precisely so a worker that
+never comes back leaves that state behind rather than a retryable one, and it is
+cleared only by a person through `resolve_unverified_writeback` (§5).
+
+**There is still no idempotency key**, and that is why this rule is the
+protection rather than a belt beside a brace. `refundCreate` accepts
+`@idempotent(key: "…")`, but the directive could not be confirmed against the
+configured API version, and an unknown directive is a **query-level** error:
+turning it on unverified would not degrade, it would fail *every* write-back.
+So the document goes out with no key, Shopify has no way to recognise a second
+POST of it as the same refund — a partial refund leaves the order enough
+headroom to take another — and "at most one post that could have executed" is
+what stands between a lost response and a customer paid twice. See §2b.
+
+---
+
 ## 8. What this side will never do
 
 So the other side can rely on it rather than defend against it:
@@ -633,6 +805,8 @@ So the other side can rely on it rather than defend against it:
   on (default off);
 - never send a partial refund when Shopify's headroom is short — it refuses
   instead, because a partial refund looks settled and is not;
+- never re-post `refundCreate` on a failure that does not prove Shopify refused
+  it, so one lost answer is never turned into a second payout (§7a);
 - never raise from `write_back_refund`; every outcome is a result dict;
 - never second-guess your authorisation: `write_back_refund` has no permission
   check and is not whitelisted, so a caller you have authorised is never refused
@@ -704,6 +878,89 @@ So the other side can rely on it rather than defend against it:
 
 ## 10. Changes on this side that this document reflects
 
+### Version 5 — only one post of the mutation can have executed (2026-09-08)
+
+Found by a code review of this side, and it is a soundness fix rather than a
+behaviour change: three answers this document has given since version 1 were
+right about *what* to report and could not justify it.
+
+**The unsound part.** `execute()` retried the identical document up to five
+times on a lost answer, which is correct for `fulfillmentCreate` — re-pushing a
+fulfillment that landed gets a `userErrors` rejection, not a second shipment —
+and wrong for a payout. `check_user_errors` and the exception handlers only ever
+saw the **last** attempt, so "Shopify read this and declined it" was reported as
+`failed_unsent` even when the rejection was *caused* by an earlier attempt that
+had succeeded: attempt 1 creates the refund, its response dies in the socket
+timeout, attempt 2 comes back "Refund amount exceeds the amount refundable on
+this order" because attempt 1 consumed the headroom. This side then wrote
+`Failed` over the durable `Unverified` marker, returned `retry_safe: true`, and
+the Refund Request form offered "Retry Shopify Refund" for a refund the customer
+had already been paid.
+
+**The fix** is `idempotent=False` on the `refundCreate` post — at most once in
+any way that could have executed. The `RefundTargets` query deliberately keeps
+its retries: it is a read, re-posting it cannot pay anybody, and losing that
+resilience would trade a safe retry for a fragile one. §7a is the whole rule.
+
+**One new `reason_code`, and it is a de-escalation.** A `THROTTLED` 200-body
+that Shopify answered *instead of* running the document is proof of
+non-execution, and was being filed as `transport_error_after_send` /
+`failed_unknown` — which parked Shopify's ordinary cost limiting in
+`Unverified`, where nothing retries it and a person has to open the order in
+Shopify to decide whether a customer was paid. It is now `rate_limited` /
+`failed_unsent`, inside the outcome that already existed. The revision below
+narrows it to that one shape.
+
+Which `THROTTLED` it was is **not** decided on this side. A first cut of this
+read `"THROTTLED" in exc.error_codes`, which is the same code the
+partly-executed response carries — so the one 200-body that may already have
+paid a customer was reported as retry-safe. The claim now travels as
+`proves_not_executed` on the exception, set only where the client saw Shopify
+refuse, and this side branches on nothing else. See §7a's last table row.
+
+**Nothing was removed and no key changed shape**, so a caller that branches on
+`outcome` needs no change; one that enumerates `reason_code` gains a slug in a
+set it already treats as retry-safe.
+
+### Revision — a bare HTTP 429 is not a refusal (2026-09-08, no version bump)
+
+Found by an adversarial pass over the version 5 change, and it is the same
+mistake in the opposite direction: version 5 was right to stop reading a
+`THROTTLED` code as proof, and then kept a *second* thing it had no grounds to
+read as proof.
+
+**What was wrong.** The claim behind the 429 row was "a rate limiter rejects
+without executing". Shopify's own GraphQL throttling arrives as HTTP **200**
+with `extensions.code` `THROTTLED`, so a 429 on `graphql.json` is as likely to
+come from a CDN, a WAF or an egress proxy in front of the store — and such a
+layer knows nothing about whether the mutation behind it ran. The premise was
+about infrastructure this project does not own, and the price of it being wrong
+is a second real refund.
+
+**What changed.** The client no longer certifies a bare 429
+(`proves_not_executed` is `false` on it) and no longer re-posts one for a
+non-idempotent document. On this side that falls through to `failed_unknown`, so
+`rate_limited` now means exactly one thing: **Shopify refused the document
+before executing it, on its own structured GraphQL throttle error.** §6 and §7a
+say so; nothing was added to or removed from the vocabulary, and the slug still
+sits in `failed_unsent`.
+
+**What it costs you**, because it is a real cost and not a tidy-up: an
+HTTP-layer rate limit on a refund parks the row on `Unverified` and needs a
+human. Hand work is recoverable; a double payout is not.
+
+**And one thing that was simply unsound.** This side's own
+`_proves_not_executed` ended with `status_code in (401, 403)` beside the flag,
+justified as belt-and-braces for an "older code path" that raised without it. No
+such path exists — every raise in the client sets the flag and the class
+defaults it `false` — so what the fallback could actually reach was an exception
+from something that had *declined* to make the claim, with this side then making
+it on that thing's behalf. Two sources of truth for one payout decision is the
+deadlock version 3 already removed once. The flag is now the only one, and a
+401 that does not carry it is `failed_unknown`. Nothing caller-visible changes:
+the client's own 401/403 raises set it, so a real auth rejection is still
+`not_authorised` / `failed_unsent`.
+
 ### Version 4 — dispatch at `Approved`, and an allow-list on the channel (2026-09-07)
 
 Asked for from the `payment_portals` side after it built the whole calling half
@@ -767,8 +1024,18 @@ instead of trailing it, because the field it is stored in keeps only the first
 off the end; `resolve_unverified_writeback` and `writeback_now` now check
 availability before permission, as `write_back_refund` already did; and the
 Shopify Settings description no longer tells an admin the write-back is enqueued
-and fires when a Refund Request reaches Completed, neither of which has been true
-since the dispatcher was deferred.
+and fires when a Refund Request reaches Completed, neither of which is true — it
+runs synchronously (§7), and version 4 moved the dispatchable state to
+`Approved`/`Queued`.
+
+That paragraph used to close by blaming the deferral of the dispatcher, and that
+explanation has been false since `f431c17`.
+The dispatcher **is** registered, under `refund_payout_dispatchers` in
+`hooks.py`, so `payment_portals`' Send step reaches `write_back_refund` on its
+own and the form button is no longer the only trigger — see §2 and §2b, which
+have carried both callers since version 4. A document that still described the
+write-back as button-only would tell an integrator their own dispatch could not
+be firing, on a path that pays customers.
 
 ### Version 3 — authorisation belongs to the caller (2026-09-04)
 

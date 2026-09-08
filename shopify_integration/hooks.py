@@ -18,12 +18,22 @@ doctype_js = {
     # Refund Request belongs to payment_portals; this only adds a Shopify
     # write-back banner and button, and renders nothing on a non-Shopify refund.
     #
-    # That button is the ONLY trigger for the refund write-back — there is
-    # deliberately no doc_events entry for "Refund Request".  A successful
-    # refundCreate pays the customer (the Cashfree-OCC app turns it into a real
-    # Cashfree refund), so it is a payout rather than a record, and the decision
-    # to fire it belongs with whatever owns the refund's money path, not with a
-    # post-submit save handler here.  See utils/refund.py.
+    # That button is ONE OF TWO triggers for the write-back, not the only one.
+    # The other is refund_payout_dispatchers at the bottom of this file: since
+    # contract version 4, payment_portals' Send step on a "Shopify" channel
+    # refund resolves that hook and the payout is dispatched with nobody
+    # pressing anything here.  This comment was true when it was written and
+    # was not corrected when f431c17 registered the dispatcher, so it read as
+    # a reassurance that enable_refund_writeback armed nothing.  It does arm
+    # the Send path.
+    #
+    # What has NOT changed, and is still exactly right: there is deliberately
+    # no doc_events entry for "Refund Request".  A successful refundCreate
+    # pays the customer (the Cashfree-OCC app turns it into a real Cashfree
+    # refund), so it is a payout rather than a record, and the decision to
+    # fire it belongs with whatever owns the refund's money path — never
+    # with a post-submit save handler here, which would pay a customer as a
+    # side effect of somebody saving a form.  See utils/refund.py.
     "Refund Request": "public/js/refund_request.js",
 }
 

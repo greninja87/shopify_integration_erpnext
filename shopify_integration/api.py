@@ -19,7 +19,10 @@ import json
 
 import frappe
 from frappe.utils.password import get_decrypted_password
-from shopify_integration.utils.refund_report import report_refund_from_webhook
+from shopify_integration.utils.refund_report import (
+    needs_report_note,
+    report_refund_from_webhook,
+)
 from shopify_integration.utils.webhook import log_webhook, update_log_status
 from shopify_integration.utils.sales_order import create_sales_order_from_shopify
 from shopify_integration.shopify_integration.doctype.shopify_settings.shopify_settings import (
@@ -165,14 +168,50 @@ def shopify_webhook():
             # (a refund that never reached Cashfree, plus the Shopify refund's
             # own note, line items, restock and staff user).  Never raises, so
             # it cannot turn a refund we already have into a webhook retry.
-            # See utils/refund_report.py and REFUND-REPORT-CONTRACT.md.
+            #
+            # Called on every refunds/create, but NOT unconditional: a refund
+            # this app wrote back to Shopify itself is skipped inside
+            # report_refund(), which consults the same
+            # refund_request_for_shopify_refund() the credit-note path below
+            # uses, and returns outcome "own_writeback" without telling
+            # anybody.  Our own refundCreate fires this very webhook, so
+            # without that check payment_portals would be told about a refund
+            # it raised and is already booking — the second recorder for one
+            # refund, which is two Payment Entries.  The check lives at that
+            # seam rather than here on purpose: the backfill path crosses it
+            # too, and a guard written here is a guard the backfill forgets.
+            #
+            # A refund on an order where a write-back of ours was posted and
+            # never confirmed IS reported, carrying the Refund Request names
+            # as an optional fact, because a withheld report is an omission
+            # nothing recovers.  The credit-note enqueue below withholds on
+            # the same evidence and says why; the two paths differ on purpose.
+            #
+            # Delivery is at-least-once by design.  A Shopify retry of this
+            # webhook reports the same refund again, and the observer dedupes
+            # on shopify_refund_id.  See utils/refund_report.py and
+            # REFUND-REPORT-CONTRACT.md §5a.
             report = report_refund_from_webhook(
                 order_data,
                 shop_domain=shop_domain,
                 shopify_order_name=_log_order_name,
             )
-            report_note = "" if report.get("delivered") else (
+            # The note exists for a report that did NOT land: it puts the
+            # reason on the log row a person opens.  It is deliberately NOT
+            # branched on `delivered` alone — the deliberate skip is not
+            # delivered either, and `own_writeback` is the EXPECTED outcome for
+            # every refund this app writes back, so branching that way pasted
+            # an explanatory sentence into the error_message of every one of
+            # those webhooks.  An error field carrying a routine sentence is an
+            # error field nobody reads.  A delivered report writes nothing here
+            # either, including the one delivered while a write-back of ours
+            # was unconfirmed: that one is already in the Error Log with the
+            # row to resolve, which is where whoever has to act on it looks.
+            # The predicate lives beside the outcome vocabulary so this cannot
+            # drift from it.
+            report_note = (
                 f" Refund report: {report.get('message', '')}"
+                if needs_report_note(report.get("outcome", "")) else ""
             )
 
             if settings.get("enable_sales_invoice") and settings.get("enable_credit_note"):

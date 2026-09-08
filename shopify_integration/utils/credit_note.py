@@ -19,6 +19,95 @@ Entry points:
 
 import frappe
 
+# What `_writeback_in_the_way` found, and what the Shopify Log should say about
+# it.  Two reasons, not one, because they mean opposite things to whoever opens
+# the row: the first says ERPNext already has the Credit Note, and the second
+# says nobody knows yet whether it should have one at all.
+_OWN_REFUND_REASON = (
+    "This refund was raised in ERPNext and written back to Shopify by this "
+    "app, so its Credit Note already exists. No second Credit Note was "
+    "created."
+)
+
+
+def _writeback_in_the_way(refund_data: dict) -> dict:
+    """What this app already knows about this refund, or {}.
+
+    Two states stop a Credit Note, and they are not the same state:
+
+    `own_refund` — `shopify_refund_gid` matches, so `refund.py` posted this
+    exact refund and READ Shopify's answer.  Certain: ERPNext has it.
+
+    `unconfirmed` — a write-back of ours on this ORDER is `Unverified` with no
+    GID, because the GID is written only from a response we read.  Every
+    `failed_unknown` outcome (worker killed after the post, a timeout, a 5xx, a
+    200 with no refund object) leaves such a row, so this refund MAY be that
+    one and may be somebody else's, and nothing here can tell.  The old guard
+    saw only the GID and therefore built a second Credit Note across that whole
+    window.
+
+    **Withholding is the right direction HERE, and the opposite of what
+    `utils/refund_report.py` does with the same evidence.  The asymmetry is
+    deliberate; do not make the two agree.**  What differs is the cost of being
+    wrong.  A duplicate report is one the observer is obliged to dedupe on
+    `shopify_refund_id` and can absorb, while a withheld report is a refund
+    nothing ever records — so that path reports and hands over the fact.  A
+    duplicate Credit Note is a real accounting document somebody has to cancel
+    by hand, and withholding it is visible: `_create_credit_note_background`
+    writes a "Skipped" row with the reason below onto the Shopify Log a person
+    opens, which nothing on the report path does.  So here the reversible
+    mistake is to wait.
+
+    Returned as a dict of two sentences rather than acted on: `log` for the
+    logger line the core function writes, `reason` for the Shopify Log row the
+    background job writes.  One function, so the two cannot come to disagree
+    about which state was found.
+    """
+    from shopify_integration.utils.refund import (
+        refund_request_for_shopify_refund,
+        unverified_writebacks_for_order,
+    )
+
+    refund_id = str(refund_data.get("id", ""))
+    own_refund = refund_request_for_shopify_refund(refund_id)
+    if own_refund:
+        return {
+            "log": (
+                f"Shopify: refund {refund_id} was written back from Refund "
+                f"Request {own_refund} — skipping Credit Note creation, "
+                f"ERPNext already has one."
+            ),
+            "reason": _OWN_REFUND_REASON,
+        }
+
+    order_id = str(refund_data.get("order_id", ""))
+    unconfirmed = unverified_writebacks_for_order(order_id)
+    if unconfirmed:
+        rows = ", ".join(unconfirmed)
+        return {
+            "log": (
+                f"Shopify: refund {refund_id} arrived on order {order_id} "
+                f"while write-back(s) {rows} were unconfirmed — skipping "
+                f"Credit Note creation until a person says whose refund it is."
+            ),
+            "reason": (
+                f"No Credit Note was created: this refund MAY be one this app "
+                f"posted to Shopify and never confirmed. Refund Request(s) "
+                f"{rows} on this order are Unverified — the refund was sent "
+                f"and its outcome never read — so nobody yet knows whether "
+                f"this is that refund coming back or a second one made in "
+                f"Shopify. A duplicate Credit Note has to be cancelled by "
+                f"hand, so it was not created. The way through: check the "
+                f"order in Shopify, resolve {rows} with "
+                f"resolve_unverified_writeback ('paid' with the refund's GID, "
+                f"or 'not_paid'), and then create the Credit Note by hand "
+                f"against the Sales Invoice for this order if it is still "
+                f"needed."
+            ),
+        }
+
+    return {}
+
 
 # ── Background job (enqueued from api.py) ─────────────────────────────────────
 
@@ -32,16 +121,22 @@ def _create_credit_note_background(refund_data: dict, store_name: str, log_name:
     try:
         cn_name = create_credit_note_from_shopify_refund(refund_data, settings)
         if not cn_name:
-            # This refund is ERPNext's own, written back by utils/refund.py, and
-            # the Credit Note for it already exists.  Not an error.
+            # Not an error, and not one reason either: the core function
+            # declines for two different states and they need different
+            # sentences on the row a person opens.  Asked again rather than
+            # returned out of the call, so the None contract stays a None; the
+            # fallback covers only the case where somebody resolved the row in
+            # between, and it must not claim the Credit Note already exists.
+            skip = _writeback_in_the_way(refund_data)
             update_log_status(
                 log_name=log_name,
                 shopify_order_id=order_id,
                 status="Skipped",
-                error=(
-                    "This refund was raised in ERPNext and written back to "
-                    "Shopify by this app, so its Credit Note already exists. "
-                    "No second Credit Note was created."
+                error=skip.get("reason") or (
+                    "No Credit Note was created: this refund is one this app "
+                    "raised, or one it may have raised and never confirmed. "
+                    "Check the Refund Request(s) for this order before "
+                    "creating a Credit Note by hand."
                 ),
             )
             return
@@ -77,7 +172,8 @@ def create_credit_note_from_shopify_refund(refund_data: dict, settings) -> str |
     :param refund_data: Shopify refund dict (from refunds/create webhook payload)
     :param settings:    Shopify Settings document
     :return:            Credit Note (Sales Invoice) name, or None when the refund
-                        is one this app wrote back and ERPNext already has it
+                        is one this app wrote back and ERPNext already has it,
+                        or one it MAY have written back and never confirmed
     :raises:            frappe.DoesNotExistError when no SI is found for the order
     :raises:            Any exception from ERPNext document creation
     """
@@ -93,15 +189,15 @@ def create_credit_note_from_shopify_refund(refund_data: dict, settings) -> str |
     # a path that does not set return_against to the same original SI, and in
     # any case a partial second refund of the same order is legitimate and must
     # still work.  Matching the refund's own id is the precise test.
-    from shopify_integration.utils.refund import refund_request_for_shopify_refund
-
-    refund_id = str(refund_data.get("id", ""))
-    own_refund = refund_request_for_shopify_refund(refund_id)
-    if own_refund:
-        frappe.logger().info(
-            f"Shopify: refund {refund_id} was written back from Refund Request "
-            f"{own_refund} — skipping Credit Note creation, ERPNext already has one."
-        )
+    #
+    # It is not the only test, though, and the reason it cannot be is that the
+    # GID it matches on is written only AFTER a successful response — so a
+    # write-back that lost its answer left this guard blind to a refund that
+    # may well be ours.  `_writeback_in_the_way` covers both states and says
+    # why this path withholds where the report path delivers.
+    skip = _writeback_in_the_way(refund_data)
+    if skip:
+        frappe.logger().info(skip["log"])
         return None
 
     from erpnext.controllers.accounts_controller import make_return_doc

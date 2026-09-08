@@ -47,6 +47,44 @@ WRITEBACK_FIELDS = {
 }
 
 
+def install_sales_order_lookup(testcase):
+    """Give `frappe.get_all` the multi-row reads this module makes, answered
+    from the fake DB, and restore it on cleanup.
+
+    The stub's `get_all` returns [] for everything, which is the right default
+    for a fake that records writes — but `unverified_writebacks_for_order` has
+    to see EVERY Sales Order carrying a Shopify order id, because an amended
+    order leaves two of them and the Refund Request points at one.  Without
+    this the amended case cannot be tested at all, and it is the case that
+    exists on this site (see the `already_paid` GID test below).
+
+    Filters go through the stub's own `_filter_matches`, not a bare `==`, for
+    a reason that only appeared once the lookup returned every match: it reads
+    Refund Requests with `sales_order: ["in", [...]]` and `docstatus: 1`, and a
+    fake that compared the two-element operator list for equality would match
+    nothing and report "no unresolved write-back" for an order that had one.
+    Names are sorted, so a test pins one order rather than dict insertion.
+    """
+    real = frappe.get_all
+
+    def _get_all(doctype, filters=None, fields=None, pluck=None, **kwargs):
+        names = sorted(
+            name for name, doc in frappe_stub.DB.get(doctype, {}).items()
+            if frappe_stub._filter_matches(doc, filters)
+        )
+        if pluck:
+            return [
+                name if pluck == "name"
+                else frappe_stub.DB[doctype][name].get(pluck)
+                for name in names
+            ]
+        return [{"name": name} for name in names]
+
+    frappe.get_all = _get_all
+    testcase.addCleanup(lambda: setattr(frappe, "get_all", real))
+    return _get_all
+
+
 def targets_response(transactions=None, order=True):
     """A RefundTargets response.  order.transactions as a plain list, which is
     the shape the docs show for that field."""
@@ -138,9 +176,14 @@ class WritebackTestCase(unittest.TestCase):
         self.calls = []
         self.responses = [targets_response(), refund_created()]
 
-        def fake_execute(settings, query, variables=None, operation=""):
+        def fake_execute(settings, query, variables=None, operation="", **kwargs):
+            # **kwargs rather than a declared `idempotent=True`, deliberately.
+            # The tests below assert on what refund.py actually PASSED, and a
+            # default here would make "posted with the ordinary retries" and
+            # "posted with idempotent=False" indistinguishable — which is the
+            # single fact every post-send "nothing was sent" claim rests on.
             self.calls.append({"query": query, "variables": variables or {},
-                               "operation": operation})
+                               "operation": operation, "kwargs": dict(kwargs)})
             if not self.responses:
                 raise AssertionError(f"unexpected GraphQL call: {operation}")
             response = self.responses.pop(0)
@@ -173,6 +216,18 @@ class WritebackTestCase(unittest.TestCase):
     @property
     def mutations(self):
         return [c for c in self.calls if c["operation"] == "refundCreate"]
+
+    def posted_kwargs(self, operation):
+        """The keyword arguments refund.py passed to execute() for that call.
+
+        `{}` when it passed none, so a test can tell "posted with
+        idempotent=False" from "did not say" — which is the difference between
+        a post that happened at most once and one that may have happened up to
+        five times.
+        """
+        calls = [c for c in self.calls if c["operation"] == operation]
+        self.assertTrue(calls, f"no {operation} call was made")
+        return calls[0]["kwargs"]
 
     def assertNothingSent(self):
         self.assertEqual(
@@ -351,8 +406,14 @@ class TestResponseFailures(WritebackTestCase):
     def test_an_auth_rejection_is_unsent_not_unverified(self):
         """Rejected at the auth layer before the document ran.  Calling this
         unknown would park every refund on a mis-scoped token in Unverified for a
-        person to clear by hand."""
-        self.responses = [targets_response(), ShopifyAPIError("forbidden", 403)]
+        person to clear by hand.
+
+        `proves_not_executed=True` is the shape execute() raises for a 401/403,
+        and since round 3 it is the only thing this side reads."""
+        self.responses = [
+            targets_response(),
+            ShopifyAPIError("forbidden", 403, proves_not_executed=True),
+        ]
         result = r.write_back_refund(REFUND)
 
         self.assertEqual(result["outcome"], r.OUTCOME_FAILED_UNSENT)
@@ -821,13 +882,14 @@ class TestSentMarker(WritebackTestCase):
         seen = {}
         real_execute = r.execute
 
-        def watching_execute(settings, query, variables=None, operation=""):
+        def watching_execute(settings, query, variables=None, operation="",
+                             **kwargs):
             if operation == "refundCreate":
                 seen["status"] = frappe_stub.get_doc_values(
                     r.REFUND_REQUEST, REFUND
                 ).get(r.WRITEBACK_STATUS_FIELD)
                 seen["commits"] = len(frappe_stub.COMMITS)
-            return real_execute(settings, query, variables, operation)
+            return real_execute(settings, query, variables, operation, **kwargs)
 
         r.execute = watching_execute
         result = r.write_back_refund(REFUND)
@@ -846,10 +908,10 @@ class TestSentMarker(WritebackTestCase):
 
         real_execute = r.execute
 
-        def killed(settings, query, variables=None, operation=""):
+        def killed(settings, query, variables=None, operation="", **kwargs):
             if operation == "refundCreate":
                 raise SystemExit("worker killed")
-            return real_execute(settings, query, variables, operation)
+            return real_execute(settings, query, variables, operation, **kwargs)
 
         r.execute = killed
         with self.assertRaises(SystemExit):
@@ -864,10 +926,10 @@ class TestSentMarker(WritebackTestCase):
         self.responses = [targets_response()]
         real_execute = r.execute
 
-        def killed(settings, query, variables=None, operation=""):
+        def killed(settings, query, variables=None, operation="", **kwargs):
             if operation == "refundCreate":
                 raise SystemExit("worker killed")
-            return real_execute(settings, query, variables, operation)
+            return real_execute(settings, query, variables, operation, **kwargs)
 
         r.execute = killed
         with self.assertRaises(SystemExit):
@@ -897,10 +959,10 @@ class TestSentMarker(WritebackTestCase):
         self.responses = [targets_response()]
         real_execute = r.execute
 
-        def killed(settings, query, variables=None, operation=""):
+        def killed(settings, query, variables=None, operation="", **kwargs):
             if operation == "refundCreate":
                 raise SystemExit("worker killed")
-            return real_execute(settings, query, variables, operation)
+            return real_execute(settings, query, variables, operation, **kwargs)
 
         r.execute = killed
         with self.assertRaises(SystemExit):
@@ -917,7 +979,11 @@ class TestSentMarker(WritebackTestCase):
             ([targets_response(),
               refund_created(user_errors=[{"field": None, "message": "too large"}])],
              "rejected_by_shopify"),
-            ([targets_response(), ShopifyAPIError("forbidden", 403)], "not_authorised"),
+            # The flag is what carries the 401/403 claim; execute() sets it, and
+            # since round 3 nothing here infers it from the status code.
+            ([targets_response(),
+              ShopifyAPIError("forbidden", 403, proves_not_executed=True)],
+             "not_authorised"),
         ):
             self.seed()
             self.responses = list(responses)
@@ -936,6 +1002,468 @@ class TestSentMarker(WritebackTestCase):
             self.responses = list(responses)
             r.write_back_refund(REFUND)
             self.assertEqual(self.stored(r.WRITEBACK_STATUS_FIELD), r.STATUS_FAILED)
+
+
+# ── Posted at most once ───────────────────────────────────────────────────────
+
+class TestWhatProvesNonExecution(unittest.TestCase):
+    """`_proves_not_executed` is the assertion two `failed_unsent` codes stand
+    on, so it is pinned as a pure function as well as through the write-back.
+
+    The evidence it reads is the client's own verdict,
+    `ShopifyAPIError.proves_not_executed`, and nothing else.  Only the raise
+    site saw the response body, and one code covers two opposite facts: a
+    THROTTLED 200 refused before execution began is Shopify refusing to run the
+    document, while a THROTTLED 200 that shows execution began may be hiding a
+    mutation that committed.  Reading the code here gets that second one
+    exactly backwards, and backwards means reporting a paid refund as
+    never-sent.
+
+    There is no second source of truth beside the flag any more, and that is
+    round 3's change.  The helper used to fall back to
+    `status_code in (401, 403)`, justified as belt-and-braces for "an older
+    code path that predates the flag" — a path that does not exist: every raise
+    in the client sets the flag and the class defaults it False.  Two sources
+    of truth for one money decision is the deadlock CONTRACT_VERSION 3 already
+    removed once, so the inference is gone and the tests below pin its absence.
+    """
+
+    def test_the_clients_own_verdict_is_what_proves_it(self):
+        """Set by execute() on exactly two kinds of raise — 401/403, and a
+        THROTTLED 200 that Shopify refused BEFORE execution began."""
+        for exc in (ShopifyAPIError("returned HTTP 401 — …", 401,
+                                    proves_not_executed=True),
+                    ShopifyAPIError("GraphQL errors: throttled", 200,
+                                    error_codes=["THROTTLED"],
+                                    proves_not_executed=True),
+                    ShopifyAPIError("no data", None, proves_not_executed=True)):
+            self.assertTrue(r._proves_not_executed(exc), str(exc))
+
+    def test_a_throttled_error_code_alone_proves_nothing(self):
+        """The defect this replaced.  A THROTTLED 200 whose body carried `data`
+        raises with the same extensions.code and the opposite meaning: the
+        document may have executed and paid the customer.  Sniffing the code
+        reported that as "nobody was paid, safe to retry"."""
+        exc = ShopifyAPIError("GraphQL errors: throttled", 200,
+                              error_codes=["THROTTLED"])
+        self.assertFalse(exc.proves_not_executed)
+        self.assertFalse(
+            r._proves_not_executed(exc),
+            "a THROTTLED code without the client's verdict was read as proof; "
+            "that is the response that may already have paid the customer",
+        )
+
+    def test_a_429_proves_nothing_and_the_client_no_longer_says_it_does(self):
+        """The bare HTTP 429, which is now what execute() actually raises for
+        one: `proves_not_executed=False`, because Shopify throttles GraphQL
+        with a 200 body — so a 429 on `graphql.json` may be a CDN, a WAF or an
+        egress proxy in front of the store, and such a layer knows nothing
+        about whether the document behind it ran."""
+        exc = ShopifyAPIError("rate limited (429).", 429,
+                              error_codes=["THROTTLED"])
+        self.assertFalse(exc.proves_not_executed)
+        self.assertFalse(r._proves_not_executed(exc))
+        # And with no status_code fallback left, the bare form is no different.
+        self.assertFalse(
+            r._proves_not_executed(ShopifyAPIError("rate limited", 429))
+        )
+
+    def test_an_auth_status_code_alone_no_longer_proves_anything(self):
+        """The round-3 removal, pinned so nobody reintroduces it.
+
+        `status_code in (401, 403)` was a SECOND source of truth for the one
+        decision that pays a customer, and the "older code path" it was
+        defending against does not exist: execute() sets the flag on both auth
+        raises, and ShopifyAPIError defaults it False.  What the fallback could
+        still reach was an exception from somewhere that declined to make the
+        claim — and making it on their behalf is the whole inference this
+        helper exists to refuse."""
+        for status in (401, 403):
+            exc = ShopifyAPIError("declined", status)
+            self.assertFalse(exc.proves_not_executed, status)
+            self.assertFalse(
+                r._proves_not_executed(exc),
+                f"an HTTP {status} with no verdict from the client was read as "
+                f"proof that nobody was paid",
+            )
+
+    def test_a_flagged_auth_refusal_is_still_proof(self):
+        """The removal is of the inference, not of the case: the client's own
+        401/403 raise carries the flag, and that is what classifies it."""
+        for status in (401, 403):
+            self.assertTrue(
+                r._proves_not_executed(
+                    ShopifyAPIError("declined", status, proves_not_executed=True)
+                ),
+                status,
+            )
+
+    def test_a_lost_answer_proves_nothing(self):
+        """The double-pay cases, and the reason the default is False."""
+        for exc in (ShopifyAPIError("connection reset"),
+                    ShopifyAPIError("read timed out"),
+                    ShopifyAPIError("returned HTTP 500.", 500),
+                    ShopifyAPIError("returned HTTP 502.", 502),
+                    ShopifyAPIError("errors", 200,
+                                    error_codes=["INTERNAL_SERVER_ERROR"])):
+            self.assertFalse(r._proves_not_executed(exc), str(exc))
+
+    def test_it_never_raises_on_an_exception_carrying_neither_attribute(self):
+        """It is called inside the handler that decides whether a customer was
+        paid, so a bare Exception has to read as "proves nothing" rather than
+        blow that handler up."""
+        self.assertFalse(r._proves_not_executed(Exception("boom")))
+
+    def test_nothing_but_the_explicit_proof_is_consulted_at_all(self):
+        """A structural tripwire on the BODY, not the docstring — which talks
+        about `error_codes` and about 401 at length, because saying why each
+        inference is gone is the only thing that stops it coming back as an
+        `or` beside the flag.  The flag is False on exactly the responses those
+        inferences fire on, so such an `or` restores the defect while reading
+        as a safety belt."""
+        import inspect
+
+        source = inspect.getsource(r._proves_not_executed)
+        body = source.split('"""')[-1]
+        self.assertIn("proves_not_executed", body)
+        self.assertNotIn("error_codes", body)
+        self.assertNotIn("THROTTLED", body)
+        self.assertNotIn(
+            "status_code", body,
+            "the status-code inference is back; two sources of truth for one "
+            "payout decision is what round 3 removed",
+        )
+        self.assertNotIn("401", body)
+        self.assertNotIn("403", body)
+
+
+class TestPostedAtMostOnce(WritebackTestCase):
+    """The delivery guarantee every post-send claim in this module rests on.
+
+    `build_refund_mutation()` is called with no key, so the `@idempotent`
+    directive is absent and Shopify cannot recognise a second POST of the same
+    document as the same refund.  `idempotent=False` is what makes the mutation
+    posted at most once in any way that could have executed, and it is what
+    makes the classification below sound rather than hopeful: a `userErrors`
+    answer, a 401 or an exhausted 429 now describe the ONLY request that could
+    have run.
+
+    Under `execute()`'s default retries they described the last of up to five
+    attempts, and the scenario a code review named is this: attempt 1 creates
+    the refund, its response dies in the socket timeout, attempt 2 is declined
+    with "Refund amount exceeds the amount refundable on this order" *precisely
+    because attempt 1 consumed the headroom* — and `write_back_refund` then
+    wrote `Failed` over the durable `Unverified` marker, returned
+    `retry_safe: true`, and `refund_request.js` offered "Retry Shopify Refund"
+    on a refund the customer had already been paid.
+    """
+
+    def test_the_mutation_is_posted_at_most_once(self):
+        """The structural guard, and it asserts on the argument `execute()`
+        actually received rather than on the source, because here the argument
+        *is* the behaviour."""
+        result = r.write_back_refund(REFUND)
+
+        self.assertTrue(result["ok"], result)
+        self.assertIs(
+            self.posted_kwargs("refundCreate").get("idempotent"), False,
+            "refundCreate was posted with the ordinary retries; a lost response "
+            "on attempt 1 then pays the customer a second time",
+        )
+
+    def test_the_modules_own_comments_do_not_overstate_the_guarantee(self):
+        """The comments at the post and at CONTRACT_VERSION 5 said flatly that
+        "refundCreate is posted AT MOST ONCE".  It is not: an exhausted 429
+        posts the identical mutation five times, and every one of them is
+        refused — which is exactly why it is safe.  The property is at most one
+        post that could have EXECUTED, and every post-send "nobody was paid"
+        verdict rests on the refusal rather than on the count.
+
+        A reader who takes the headline at face value is reasoning from
+        something false, and the thing they would most plausibly do with it is
+        restore `execute()`'s default retries here."""
+        import re
+
+        source = open(r.__file__, encoding="utf-8").read()
+        for match in re.finditer(r"(?i)at most once", source):
+            tail = " ".join(source[match.end():match.end() + 160].split())
+            self.assertIn(
+                "execut", tail.lower(),
+                f"an unqualified 'at most once' in refund.py: "
+                f"...{tail[:120]}...",
+            )
+
+    def test_the_targets_query_keeps_its_retries(self):
+        """`RefundTargets` is a read.  Re-posting it cannot pay anybody, so it
+        keeps `execute()`'s resilience — trading a safe retry for a fragile one
+        buys nothing and costs every transient 5xx a refusal somebody has to
+        re-drive by hand."""
+        r.write_back_refund(REFUND)
+
+        self.assertIsNot(
+            self.posted_kwargs("RefundTargets").get("idempotent"), False,
+            "the RefundTargets read lost its retries; only the mutation needs "
+            "the at-most-once rule",
+        )
+
+    def test_user_errors_after_send_are_unsent_on_a_single_post(self):
+        """The classification was always right and was not sound: with retries
+        on, `check_user_errors` only ever saw the last of up to five attempts,
+        so "Shopify read this and declined it" could be a rejection *caused* by
+        an earlier attempt that had already paid the customer."""
+        self.responses = [
+            targets_response(),
+            refund_created(user_errors=[
+                {"field": ["input", "transactions", "0", "amount"],
+                 "message": "Refund amount exceeds the amount refundable on "
+                            "this order."},
+            ]),
+        ]
+        result = r.write_back_refund(REFUND)
+
+        self.assertEqual(result["outcome"], r.OUTCOME_FAILED_UNSENT)
+        self.assertEqual(result["reason_code"], "rejected_by_shopify")
+        self.assertTrue(result["retry_safe"])
+        self.assertFalse(result["possibly_paid"])
+        self.assertEqual(result["status"], r.STATUS_FAILED)
+        self.assertEqual(self.stored(r.WRITEBACK_STATUS_FIELD), r.STATUS_FAILED)
+        self.assertNoGid()
+        # And the claim above is true only because of this argument.
+        self.assertIs(self.posted_kwargs("refundCreate").get("idempotent"), False)
+
+    def test_a_bare_429_after_send_is_possibly_paid_not_rate_limited(self):
+        """Round 3's correction, and it is a de-escalation the other way.
+
+        `execute()` now raises a bare HTTP 429 with `proves_not_executed=False`
+        and does not re-post it for a non-idempotent document: Shopify's own
+        GraphQL throttling arrives as a 200 body, so a 429 on `graphql.json` is
+        as likely to be a CDN, a WAF or an egress proxy in FRONT of the store,
+        and such a layer knows nothing about whether the mutation behind it
+        ran.  So this falls through to `fail_unknown` and lands on
+        `Unverified`, where a person decides — deliberately, at the cost of
+        somebody opening the order in Shopify.  The alternative asserted a
+        premise about infrastructure nobody here controls, and the price of
+        that premise being wrong is a second real refund."""
+        self.responses = [
+            targets_response(),
+            ShopifyAPIError("refundCreate rate limited (429).", 429,
+                            error_codes=["THROTTLED"]),
+        ]
+        result = r.write_back_refund(REFUND)
+
+        self.assertEqual(result["status"], r.STATUS_UNVERIFIED)
+        self.assertEqual(result["outcome"], r.OUTCOME_FAILED_UNKNOWN)
+        self.assertNotEqual(
+            result["reason_code"], "rate_limited",
+            "an HTTP-layer 429 was reported as Shopify's own refusal, which is "
+            "retry-safe — on a mutation that may have executed",
+        )
+        # Shopify (or something wearing its clothes) ANSWERED, so it is the
+        # answered-but-unusable code rather than a transport failure.
+        self.assertEqual(result["reason_code"], "response_unverifiable")
+        self.assertTrue(result["possibly_paid"])
+        self.assertFalse(result["retry_safe"])
+        self.assertEqual(self.stored(r.WRITEBACK_STATUS_FIELD), r.STATUS_UNVERIFIED)
+        self.assertNoGid()
+
+    def test_shopifys_own_pre_execution_refusal_is_what_rate_limited_means(self):
+        """The one remaining route to `rate_limited`, and the only thing it
+        means now: HTTP 200, `errors[].extensions.code` of `THROTTLED`, in the
+        shape the GraphQL spec reserves for a request refused BEFORE execution
+        began — no `data` key and no `errors[].path`.  `execute()` re-posts
+        exactly that, even for this non-idempotent document, and raises with
+        `proves_not_executed=True` once the attempts run out.
+
+        The flag is the only thing that separates it from the THROTTLED below
+        that may have committed: same extensions.code, opposite meaning."""
+        self.responses = [
+            targets_response(),
+            ShopifyAPIError("refundCreate returned GraphQL errors: throttled",
+                            200, error_codes=["THROTTLED"],
+                            proves_not_executed=True),
+        ]
+        result = r.write_back_refund(REFUND)
+
+        self.assertEqual(result["outcome"], r.OUTCOME_FAILED_UNSENT)
+        self.assertEqual(result["reason_code"], "rate_limited")
+        self.assertTrue(result["retry_safe"])
+        self.assertFalse(result["possibly_paid"])
+        self.assertEqual(self.stored(r.WRITEBACK_STATUS_FIELD), r.STATUS_FAILED)
+        self.assertNoGid()
+
+    def test_a_throttle_that_may_have_committed_is_possibly_paid(self):
+        """The one the round-1 fix got backwards, and the dangerous direction.
+
+        A GraphQL document can resolve part way and then blow the cost budget,
+        so Shopify answers 200 with BOTH a populated `data` and a THROTTLED
+        error.  `refundCreate` resolves a `transactions(first: 10)` connection,
+        which has real query cost, so that shape is reachable on the very
+        mutation that pays a customer.  `execute()` refuses to re-post it and
+        raises with `proves_not_executed=False` — the same extensions.code as a
+        pure refusal and the opposite meaning.  It must land where a person
+        looks, never as retry-safe."""
+        self.responses = [
+            targets_response(),
+            ShopifyAPIError("refundCreate returned GraphQL errors: throttled",
+                            200, error_codes=["THROTTLED"]),
+        ]
+        result = r.write_back_refund(REFUND)
+
+        self.assertEqual(result["status"], r.STATUS_UNVERIFIED)
+        self.assertEqual(result["outcome"], r.OUTCOME_FAILED_UNKNOWN)
+        self.assertNotEqual(
+            result["reason_code"], "rate_limited",
+            "a THROTTLED response that may carry a committed refund was "
+            "reported as an ordinary rate limit, which is retry-safe",
+        )
+        self.assertEqual(result["reason_code"], "response_unverifiable")
+        self.assertTrue(result["possibly_paid"])
+        self.assertFalse(result["retry_safe"])
+        self.assertEqual(self.stored(r.WRITEBACK_STATUS_FIELD), r.STATUS_UNVERIFIED)
+        self.assertNoGid()
+
+    def test_a_401_after_send_is_still_not_authorised(self):
+        """Unchanged behaviour, now carrying the guarantee its comment always
+        asserted: rejected at the auth layer, before the document ran.
+
+        The fixture carries `proves_not_executed=True` because that is what
+        `execute()` raises for a 401 — and since round 3 it is the ONLY thing
+        that classifies it."""
+        self.responses = [
+            targets_response(),
+            ShopifyAPIError("unauthorized", 401, proves_not_executed=True),
+        ]
+        result = r.write_back_refund(REFUND)
+
+        self.assertEqual(result["outcome"], r.OUTCOME_FAILED_UNSENT)
+        self.assertEqual(result["reason_code"], "not_authorised")
+        self.assertTrue(result["retry_safe"])
+        self.assertEqual(self.stored(r.WRITEBACK_STATUS_FIELD), r.STATUS_FAILED)
+
+    def test_a_401_that_carries_no_verdict_is_not_read_as_proof(self):
+        """The removal of the status-code inference, end to end.
+
+        Only the raise site knows whether Shopify answered INSTEAD of running
+        the document, so a 401 arriving here without the client's verdict came
+        from somewhere that declined to make that claim — a wrapper, a mock, a
+        future code path — and this side must not make it on their behalf.  It
+        is the safe direction: `Unverified` costs somebody opening the order in
+        Shopify, while the inference costs a second real refund."""
+        self.responses = [targets_response(), ShopifyAPIError("unauthorized", 401)]
+        result = r.write_back_refund(REFUND)
+
+        self.assertEqual(result["outcome"], r.OUTCOME_FAILED_UNKNOWN)
+        self.assertEqual(result["reason_code"], "response_unverifiable")
+        self.assertFalse(result["retry_safe"])
+        self.assertTrue(result["possibly_paid"])
+        self.assertEqual(self.stored(r.WRITEBACK_STATUS_FIELD), r.STATUS_UNVERIFIED)
+
+    def test_a_500_after_send_is_unverified_and_possibly_paid(self):
+        """The line the whole distinction is drawn against.  Shopify's edge can
+        answer 502 or 503 after the mutation has committed, so a 5xx proves
+        nothing and stays a person's problem — and `idempotent=False` also means
+        `execute()` no longer retries it.
+
+        It is `response_unverifiable` rather than `transport_error_after_send`:
+        Shopify answered, the answer was unusable.  The transport worked."""
+        self.responses = [
+            targets_response(),
+            ShopifyAPIError("refundCreate returned HTTP 500.", 500),
+        ]
+        result = r.write_back_refund(REFUND)
+
+        self.assertEqual(result["status"], r.STATUS_UNVERIFIED)
+        self.assertEqual(result["outcome"], r.OUTCOME_FAILED_UNKNOWN)
+        self.assertEqual(result["reason_code"], "response_unverifiable")
+        self.assertTrue(result["possibly_paid"])
+        self.assertFalse(result["retry_safe"])
+        self.assertEqual(self.stored(r.WRITEBACK_STATUS_FIELD), r.STATUS_UNVERIFIED)
+        self.assertNoGid()
+
+    def test_a_transport_error_after_send_is_unverified(self):
+        """A timeout or a reset says the answer never came back, not that the
+        document never ran."""
+        self.responses = [targets_response(), ShopifyAPIError("connection reset")]
+        result = r.write_back_refund(REFUND)
+
+        self.assertEqual(result["status"], r.STATUS_UNVERIFIED)
+        self.assertEqual(result["outcome"], r.OUTCOME_FAILED_UNKNOWN)
+        self.assertEqual(result["reason_code"], "transport_error_after_send")
+        self.assertTrue(result["possibly_paid"])
+        self.assertEqual(self.stored(r.WRITEBACK_STATUS_FIELD), r.STATUS_UNVERIFIED)
+
+    def test_the_two_unknown_codes_split_on_whether_shopify_ANSWERED(self):
+        """Both are `failed_unknown` and both mean "a person must look", but
+        they are different facts and the contract's §6 table defines them
+        narrowly.  No status_code on the exception means the transport itself
+        failed and nothing was read back; a status_code means Shopify answered
+        something this side could not use.  Filing an HTTP 400 or 404 as a
+        transport error tells a reader the network broke, and sends them to
+        look at the wrong thing."""
+        answered = {
+            400: "refundCreate returned HTTP 400: bad request",
+            404: "refundCreate returned HTTP 404: no such order",
+            500: "refundCreate returned HTTP 500.",
+            # The bare 429 joins them in round 3: something answered, it just
+            # said nothing about whether the mutation ran.
+            429: "refundCreate rate limited (429).",
+            200: "refundCreate returned GraphQL errors: something else",
+        }
+        for status, message in answered.items():
+            self.seed()
+            self.responses = [targets_response(),
+                              ShopifyAPIError(message, status)]
+            result = r.write_back_refund(REFUND)
+            self.assertEqual(result["outcome"], r.OUTCOME_FAILED_UNKNOWN, status)
+            self.assertEqual(result["reason_code"], "response_unverifiable", status)
+
+        # Only a genuine transport failure carries no status at all.  The
+        # missing-mutation-key raise used to be listed here and is not one: it
+        # now comes back with status_code 200, and the test below is where it
+        # belongs.
+        for message in ("connection reset by peer", "read timed out",
+                        "refundCreate failed: HTTPSConnectionPool read timeout"):
+            self.seed()
+            self.responses = [targets_response(), ShopifyAPIError(message)]
+            result = r.write_back_refund(REFUND)
+            self.assertEqual(result["outcome"], r.OUTCOME_FAILED_UNKNOWN, message)
+            self.assertEqual(
+                result["reason_code"], "transport_error_after_send", message
+            )
+
+    def test_a_missing_mutation_key_is_an_answer_not_a_broken_network(self):
+        """`check_user_errors` is the REAL one here, so this pins the shape it
+        raises rather than a fixture's guess at it.
+
+        It only ever sees a body execute() already accepted and parsed, which
+        execute() reaches only on a 2xx with a non-null `data` — Shopify
+        ANSWERED, in full, and the answer simply did not contain the mutation.
+        The raise therefore carries status_code 200, and this side splits
+        "the transport failed" from "Shopify answered something unusable" on
+        `status_code is None`: raising bare filed it as
+        `transport_error_after_send` and sent the reader to look at the network
+        on a request that had come back."""
+        self.responses = [targets_response(), {"somethingElse": {}}]
+        result = r.write_back_refund(REFUND)
+
+        self.assertEqual(result["outcome"], r.OUTCOME_FAILED_UNKNOWN)
+        self.assertEqual(
+            result["reason_code"], "response_unverifiable",
+            "a response Shopify sent in full was reported as a transport error",
+        )
+        self.assertTrue(result["possibly_paid"])
+        self.assertFalse(result["retry_safe"])
+        self.assertEqual(self.stored(r.WRITEBACK_STATUS_FIELD), r.STATUS_UNVERIFIED)
+        self.assertNoGid()
+
+    def test_rate_limited_belongs_to_the_unsent_outcome_and_nothing_else(self):
+        """A new slug in a closed vocabulary payment_portals branches on, so it
+        has to sit in exactly one outcome — the one that means nobody was
+        paid."""
+        self.assertIn("rate_limited", r.REASON_CODES[r.OUTCOME_FAILED_UNSENT])
+        for outcome, codes in r.REASON_CODES.items():
+            if outcome != r.OUTCOME_FAILED_UNSENT:
+                self.assertNotIn("rate_limited", codes, outcome)
 
 
 # ── The warning must survive truncation ───────────────────────────────────────
@@ -1013,6 +1541,88 @@ class TestUnverified(WritebackTestCase):
         self.assertEqual(
             r.refund_request_for_shopify_refund("1234567890"), REFUND
         )
+
+    def test_a_well_formed_refund_gid_is_accepted_as_given(self):
+        """The other accepted form: what a person copies out of the Shopify
+        admin's URL or API response."""
+        self.unverify()
+        result = r.resolve_unverified_writeback(
+            REFUND, "paid", shopify_refund_gid=REFUND_GID
+        )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(self.stored(r.REFUND_GID_FIELD), REFUND_GID)
+        self.assertEqual(self.stored(r.WRITEBACK_STATUS_FIELD), r.STATUS_DONE)
+
+    def test_a_value_that_is_not_a_refund_id_is_refused(self):
+        """The only exit from Unverified, and two loop guards now lean on what
+        it writes: `refund_request_for_shopify_refund` matches the GID, and
+        `unverified_writebacks_for_order` stops matching once the status moves
+        to Done.  `gid()` passes anything already starting with `gid://`
+        straight through, so a mis-paste — another resource type, another
+        store's refund, a truncated id — used to be stored verbatim and then
+        permanently satisfied BOTH guards for that order: the refunds/create
+        webhook for the real refund would match nothing, be reported as an
+        externally-made refund, and earn a second Payment Entry.
+
+        Refusing costs a retype.  Accepting costs a refund that is never
+        recorded, so the message has to say what a correct value looks like."""
+        self.unverify()
+        for value in (
+            "gid://shopify/Product/1234567890",      # right store, wrong type
+            "gid://shopify/Order/1234567890",
+            "gid://shopify/Refund/",                 # truncated to nothing
+            "gid://shopify/Refund",
+            "gid://shopify/Refund/12345abc",
+            "gid://shopify/Refund/1234567890/extra",
+            "REF-00207",                             # the ERPNext name, not the id
+            "#6518",                                 # the order name
+            "https://admin.shopify.com/store/x/orders/6518",
+            "12,345",
+            "1234-5678",
+            "yes it is there",
+        ):
+            result = r.resolve_unverified_writeback(
+                REFUND, "paid", shopify_refund_gid=value
+            )
+
+            self.assertFalse(result["ok"], value)
+            self.assertIn(
+                "gid://shopify/Refund/", result["message"],
+                f"the refusal for {value!r} does not say what a correct value "
+                f"looks like",
+            )
+            self.assertEqual(
+                self.stored(r.WRITEBACK_STATUS_FIELD), r.STATUS_UNVERIFIED, value
+            )
+            self.assertFalse(
+                (self.stored(r.REFUND_GID_FIELD) or "").strip(),
+                f"{value!r} was stored as a refund id",
+            )
+
+    def test_a_padded_numeric_id_is_still_a_numeric_id(self):
+        """Refusing has to cost a retype, not a puzzle: surrounding whitespace
+        from a copy-paste is not a mis-paste."""
+        self.unverify()
+        result = r.resolve_unverified_writeback(
+            REFUND, "paid", shopify_refund_gid="  1234567890  "
+        )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(self.stored(r.REFUND_GID_FIELD), REFUND_GID)
+
+    def test_a_refused_gid_leaves_the_row_resolvable(self):
+        """A refusal must not consume the one exit: after the retype it works."""
+        self.unverify()
+        r.resolve_unverified_writeback(
+            REFUND, "paid", shopify_refund_gid="gid://shopify/Product/1234567890"
+        )
+        result = r.resolve_unverified_writeback(
+            REFUND, "paid", shopify_refund_gid="1234567890"
+        )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(self.stored(r.REFUND_GID_FIELD), REFUND_GID)
 
     def test_resolving_as_paid_without_a_gid_is_refused(self):
         """A Done row with no GID would let the refunds/create webhook build a
@@ -1135,6 +1745,257 @@ class TestCreditNoteLoopGuard(WritebackTestCase):
         self.assertIsNone(result)
         self.assertEqual(
             [d for d in frappe_stub.INSERTS if d.get("doctype") == "Sales Invoice"], []
+        )
+
+
+class TestUnverifiedWritebacksForOrder(WritebackTestCase):
+    """The other half of the loop guard, for the window the GID cannot cover.
+
+    `refund_request_for_shopify_refund` matches on `shopify_refund_gid`, and
+    that field is only written once a successful `refundCreate` response has
+    been READ.  Everything committed before the post is the `Unverified` marker
+    with the GID field still empty — so every `failed_unknown` outcome (worker
+    killed after the post, a timeout, a 5xx, "Shopify accepted the request but
+    returned no refund object") leaves a row that IS ours and carries no GID,
+    while Shopify may genuinely hold the refund.
+
+    This lookup answers "which unresolved write-backs of ours are on this
+    order?", which is the only question available in that window.  Plural since
+    round 3: the singular form returned one arbitrary row via
+    `frappe.db.get_value`, so an order carrying two unconfirmed write-backs
+    named only one of them — and the person sent to resolve it cleared one row
+    while the other went on withholding reports with nothing to point at.
+    """
+
+    def unverify(self, sales_order="SO-0001"):
+        self.set_field(**{
+            "sales_order": sales_order,
+            r.WRITEBACK_STATUS_FIELD: r.STATUS_UNVERIFIED,
+            r.REFUND_GID_FIELD: "",
+        })
+
+    def second_unverified(self, name="REF-0008", sales_order="SO-0001",
+                          docstatus=1):
+        """A second unconfirmed write-back on the same Shopify order."""
+        frappe_stub.set_doc(r.REFUND_REQUEST, name, {
+            "name": name,
+            "docstatus": docstatus,
+            "status": "Approved",
+            "refund_channel": r.CHANNEL_DISPATCH,
+            "payment_entry": "",
+            "sales_order": sales_order,
+            "net_refund_amount": 500.0,
+            "reason_note": "Second unconfirmed attempt",
+            r.REFUND_GID_FIELD: "",
+            r.WRITEBACK_STATUS_FIELD: r.STATUS_UNVERIFIED,
+        })
+        return name
+
+    def test_an_unverified_row_on_the_order_is_found(self):
+        install_sales_order_lookup(self)
+        self.unverify()
+        self.assertEqual(r.unverified_writebacks_for_order(ORDER_ID), [REFUND])
+
+    def test_two_unconfirmed_writebacks_on_one_order_are_both_named(self):
+        """The reason this is plural.  Two rows can be Unverified on the same
+        order — a first attempt that lost its answer, then a second refund
+        raised for the rest of the order that lost its answer too — and
+        `frappe.db.get_value` returned whichever the database offered first.
+        Naming one of two tells a person the order is clear once they have
+        resolved it, while the refund the unnamed row may have paid is the one
+        nothing ever records."""
+        install_sales_order_lookup(self)
+        self.unverify()
+        second = self.second_unverified()
+
+        self.assertEqual(
+            r.unverified_writebacks_for_order(ORDER_ID),
+            sorted([REFUND, second]),
+            "an order with two unconfirmed write-backs named only one of them",
+        )
+
+    def test_the_order_of_the_result_is_deterministic(self):
+        """Two callers reading the same order must be told the same thing, and
+        a log line that reshuffles between runs cannot be diffed."""
+        install_sales_order_lookup(self)
+        self.unverify()
+        self.second_unverified(name="REF-0002")
+        self.second_unverified(name="REF-0009")
+
+        first = r.unverified_writebacks_for_order(ORDER_ID)
+        self.assertEqual(first, r.unverified_writebacks_for_order(ORDER_ID))
+        self.assertEqual(first, sorted(first))
+
+    def test_a_cancelled_refund_request_is_not_a_hit(self):
+        """The docstatus filter, and it is not hypothetical: cancelling the
+        stuck request is exactly what an operator reaches for when a row will
+        not clear.  A cancelled Refund Request is no longer ERPNext's record of
+        anything, so it must stop withholding refund reports for the order —
+        otherwise the refund Shopify really made is never recorded anywhere,
+        which is the omission nothing can recover."""
+        install_sales_order_lookup(self)
+        self.unverify()
+        self.set_field(docstatus=2)
+        self.assertEqual(r.unverified_writebacks_for_order(ORDER_ID), [])
+
+    def test_a_draft_refund_request_is_not_a_hit_either(self):
+        """Same filter, the other side of it.  A draft was never submitted, so
+        nothing dispatched from it and no mutation was ever posted."""
+        install_sales_order_lookup(self)
+        self.unverify()
+        self.set_field(docstatus=0)
+        self.assertEqual(r.unverified_writebacks_for_order(ORDER_ID), [])
+
+    def test_a_cancelled_row_does_not_hide_a_live_one(self):
+        """The filter must narrow the answer, not replace it."""
+        install_sales_order_lookup(self)
+        self.unverify()
+        live = self.second_unverified(name="REF-0009")
+        self.set_field(docstatus=2)
+        self.assertEqual(r.unverified_writebacks_for_order(ORDER_ID), [live])
+
+    def test_a_row_in_any_other_state_is_not_a_hit(self):
+        """Done, Failed, Skipped and Pending are all resolved as far as this
+        question goes: Done has a GID for the other lookup to match, and the
+        rest were never posted or were cleanly refused."""
+        install_sales_order_lookup(self)
+        for status in ("", r.STATUS_DONE, r.STATUS_FAILED, r.STATUS_SKIPPED,
+                       r.STATUS_PENDING):
+            self.set_field(**{r.WRITEBACK_STATUS_FIELD: status})
+            self.assertEqual(
+                r.unverified_writebacks_for_order(ORDER_ID), [], status
+            )
+
+    def test_an_unverified_row_on_a_different_order_is_not_a_hit(self):
+        """The lookup is order-scoped, and has to be: an unresolved write-back
+        on one order says nothing about a refund somebody made on another."""
+        install_sales_order_lookup(self)
+        self.unverify()
+        self.assertEqual(r.unverified_writebacks_for_order("9999999999999"), [])
+
+    def test_an_amended_sales_order_is_still_the_same_shopify_order(self):
+        """A Sales Order amended after the Refund Request was raised leaves two
+        documents carrying the same shopify_order_id, and the refund points at
+        one of them.  Matching a single Sales Order would miss the row and
+        report our own possibly-paid refund as an external one."""
+        install_sales_order_lookup(self)
+        frappe_stub.set_doc("Sales Order", "SO-0001-1", {
+            "shopify_order_id": ORDER_ID,
+            "shopify_store": "notdrones.myshopify.com",
+        })
+        self.unverify(sales_order="SO-0001-1")
+        self.assertEqual(r.unverified_writebacks_for_order(ORDER_ID), [REFUND])
+
+    def test_both_halves_of_an_amended_order_are_reported(self):
+        """The amendment and the original can each carry an unconfirmed
+        write-back, and those are two refunds, not one."""
+        install_sales_order_lookup(self)
+        frappe_stub.set_doc("Sales Order", "SO-0001-1", {
+            "shopify_order_id": ORDER_ID,
+            "shopify_store": "notdrones.myshopify.com",
+        })
+        self.unverify()
+        amended = self.second_unverified(sales_order="SO-0001-1")
+
+        self.assertEqual(
+            r.unverified_writebacks_for_order(ORDER_ID),
+            sorted([REFUND, amended]),
+        )
+
+    def test_it_is_inert_without_the_refund_request_doctype(self):
+        """Same rule as every other entry point: this module stays installable
+        on a site with no payment_portals, so the answer there is an empty list
+        rather than an exception inside a webhook."""
+        install_sales_order_lookup(self)
+        self.unverify()
+        frappe_stub.META_FIELDS[r.REFUND_REQUEST] = set()
+        self.assertEqual(r.unverified_writebacks_for_order(ORDER_ID), [])
+
+    def test_a_blank_order_id_is_never_a_hit(self):
+        """A refund whose order we could not read must not be claimed by a row
+        whose Sales Order link is empty."""
+        install_sales_order_lookup(self)
+        self.unverify()
+        for value in ("", None, "   "):
+            self.assertEqual(
+                r.unverified_writebacks_for_order(value), [], repr(value)
+            )
+
+    def test_an_order_with_no_sales_order_at_all_is_not_a_hit(self):
+        install_sales_order_lookup(self)
+        self.unverify()
+        self.assertEqual(r.unverified_writebacks_for_order("404040404"), [])
+
+    def test_it_never_raises_when_the_lookup_itself_fails(self):
+        """It is consulted from inside a webhook that must return 200 about a
+        refund that has already happened, so a guard that cannot decide
+        answers "no hit" and says why in the Error Log."""
+        self.unverify()
+        real = frappe.get_all
+
+        def _boom(*a, **k):
+            raise RuntimeError("no such table")
+
+        frappe.get_all = _boom
+        try:
+            self.assertEqual(r.unverified_writebacks_for_order(ORDER_ID), [])
+        finally:
+            frappe.get_all = real
+        self.assertTrue(
+            [t for _, t in frappe_stub.ERRORS if "Unverified" in t],
+            [t for _, t in frappe_stub.ERRORS],
+        )
+
+    def test_the_state_written_before_the_post_is_exactly_what_this_finds(self):
+        """End to end, and the reason this function exists: after a post-send
+        failure the row is Unverified with NO GID, so the GID lookup misses and
+        this one hits."""
+        install_sales_order_lookup(self)
+        self.responses = [targets_response(), ShopifyAPIError("connection reset")]
+        result = r.write_back_refund(REFUND)
+
+        self.assertEqual(result["status"], r.STATUS_UNVERIFIED)
+        self.assertFalse(self.stored(r.REFUND_GID_FIELD))
+        self.assertIsNone(r.refund_request_for_shopify_refund("1234567890"))
+        self.assertEqual(r.unverified_writebacks_for_order(ORDER_ID), [REFUND])
+
+    def test_resolving_the_row_ends_the_hit(self):
+        """`resolve_unverified_writeback` is the way out of the window: as paid
+        it writes the GID the other lookup matches, and as not_paid it clears
+        the status so nothing is withheld any more."""
+        install_sales_order_lookup(self)
+        self.unverify()
+        r.resolve_unverified_writeback(REFUND, "paid",
+                                       shopify_refund_gid="1234567890")
+        self.assertEqual(r.unverified_writebacks_for_order(ORDER_ID), [])
+        self.assertEqual(r.refund_request_for_shopify_refund("1234567890"), REFUND)
+
+        self.seed()
+        install_sales_order_lookup(self)
+        self.unverify()
+        r.resolve_unverified_writeback(REFUND, "not_paid")
+        self.assertEqual(r.unverified_writebacks_for_order(ORDER_ID), [])
+
+    def test_resolving_one_of_two_leaves_the_other_named(self):
+        """The consequence of the plural shape: a person who clears one row is
+        still told the order is withheld, and by which document."""
+        install_sales_order_lookup(self)
+        self.unverify()
+        second = self.second_unverified()
+        r.resolve_unverified_writeback(REFUND, "not_paid")
+
+        self.assertEqual(r.unverified_writebacks_for_order(ORDER_ID), [second])
+
+    def test_the_singular_form_is_gone(self):
+        """A tripwire, because the two shapes differ in the direction that
+        loses a row: `unverified_writeback_for_order` returned one arbitrary
+        match, so a caller left on it goes on naming one of two.  Its absence
+        is what forces every caller to be updated rather than to keep
+        working while answering less than it is asked."""
+        self.assertFalse(
+            hasattr(r, "unverified_writeback_for_order"),
+            "the singular lookup is back; it names one of two unconfirmed "
+            "write-backs and the other keeps withholding reports silently",
         )
 
 

@@ -17,6 +17,7 @@ Covers the pure half of utils/refund.py, which is where the correctness lives:
 """
 
 import unittest
+from pathlib import Path
 
 from shopify_integration.tests import frappe_stub
 
@@ -408,6 +409,65 @@ class TestRefundMutation(unittest.TestCase):
         mutation = r.build_refund_mutation('bad"key')
         self.assertNotIn('"bad"key"', mutation)
         self.assertIn("badkey", mutation)
+
+
+class TestTheBriefSaysWhereTheSafeRehearsalCanBeRun(unittest.TestCase):
+    """`REFUND-WRITEBACK-BRIEF.md` section 10 prescribes "Check What Shopify
+    Says" as the one live exercise that cannot pay anybody.
+
+    What it did not say is that the button is not always there.  It renders only
+    on a **submitted** Refund Request whose `refund_channel` is the Shopify
+    channel — `refund_request.js` returns on `docstatus !== 1` and gates both
+    action buttons on `dispatches_here`, and `get_refund_writeback_status`
+    answers `is_shopify` only when `payout_owner == OWNER_SHOPIFY`.  So an
+    operator following the brief on a `Bank Transfer` refund hunts for a button
+    that will never appear, and the document that sent them looking is the one
+    that has to say so.
+
+    Asserted against the code as well as the prose, so the description cannot
+    drift from the gate it describes.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        root = Path(__file__).resolve().parents[2]
+        cls.brief = (root / "REFUND-WRITEBACK-BRIEF.md").read_text(
+            encoding="utf-8")
+        cls.js = (root / "shopify_integration" / "public" / "js"
+                  / "refund_request.js").read_text(encoding="utf-8")
+
+    def rehearsal_section(self):
+        """The prose around the prescribed rehearsal.
+
+        Windowed rather than searched whole: `Bank Transfer` and `submitted`
+        both appear elsewhere in this document, so a whole-file match would
+        pass while the step that sends somebody looking said nothing.
+        """
+        prose = " ".join(self.brief.split())
+        at = prose.find("Check What Shopify Says")
+        self.assertNotEqual(at, -1, "the brief no longer names the rehearsal")
+        return prose[at:at + 1600]
+
+    def test_the_step_says_which_refunds_show_the_button(self):
+        section = self.rehearsal_section()
+        self.assertRegex(section, r"(?i)submitted")
+        self.assertIn("refund_channel", section)
+        self.assertIn("Bank Transfer", section)
+
+    def test_the_step_names_what_decides_it_so_it_can_be_checked(self):
+        section = self.rehearsal_section()
+        self.assertIn("get_refund_writeback_status", section)
+        self.assertIn("payout_owner", section)
+
+    def test_the_gate_the_brief_describes_is_the_gate_the_form_has(self):
+        """The document is only worth trusting if these are the same two
+        conditions the form actually applies."""
+        self.assertIn("frm.doc.docstatus !== 1", self.js)
+        self.assertIn("frm.doc.refund_channel === SHOPIFY_REFUND_CHANNEL",
+                      self.js)
+        # Both action buttons hang off that conjunction, the read-only one
+        # included — which is exactly why the read-only one can be absent.
+        self.assertIn("shopify_refund_targets_button(frm)", self.js)
 
 
 if __name__ == "__main__":

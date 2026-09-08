@@ -205,21 +205,70 @@ class TestRefundWritebackSettings(unittest.TestCase):
     def test_the_customer_email_ships_off(self):
         self.assertEqual(self.field("notify_customer_on_refund").get("default"), "0")
 
-    def test_the_description_does_not_promise_automation(self):
+    def test_the_description_does_not_promise_automation_that_does_not_exist(self):
         """It said the write-back fires "when a Refund Request reaches Completed"
-        and is "enqueued".  Neither is true — there is no doc_events hook and the
-        call is synchronous — so an admin was told refunds would flow on their own
-        when nothing would send one."""
+        and is "enqueued".  Neither is true — there is no doc_events entry for
+        Refund Request and the call is synchronous — so an admin was told refunds
+        would flow out of a save handler that this app deliberately never
+        registered.  Those four phrasings stay banned; what changed is where the
+        true statement lives, which is the next two tests."""
         description = self.field("section_refund_writeback")["description"].lower()
         for claim in ("is enqueued", "enqueued and", "automatically once",
                       "will be sent automatically"):
             self.assertNotIn(claim, description)
-        self.assertIn("nothing happens automatically", description)
 
-    def test_the_description_says_a_person_has_to_press_the_button(self):
+    def test_the_description_does_not_reassure_that_nothing_can_send_itself(self):
+        """The correction to the claim above overshot into the opposite lie, and
+        the assertion that used to sit here — assertIn("nothing happens
+        automatically") — is what pinned the overshoot in place.
+
+        `refund_payout_dispatchers` is registered in hooks.py (f431c17), so
+        payment_portals' Send step on a Shopify-channel Refund Request dispatches
+        the payout with nobody pressing anything on this form; the registration
+        is pinned by TestTheDispatcherHookIsRegistered in
+        test_refund_dispatch_gate.py, and utils/refund.py's own header lists that
+        Send step first among the two callers.  An admin who read "Nothing happens
+        automatically.  Enabling this switch does not by itself send anything."
+        and switched the checkbox on to have it ready was one Send away from a
+        real Cashfree payout — with the dispatcher registered, this checkbox is
+        the last switch in front of the money.
+
+        Of the two directions this paragraph can be wrong, that is the one that
+        pays a customer, so the reassurances are banned outright rather than
+        softened."""
+        description = self.field("section_refund_writeback")["description"].lower()
+        for reassurance in ("nothing happens automatically",
+                            "does not by itself send",
+                            "there is no trigger on the refund request"):
+            self.assertNotIn(reassurance, description)
+
+    def test_the_description_names_the_hook_that_pays_without_a_person(self):
+        """Naming the hook verbatim is what makes the paragraph checkable by the
+        person reading it: they can grep hooks.py and see the trigger for
+        themselves rather than taking the form's word for what is armed."""
+        description = self.field("section_refund_writeback")["description"].lower()
+        self.assertIn("refund_payout_dispatchers", description)
+        self.assertIn("nobody pressing a button", description)
+        self.assertIn("arms the send path", description)
+
+    def test_the_description_says_the_button_is_the_other_trigger_and_pays(self):
         description = self.field("section_refund_writeback")["description"].lower()
         self.assertIn("refund in shopify", description)
         self.assertIn("pays the customer", description)
+
+    def test_the_description_names_the_states_the_payout_goes_out_from(self):
+        """The same paragraph used to tell an admin to press the button "on a
+        submitted, Completed refund".  Since CONTRACT_VERSION 4 the payout is
+        dispatched from DISPATCHABLE_STATUSES — before ERPNext books it — and a
+        Completed refund carrying a Payment Entry comes back already_booked with
+        no button rendered at all.  Following the old sentence meant waiting for
+        a state in which nothing can be sent, so the states are read off the code
+        here instead of retyped."""
+        description = self.field("section_refund_writeback")["description"].lower()
+        for status in r.DISPATCHABLE_STATUSES:
+            self.assertIn(status.lower(), description, status)
+        self.assertIn("already_booked", description)
+        self.assertNotIn("a submitted, completed refund", description)
 
     def test_the_description_warns_about_the_double_payout(self):
         description = self.field("section_refund_writeback")["description"].lower()

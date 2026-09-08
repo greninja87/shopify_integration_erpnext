@@ -81,6 +81,8 @@ Layout follows utils/fulfillment.py: pure decision functions first, testable
 with no bench, then the frappe-bound orchestration.
 """
 
+import re
+
 import frappe
 from frappe.utils import add_to_date, cint, flt, now_datetime
 
@@ -118,7 +120,36 @@ REFUND_REQUEST = "Refund Request"
 #    one left open (a Bank Transfer refund on a Shopify order was accepted, and
 #    writing that back pays a NEFT refund a second time through the OCC bridge).
 #    Two new refused codes: channel_does_not_dispatch, already_booked.
-CONTRACT_VERSION = 4
+# 5: at most one post of refundCreate can ever have EXECUTED —
+#    execute(..., idempotent=False).  Stated that way deliberately: it is NOT
+#    "one post".  One failure is still re-POSTED, up to five times — Shopify's
+#    own THROTTLED 200-body in the shape that says it refused the document
+#    before execution began — and that is safe because every one of those posts
+#    was refused, not because there was one.  The guarantee rests on the
+#    refusal, not on the count, and a reader who takes "posted once" as the
+#    headline is reasoning from something false; the likeliest thing they then
+#    do with it is restore the ordinary retries.
+#    No key in the result changed shape; what changed is what two of them MEAN.
+#    The post-send failed_unsent verdicts (userErrors -> rejected_by_shopify,
+#    401/403 -> not_authorised) each read one response and told the caller
+#    "nobody was paid, safe to retry".  Under the ordinary retries that response
+#    was the last of up to five attempts that could each have run, so the
+#    verdict was hopeful rather than sound: attempt 1 can create the refund,
+#    lose its answer to the socket timeout, and attempt 2 be declined for
+#    exceeding the refundable amount PRECISELY because attempt 1 consumed it —
+#    reported here as retry-safe, on a refund the customer had already been
+#    paid.  With only one post able to have executed, those verdicts describe
+#    the only request that could have run, and they are true.
+#    One new reason_code, inside the existing failed_unsent outcome:
+#    rate_limited, for an exhausted pre-execution THROTTLED refusal after the
+#    post.  That is Shopify refusing to run the document, and it used to be
+#    filed as failed_unknown — which left Shopify's ordinary cost limiting
+#    sitting in Unverified for a person to clear by hand.  A bare HTTP 429 is
+#    deliberately NOT in it: see the code's own comment, and §7a of the
+#    contract.  A caller that branches on reason_code should accept the slug as
+#    one more retry-safe one; one that branches on outcome alone needs no
+#    change at all.
+CONTRACT_VERSION = 5
 
 # Refund Request state fields, created by this app as Custom Fields.
 REFUND_GID_FIELD      = "shopify_refund_gid"
@@ -216,9 +247,36 @@ REASON_CODES = {
         "no_refundable_transactions",
         "rejected_by_shopify",
         "not_authorised",
+        # Shopify's own THROTTLED 200-body, in the shape that says it refused
+        # the document BEFORE execution began, outliving execute()'s retries
+        # after the mutation was posted — and only where the client vouched for
+        # it with proves_not_executed.  Shopify answered instead of running the
+        # document, so nobody was paid.  Two things that carry the same
+        # extensions.code are NOT this code: a THROTTLED body that shows
+        # execution began, which may hide a committed mutation, and a bare HTTP
+        # 429, which says a rate limiter refused the request without saying
+        # WHICH one — Shopify throttles GraphQL with a 200 body, so a 429 here
+        # may come from a CDN or a proxy in front of the store.  Both are
+        # response_unverifiable below.  Until CONTRACT_VERSION 5 the refusal
+        # fell into failed_unknown too, which parked Shopify's ordinary cost
+        # limiting in Unverified — a state nothing retries and only a person can
+        # clear, by opening the order in Shopify to decide whether a customer
+        # had been paid.  That is a great deal of hand work for a request
+        # Shopify said it had not run.
+        "rate_limited",
         "setup_failed",
     }),
     OUTCOME_FAILED_UNKNOWN: frozenset({
+        # The two possibly-paid codes split on whether Shopify ANSWERED, which
+        # is the only evidence available and is what the contract's §6 table
+        # says each of them means.  No status_code on the exception -> the
+        # transport failed and nothing was read back.  A status_code -> Shopify
+        # answered something unusable: an HTTP 400/404/5xx, or a
+        # 200-with-errors that was not a proven refusal.  Both are "a person
+        # must look" and neither is ever retried, so the split changes where a
+        # reader is sent, not what anybody may do — but it was filing every
+        # non-refusal post-send failure under "transport error", which told
+        # that reader the network had broken when Shopify had replied in full.
         "transport_error_after_send",
         "response_unverifiable",
         "unverified_previous_attempt",
@@ -638,8 +696,14 @@ def build_refund_mutation(key: str = "") -> str:
     confirmed against the configured API version, and an unknown directive is a
     query-level error — which execute() raises on, so it would fail *every*
     write-back rather than degrade.  It is therefore off unless a caller passes
-    a key, and the stored-GID guard plus the worker claim carry idempotency on
-    their own.  Turn it on once a live response has confirmed it.
+    a key.  Turn it on once a live response has confirmed it.
+
+    What carries idempotency instead is three things, and the third is the easy
+    one to forget: the stored-GID guard, the worker claim, and — for the window
+    neither of those can reach, between the POST and the answer — the fact that
+    write_back_refund posts this document with execute(..., idempotent=False),
+    so it goes out at most once in any way that could have executed.  Without a
+    key that is the only protection there is; see the comment at the post.
 
     No key is generated anywhere yet, deliberately — a helper that minted one
     while nothing sent it would read as though retries were already protected.
@@ -1069,6 +1133,80 @@ def _response_gateways(refund) -> list:
     return gateways
 
 
+def _proves_not_executed(exc) -> bool:
+    """
+    Whether this failure is PROOF that Shopify never ran the document.
+
+    Named for what it asserts, because the assertion is the whole of it.  This
+    is consulted only after refundCreate has been posted, and a True here is
+    what licenses reporting a payout as failed_unsent — "nobody was paid, safe
+    to retry".  Wrong in the True direction and payment_portals retries a refund
+    that has already paid the customer through the Cashfree-OCC bridge.
+
+    So nothing is derived here.  There is exactly ONE source of truth and it is
+    the exception's `proves_not_executed`, which the CLIENT sets, because the
+    client is the only place that can know it: only the raise site saw the
+    response body and knows which branch raised.
+
+    What the client will certify
+    ---------------------------
+    Two raises, and they are narrow:
+
+        401 / 403        refused at the auth layer, the document unreached.
+        200 + THROTTLED  Shopify's own cost refusal, and ONLY in the shape the
+        refused before   GraphQL spec reserves for a request refused before
+        execution        execution began — no `data` key at all, and no
+                         errors[].path.  See
+                         shopify_graphql._refused_before_execution.
+
+    What it will not, however the failure looks
+    -------------------------------------------
+        200 + THROTTLED  the document resolved part way and then blew the cost
+        after execution  budget, so it may have COMMITTED.  refundCreate
+        began            resolves a transactions(first: 10) connection with real
+                         query cost, so this is reachable on the very mutation
+                         that pays a customer — and it carries the SAME
+                         extensions.code as the pure refusal above.
+        HTTP 429         Shopify throttles GraphQL with a 200 body, so a 429 on
+                         graphql.json may be a CDN, a WAF or an egress proxy in
+                         FRONT of the store, and a layer like that knows nothing
+                         about whether the document behind it ran.  Round 2
+                         certified it as a refusal on the premise "a rate
+                         limiter rejects without executing"; that is a premise
+                         about infrastructure nobody here owns, and the price of
+                         it being wrong is a second real refund.  So a bare 429
+                         no longer qualifies and lands on Unverified instead.
+        transport / 5xx  only the ANSWER is known to be lost.
+
+    Two inferences used to live here and both are gone.  The first tested
+    `"THROTTLED" in exc.error_codes`, which reads the partly-executed response
+    above as "nobody was paid, safe to retry" — exactly backwards, on the one
+    response that might already have paid a customer.  The second tested
+    `status_code in (401, 403)`, justified as belt-and-braces for an "older code
+    path" that raised without the flag; no such path exists — every raise in the
+    client sets it and the class defaults it False — so what the fallback could
+    actually reach was an exception from somewhere that declined to make the
+    claim, with this side then making it on their behalf.  Two sources of truth
+    for one money decision is the deadlock CONTRACT_VERSION 3 already removed
+    once.
+
+    Neither may come back as an `or` beside the flag.  The flag is False on
+    precisely the responses those tests fire on, so such an `or` restores the
+    defect while reading as a belt beside a brace.
+
+    The default is False, and it is the safe one: False means "assume the
+    document may have run", which lands the row on Unverified where a person
+    decides.  When the choice is between "might pay twice" and "might need a
+    human to look", this module chooses the human.
+
+    getattr with a default rather than attribute access, deliberately: this runs
+    inside the handler that decides whether a customer was paid, so an exception
+    carrying no such attribute has to read as "proves nothing" instead of
+    raising there.
+    """
+    return bool(getattr(exc, "proves_not_executed", False))
+
+
 def _log(settings, refund_name, shopify_order_id, status, message, payload=None):
     """One Shopify Log entry per attempt, successful or not."""
     from shopify_integration.utils.webhook import log_webhook
@@ -1094,11 +1232,13 @@ def write_back_refund(refund_name: str, triggered_by: str = "manual") -> dict:
 
     **This pays the customer.**  A successful refundCreate on these orders is
     bridged into a real Cashfree refund by the Cashfree-OCC app, so treat it as
-    a payout and not as bookkeeping.  Nothing calls this automatically: there is
-    no doc_events hook, deliberately, because deciding to pay somebody belongs
-    with whatever owns the refund's money path, not with a save handler here.
-    Today the only caller is the form button, via writeback_now; a dispatcher on
-    the payment_portals side is the intended one.
+    a payout and not as bookkeeping.  There is no doc_events hook, deliberately,
+    because deciding to pay somebody belongs with whatever owns the refund's
+    money path and not with a save handler here.  But two callers do reach this,
+    and since f431c17 one of them is automatic: payment_portals' Send step,
+    through the refund_payout_dispatchers hook registered in hooks.py, and
+    writeback_now behind the form button.  The module docstring above has both,
+    and REFUND-DISPATCH-CONTRACT.md 2 and 2b have the states each arrives in.
 
     Idempotent and safe to call twice: shopify_refund_gid being set is a hard
     stop, and the worker claim stops two callers racing.  Never raises — every
@@ -1297,12 +1437,62 @@ def write_back_refund(refund_name: str, triggered_by: str = "manual") -> dict:
         })
         frappe.db.commit()  # nosemgrep: frappe-manual-commit — must survive a worker that never returns
 
+        # ── The post: at most one of these can ever have EXECUTED ──────────
+        # Not "the post happens once", which is the headline this comment used
+        # to carry and is false.  execute() may still POST this identical
+        # mutation up to five times, on exactly one failure: Shopify's own
+        # THROTTLED 200-body in the shape the GraphQL spec reserves for a
+        # request refused BEFORE execution began.  That is safe because every
+        # one of those posts was REFUSED, not because there was only one.  The
+        # property the verdicts below rest on is the weaker and true one: at
+        # most one post that Shopify could have run.
+        #
+        # idempotent=False is the line that gives it, and it is the only thing
+        # that makes every post-send "nothing was sent" claim below provable.
+        # build_refund_mutation() is called with no key, so the @idempotent
+        # directive is absent and Shopify cannot recognise a second POST of
+        # this document as the same refund: attempt 1 creates a real partial
+        # refund, its answer dies in the socket timeout, the order still holds
+        # the headroom a partial refund leaves, and attempt 2 pays the customer
+        # a SECOND time through the Cashfree-OCC bridge.
+        #
+        # So it does not mean "one attempt".  execute() still retries the one
+        # failure Shopify itself certifies as a pre-execution refusal — a
+        # THROTTLED 200 with no `data` key and no errors[].path — because
+        # re-posting after a refusal cannot double-pay.  What it no longer
+        # retries is a transport error, a 5xx, a bare HTTP 429, or a THROTTLED
+        # body that shows execution began; none of those is evidence about
+        # whether the mutation ran.  The 429 because Shopify throttles GraphQL
+        # with a 200 body, so one here may be a CDN or a proxy in front of the
+        # store; the last because a document can resolve part way and then blow
+        # the cost budget.  The table is in shopify_graphql.execute()'s
+        # docstring.
+        #
+        # DO NOT restore the default here without reading the two handlers at
+        # the foot of this function.  Their failed_unsent verdicts — userErrors,
+        # 401/403, and the refusals the client vouches for with
+        # proves_not_executed, every one of them "nobody was paid, safe to
+        # retry" — are sound only because the answer they read describes the ONLY
+        # request that could have executed.  With retries on it described the
+        # last of up to five that could each have run, and the scenario a code
+        # review named is: attempt 1
+        # creates the refund, its response is lost, attempt 2 is declined with
+        # "Refund amount exceeds the amount refundable on this order" PRECISELY
+        # BECAUSE attempt 1 consumed the headroom — whereupon this function
+        # wrote STATUS_FAILED over the durable Unverified marker, returned
+        # retry_safe=True, and refund_request.js offered "Retry Shopify Refund"
+        # on a refund the customer had already been paid.
+        #
+        # The RefundTargets query above keeps the default on purpose: it is a
+        # read, re-posting it cannot pay anybody, and losing that resilience
+        # would trade a safe retry for a fragile one.
         sent = True
         data = execute(
             settings,
             build_refund_mutation(),
             payload,
             operation="refundCreate",
+            idempotent=False,
         )
 
         # The load-bearing call.  HTTP 200 with userErrors means Shopify
@@ -1354,21 +1544,79 @@ def write_back_refund(refund_name: str, triggered_by: str = "manual") -> dict:
     except ShopifyUserError as exc:
         # userErrors is unambiguous: the request was well-formed, Shopify read it
         # and declined it, and nothing was refunded.
+        #
+        # Unambiguous only because at most one post of this mutation could have
+        # executed.  check_user_errors sees one response, and with
+        # idempotent=False that response describes the only request that could
+        # have run — five refused posts are still one that could have run.
+        # Under the ordinary retries it saw the last of up to five that could
+        # each have run, and "Refund amount
+        # exceeds the amount refundable on this order" is exactly the answer a
+        # second attempt gets when the FIRST one succeeded and consumed the
+        # headroom — so this handler wrote STATUS_FAILED over the durable
+        # Unverified marker, returned retry_safe=True, and the form offered
+        # "Retry Shopify Refund" for a refund already paid.  Keep the
+        # classification, and keep idempotent=False at the post with it: the two
+        # are one decision, and separating them restores the defect silently.
         return fail_unsent(str(exc), "rejected_by_shopify")
 
     except ShopifyAPIError as exc:
         # Which phase raised decides whether the customer might have been paid.
         # Before the mutation was posted, nothing can have happened.  After, it
-        # can — execute() retries internally, so a lost response on any attempt
-        # may be hiding a refund that went through.
+        # can: the POST may have been delivered and executed with only its answer
+        # lost.  That is true of a single attempt, so it does not rest on
+        # retries — and for this document there are none left on that path.
         if not sent:
             return fail_unsent(str(exc), "query_failed")
-        if getattr(exc, "status_code", None) in (401, 403):
-            # Rejected at the auth layer, before the document ran.  This one is
-            # safe to call unsent, and saying so keeps a mis-scoped token from
-            # parking refunds in Unverified where a person has to clear each one.
-            return fail_unsent(str(exc), "not_authorised")
-        return fail_unknown(str(exc), "transport_error_after_send")
+        if _proves_not_executed(exc):
+            # Shopify produced this INSTEAD of running the document: refused at
+            # the auth layer (401/403), or refused on its own structured
+            # GraphQL throttle error before execution began.  Both are safe to
+            # call unsent — and safe only because no earlier post of this
+            # mutation could have executed.  That is the guarantee the comment
+            # here used to assert ("rejected at the auth layer, before the
+            # document ran") without being able to make it: with the ordinary
+            # retries on, an earlier attempt could have run and paid before the
+            # token was rotated or the cost bucket ran dry, and the 401 we ended
+            # up reading said nothing about it.
+            #
+            # The claim itself is the client's, read off proves_not_executed —
+            # see _proves_not_executed for why this side must not re-derive it,
+            # from the error codes OR from the status.
+            #
+            # `rate_limited` therefore now means exactly ONE thing: Shopify
+            # refused the document before executing it, on its own THROTTLED
+            # 200-body in the shape the spec reserves for a pre-execution
+            # refusal.  A bare HTTP 429 is NOT this: Shopify throttles GraphQL
+            # with a 200 body, so a 429 on graphql.json may be a CDN, a WAF or
+            # an egress proxy in front of the store, and it now falls through to
+            # fail_unknown and parks the row on Unverified for a person.  That
+            # costs somebody opening the order in Shopify, and it is the
+            # deliberate trade: the alternative asserted a premise about
+            # infrastructure nobody here controls.
+            #
+            # The status is read only to SPLIT two proven refusals that the
+            # client has already vouched for, never to establish one.
+            if getattr(exc, "status_code", None) in (401, 403):
+                return fail_unsent(str(exc), "not_authorised")
+            return fail_unsent(str(exc), "rate_limited")
+        # Possibly paid either way, so both codes live in failed_unknown and
+        # neither is ever retried.  They are split on the one piece of evidence
+        # already in hand, because they are different facts and §6 of the
+        # contract defines them narrowly:
+        #
+        #   no status_code   the transport failed — DNS, TLS, a reset, a socket
+        #                    timeout — and nothing was read back at all.
+        #   a status_code    Shopify ANSWERED and the answer was unusable: an
+        #                    HTTP 400/404/5xx, or a 200-with-errors that was not
+        #                    a proven refusal (including the THROTTLED body that
+        #                    may carry a committed mutation).
+        #
+        # Filing the second under transport_error_after_send told a reader the
+        # network broke and sent them to look at the wrong thing.
+        if getattr(exc, "status_code", None) is None:
+            return fail_unknown(str(exc), "transport_error_after_send")
+        return fail_unknown(str(exc), "response_unverifiable")
 
     except Exception:
         frappe.log_error(
@@ -1409,7 +1657,134 @@ def refund_request_for_shopify_refund(shopify_refund_id):
     )
 
 
+def unverified_writebacks_for_order(shopify_order_id) -> list:
+    """
+    Every unresolved write-back of ours on this Shopify order, as a list.
+
+    The GID lookup above is exact and covers only the window AFTER a successful
+    refundCreate response has been read.  It cannot cover the window this
+    function exists for, and that window is the dangerous one:
+
+        _set_state(STATUS_UNVERIFIED)  ← committed BEFORE the post, GID EMPTY
+        execute(refundCreate)          ← the post
+        _set_state(REFUND_GID_FIELD)   ← the GID, only on a response we read
+
+    Every failed_unknown outcome stops between the first and the third: a
+    worker killed after the post, a socket timeout, a 5xx, a 200 that answered
+    without a refund object.  Each leaves a row that IS ours, carries no GID,
+    and sits beside a Shopify order that may genuinely hold the refund.  The
+    refunds/create webhook for that refund then finds nothing on the GID lookup
+    and is reported to payment_portals as a refund somebody made in Shopify —
+    the two-recorders defect the guard exists to stop, in the one state where
+    nobody can tell what happened.
+
+    An Unverified row is not proof the refund is ours; it is grounds for
+    withholding a report until a person has said which it is.  The caller
+    decides what to do with that — see refund_report._surface, which logs it
+    rather than skipping silently.
+
+    EVERY match, not one of them
+    ---------------------------
+    This returned a single arbitrary row through frappe.db.get_value until
+    round 3, and an order can carry two: a first attempt that lost its answer,
+    then a second refund raised for the rest of the order that lost its answer
+    too.  The caller names the row it is given in the message that tells a
+    person what to resolve, so naming one of two says the order is clear once
+    that one is cleared — while the refund the unnamed row may have paid is the
+    one nothing ever records, and an omission is the failure nothing can
+    recover.  Sorted, so two readers of the same order are told the same thing
+    and a log line can be diffed.
+
+    Submitted rows only
+    -------------------
+    docstatus == 1, and the filter is not hypothetical: cancelling the stuck
+    request is exactly what an operator reaches for when a row will not clear.
+    A cancelled Refund Request is no longer ERPNext's record of anything, so it
+    must stop withholding reports for the order — otherwise the refund Shopify
+    really made is recorded nowhere at all.  A draft never dispatched, so no
+    mutation was ever posted from it.
+
+    Resolved by doctype name through frappe, and inert when the write-back
+    fields are absent, so this module stays installable on a site with no
+    payment_portals.  The Sales Order fan-out is a multi-row read because a
+    Sales Order can be AMENDED: the amendment carries the same
+    shopify_order_id, the Refund Request points at one of the two, and matching
+    a single Sales Order would miss the row exactly when the refund had been
+    disputed and re-cut.  Never raises — it is consulted from inside a webhook
+    that must return 200 about a refund that has already happened.
+    """
+    if not _has_writeback_fields():
+        return []
+
+    order_id = str(shopify_order_id or "").strip()
+    if not order_id:
+        return []
+
+    try:
+        sales_orders = frappe.get_all(
+            "Sales Order", filters={"shopify_order_id": order_id}, pluck="name"
+        )
+        if not sales_orders:
+            return []
+        return sorted(frappe.get_all(
+            REFUND_REQUEST,
+            filters={
+                WRITEBACK_STATUS_FIELD: STATUS_UNVERIFIED,
+                "docstatus": 1,
+                "sales_order": ["in", sorted(sales_orders)],
+            },
+            pluck="name",
+        ))
+    except Exception:
+        # A guard that cannot decide answers "no hit" and says why.  Raising
+        # here would take down a webhook about a refund that has already
+        # happened, and no retry of it can un-refund anything.
+        frappe.log_error(
+            frappe.get_traceback(),
+            f"Shopify: Unverified Write-Back Lookup Failed — {order_id}",
+        )
+        return []
+
+
 # ── Clearing an unconfirmed attempt ───────────────────────────────────────────
+
+# What a Shopify refund id may look like, and nothing else.  Both forms a person
+# can legitimately have in hand: the bare numeric id, and the GID Shopify's own
+# API returns.  [0-9] rather than \d on purpose — \d also matches other Unicode
+# decimal digits, and "１２３" is not an id Shopify will ever match.  Matched with
+# fullmatch, because `$` also matches before a trailing newline and a value that
+# is a real id plus one more line is not a real id.
+_BARE_REFUND_ID = re.compile(r"[0-9]+")
+_REFUND_GID = re.compile(r"gid://shopify/Refund/[0-9]+")
+
+_REFUND_GID_EXAMPLE = "1234567890 or gid://shopify/Refund/1234567890"
+
+
+def _validated_refund_gid(value) -> str:
+    """
+    The GID to store for a hand-entered refund id, or "" if it is not one.
+
+    gid() passes anything already starting with "gid://" straight through, so
+    without this a mis-paste — another resource type, another store's refund, a
+    truncated id, an admin URL — was accepted verbatim and then permanently
+    satisfied BOTH loop guards for that order: refund_request_for_shopify_refund
+    would never match the real refund's id, and unverified_writebacks_for_order
+    stops matching the moment the status moves to Done.  The refunds/create
+    webhook for the refund Shopify actually made would then be reported as an
+    externally-made refund and earn a second Payment Entry.
+
+    This is the ONLY exit from Unverified, so refusing has to cost a retype and
+    no more: surrounding whitespace is stripped, because that is a copy-paste
+    and not a mis-paste.  Accepting the wrong value costs a refund that is
+    never recorded, which is the failure nothing can recover.
+    """
+    raw = str(value or "").strip()
+    if _BARE_REFUND_ID.fullmatch(raw):
+        return gid("Refund", raw)
+    if _REFUND_GID.fullmatch(raw):
+        return raw
+    return ""
+
 
 @frappe.whitelist()
 def resolve_unverified_writeback(refund_name: str, resolution: str,
@@ -1430,7 +1805,10 @@ def resolve_unverified_writeback(refund_name: str, resolution: str,
 
     "paid" demands a GID rather than taking somebody's word for it: the GID is
     what the credit-note loop guard matches on, so a Done row without one would
-    let the refunds/create webhook build a second Credit Note.
+    let the refunds/create webhook build a second Credit Note.  And it must be
+    a refund id and not merely a non-empty string — a Done row carrying the
+    WRONG id fails that guard exactly as a blank one does, while also looking
+    settled.  See _validated_refund_gid.
 
     Who resolved it and which way is written into the note, because this is a
     decision about whether a customer has been paid, made without evidence in
@@ -1470,16 +1848,29 @@ def resolve_unverified_writeback(refund_name: str, resolution: str,
     detail = f" {note.strip()}" if str(note or "").strip() else ""
 
     if resolution == "paid":
-        refund_gid = str(shopify_refund_gid or "").strip()
-        if not refund_gid:
+        raw_gid = str(shopify_refund_gid or "").strip()
+        if not raw_gid:
             return refuse(
                 "Recording this as paid needs the Shopify refund id (the GID "
                 "from the order's refund in Shopify). Without it the "
                 "credit-note guard cannot recognise the refund and the "
                 "refunds/create webhook would create a second Credit Note."
             )
+        refund_gid = _validated_refund_gid(raw_gid)
+        if not refund_gid:
+            # Refusing costs a retype; accepting costs a refund that is never
+            # recorded — see _validated_refund_gid.  The message names the two
+            # accepted forms, because "invalid" alone sends a person back to
+            # guess with the same value.
+            return refuse(
+                f"'{raw_gid[:60]}' is not a Shopify refund id. It must be the "
+                f"refund's numeric id or its full GID — {_REFUND_GID_EXAMPLE} "
+                f"— taken from the refund on this order in Shopify, not the "
+                f"order id, the Refund Request name, or an admin URL. Nothing "
+                f"was changed."
+            )
         _set_state(refund_name, **{
-            REFUND_GID_FIELD: gid("Refund", refund_gid),
+            REFUND_GID_FIELD: refund_gid,
             WRITEBACK_STATUS_FIELD: STATUS_DONE,
             REFUND_GATEWAY_FIELD: str(gateway or "").strip()[:140],
             WRITEBACK_AT_FIELD: now_datetime(),
@@ -1488,7 +1879,7 @@ def resolve_unverified_writeback(refund_name: str, resolution: str,
                 f"the order in Shopify.{detail}"
             )[:1000],
         })
-        message = f"Recorded as refunded in Shopify ({gid('Refund', refund_gid)})."
+        message = f"Recorded as refunded in Shopify ({refund_gid})."
     else:
         _set_state(refund_name, **{
             REFUND_GID_FIELD: "",

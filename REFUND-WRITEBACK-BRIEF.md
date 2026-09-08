@@ -486,33 +486,75 @@ data, but a Shopify write from it hits the **live storefront** and, through the
 OCC bridge, real money. Treat every call as a payout.
 
 1. Ship with `enable_refund_writeback` **off**. Do not turn it on yourself.
-2. First live exercise: an order that is **already fully refunded** (e.g.
-   `#6518`, or `#6491`, both fully refunded). It cannot move money. Confirm the
-   refusal, then stop.
+2. First live exercise: **"Check What Shopify Says"** on the Refund Request form
+   (`utils/refund.refund_targets_now`). It is read-only: it runs the same
+   `RefundTargets` query the payout runs and stops there — no mutation, and
+   nothing written to the Refund Request, not even a claim — and it reports
+   every transaction with its kind, status, gateway, amount and refundable
+   headroom, the refundable total, and the verdict `plan_refund` itself would
+   reach. It needs Shopify Settings write and works with
+   `enable_refund_writeback` **off**, which is the point of it: it is the one
+   live exercise that cannot pay anybody. Run it on the order the user means to
+   refund, and stop there.
 
-   > **Corrected 2026-09-07.** This step used to claim Shopify "must refuse with
-   > a `userErrors` about exceeding the refundable amount", and that the probe
-   > therefore "exercises credentials, query, mutation and error handling". The
-   > second half was wrong, and the first never happens.
+   > **The button is not on every refund, so check the document first.** It
+   > renders only on a **submitted** Refund Request (`refund_request.js`
+   > returns immediately on `docstatus !== 1`) whose `refund_channel` is
+   > `Shopify`: that is the channel the **payout** button hangs off. The
+   > read-only probe has a wider gate — `refund_request.js` also offers it on a
+   > `Manual Portal Refund` refund whose order is Shopify's, because reading
+   > what Shopify holds is useful there too and it sends nothing.
+   > `get_refund_writeback_status` is the other half — it reports
+   > `is_shopify` only when `payout_owner == OWNER_SHOPIFY`, and a refund that
+   > comes back false there without an `Unverified` status takes the dead-end
+   > path, which renders no buttons at all by design.
    >
-   > **The mutation is never posted.** `plan_refund` finds no parent with
-   > headroom, returns `no_refundable_transactions`, and `write_back_refund`
-   > takes `fail_unsent` about thirty lines *above* `refundCreate`
-   > (`utils/refund.py`, the guard at the `plan["problem"]` branch versus
-   > `sent = True` further down). Shopify is never asked, so there are no
-   > `userErrors` to read, and the `Unverified`-before-post commit that makes a
-   > killed worker safe is not entered either.
+   > So on a `Bank Transfer` refund there is no button of either kind and there
+   > never will be — that channel pays the customer by another route (§2a and
+   > the allow-list in §6), and this app is not the one that pays it, so there
+   > is nothing for it to rehearse. On a `Manual Portal Refund` you get the
+   > read-only probe and no payout button, which is the right pair: Shopify has
+   > already paid that refund, so reading what it holds is informative and
+   > asking it to pay again is refused (`channel_is_manual_portal_refund`).
+   > Somebody following this step expecting **Refund in Shopify** on either
+   > channel is hunting for a control that does not exist. This paragraph
+   > exists because the step above did not say so.
+
+   > **Corrected 2026-09-08.** This step used to prescribe pressing **Refund in
+   > Shopify** on an order that was *already fully refunded* (`#6518`, `#6491`),
+   > "where Shopify must refuse" — it cannot move money, so it read as the
+   > safe live rehearsal of the payout. `c3dc0f4` removed that same prescription
+   > from `enable_refund_writeback`'s description in Shopify Settings, and
+   > leaving it here left two operator documents disagreeing about whether a safe
+   > live rehearsal exists. It does not. The read above rehearses the *query*,
+   > never the payout.
    >
-   > So the probe exercises **credentials, the `RefundTargets` query, this app's
-   > reading of a real order's transactions, and the refusal path** — and not
-   > the mutation, the `userErrors` handling, or `rejected_by_shopify`.
+   > **On such an order the mutation is never posted.** `plan_refund` finds no
+   > parent with headroom, returns `no_refundable_transactions`, and
+   > `write_back_refund` takes `fail_unsent` **before `refundCreate` is posted at
+   > all** — the guard is the `plan["problem"]` branch, and `sent = True` is
+   > further down the same function (`utils/refund.py`). Shopify is never asked,
+   > so there are no `userErrors` to read, and the `Unverified`-before-post
+   > commit that makes a killed worker safe is not entered either. (An earlier
+   > version of this note put that guard "about thirty lines" above the mutation.
+   > It is nearer seventy — and a line count in prose is stale on the next
+   > edit, so the structural fact is the one to keep.)
    >
-   > **And there is no other order that would exercise them safely.** Asking for
-   > more than remains is refused as `insufficient_refundable`, also before the
-   > post. This app's headroom guard is strictly more conservative than
-   > Shopify's, so **every order on which `refundCreate` actually posts is one
-   > Shopify will accept — and a real customer gets paid.** `rejected_by_shopify`
-   > is reachable only through a genuine divergence between our arithmetic and
+   > Pressing the button there is also not free. `fail_unsent` calls
+   > `_release_claim(refund_name, STATUS_FAILED, message)`, so the probe writes a
+   > **Failed** write-back status and an error message onto a real Refund
+   > Request; and it needs `enable_refund_writeback` **on** to get that far
+   > (`_settings_for_store` filters the toggle), which arms the Send path for
+   > every Shopify-channel refund on that store, not only the one being probed.
+   > The only thing it exercises that the read-only check does not is the refusal
+   > path, which the stubbed tests in §9 already cover.
+   >
+   > **And no other order would exercise the mutation safely.** Asking for more
+   > than remains is refused as `insufficient_refundable`, also before the post.
+   > This app's headroom guard is strictly more conservative than Shopify's, so
+   > **every order on which `refundCreate` actually posts is one Shopify will
+   > accept — and a real customer gets paid.** `rejected_by_shopify` is
+   > reachable only through a genuine divergence between our arithmetic and
    > Shopify's, which cannot be arranged deliberately.
    >
    > `tests/test_refund_writeback.py::TestTheSafeProbeNeverReachesTheMutation`
@@ -523,10 +565,11 @@ OCC bridge, real money. Treat every call as a payout.
    > both rest on there being a safe live exercise of the mutation before the
    > dispatcher is built. There is not. Either the dispatcher is built against
    > an assumption that only a real payout can test, or the first real payout is
-   > chosen deliberately as the test — the user's call, on the user's order, per
-   > step 3. It is still worth running the probe: credentials and the live
-   > transaction shapes are the genuinely unknown parts, and
-   > `order.transactions` list-vs-connection is still unsettled.
+   > chosen deliberately as the test — the user's call, on the user's order,
+   > per step 3. What the read-only check does settle is the genuinely unknown
+   > part: that the credentials work, and what the live transaction shapes are —
+   > including whether `order.transactions` comes back as a list or a connection,
+   > which is still unsettled.
 3. Everything past that point moves customer money and belongs to the user, not
    to you. Hand them §10 and let them choose the order and the moment. `#6601`
    has ₹27,000 of headroom — precisely the sort of order not to experiment on.

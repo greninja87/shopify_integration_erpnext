@@ -57,11 +57,65 @@ _last_request_at = 0.0
 
 
 class ShopifyAPIError(Exception):
-    """Any non-recoverable failure talking to the Shopify Admin API."""
+    """
+    Any non-recoverable failure talking to the Shopify Admin API.
 
-    def __init__(self, message, status_code=None):
+    `status_code` is the HTTP status when there was one, and None when the call
+    never got an answer (a transport error, or a missing credential caught
+    before the request went out).
+
+    `error_codes` carries the GraphQL `errors[].extensions.code` values when the
+    failure arrived as HTTP 200 with query-level errors, and is [] otherwise.
+    It is diagnostic — it says what Shopify complained about, which is what a
+    log line and a human triaging one want.  Always a list, never None, so a
+    caller can write `"THROTTLED" in exc.error_codes` without guarding.  A bare
+    string is accepted as ONE code, because `list("THROTTLED")` is nine
+    single-character codes and `"THROTTLED" in` that is False while every
+    character of it matches — a raise site one bracket-pair off from the
+    correct form would read as "no THROTTLED here" while looking right in the
+    log.
+
+    `proves_not_executed` is the load-bearing one, and it is deliberately NOT
+    something a caller derives from the codes.  True means Shopify produced this
+    answer INSTEAD of running the document, and only two answers qualify:
+    refused at the auth layer (401/403), or refused by Shopify's own
+    pre-execution GraphQL throttle — a 200 carrying THROTTLED with no `data`
+    key at all and no `errors[].path`.  A bare HTTP 429 is NOT one of them:
+    Shopify throttles GraphQL with a 200 body, so a 429 on graphql.json may
+    have come from a CDN, a WAF or an egress proxy, and such a layer is no
+    evidence about the document behind it.  Only the client
+    knows that, because only the client saw the response body and knows which
+    branch raised — a 200 carrying BOTH `data` and a THROTTLED error has the
+    same code as a pure refusal and the opposite meaning, so "THROTTLED in
+    error_codes" is not the same claim and reading it as one pays a customer
+    twice (see the retry rules in shopify_graphql.execute()).
+
+    So this is the single fact a money-moving caller is allowed to branch on,
+    and the default is the safe one: False = assume the document may have run,
+    hand the row to a human.  It is only ever True where the raise site can
+    point at Shopify's own refusal.
+    """
+
+    def __init__(self, message, status_code=None, error_codes=None,
+                 proves_not_executed=False):
         super().__init__(message)
         self.status_code = status_code
+        # A bare string is one code, not its characters.  list("THROTTLED")
+        # yields ["T","H","R","O","T","T","L","E","D"], so a raise site written
+        # error_codes="THROTTLED" instead of ["THROTTLED"] would make
+        # `"THROTTLED" in exc.error_codes` False on the very exception that IS
+        # a throttle — invisible in a log line, which prints the characters,
+        # and wrong in every triage query.
+        if isinstance(error_codes, str):
+            self.error_codes = [error_codes] if error_codes else []
+        else:
+            # Copied, not aliased: the caller's list is usually the one built
+            # from the response body, and an exception's evidence must not
+            # change shape after the fact.
+            self.error_codes = list(error_codes or [])
+        # Coerced, so `is True` / `is False` at a payout decision means what it
+        # looks like even if a raise site hands over a truthy non-bool.
+        self.proves_not_executed = bool(proves_not_executed)
 
 
 # ── Credentials ────────────────────────────────────────────────────────────────
