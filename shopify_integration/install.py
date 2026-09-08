@@ -553,7 +553,7 @@ def create_refund_request_writeback_custom_fields():
         "allow_on_submit": 1,
         "no_copy":         1,
         "in_standard_filter": 1,
-        "description":     "Pending = claimed by a worker. Done = Shopify accepted the refund. Failed = nothing was sent, safe to retry with the Refund in Shopify button. Skipped = nothing to send (not a Shopify order, or the refund came from Shopify already). <b>Unverified = the request reached Shopify and the outcome could not be confirmed, so the customer may already have been paid</b> — do not retry; check the order in Shopify and record what you find.",
+        "description":     "Pending = claimed by a worker. Done = Shopify accepted the refund. Failed = nothing was sent, safe to retry with the Refund in Shopify button. Skipped = nothing to send (not a Shopify order, or the refund came from Shopify already). <b>Unverified = the request reached Shopify and the outcome could not be confirmed, so the customer may already have been paid</b> — do not retry; check the order in Shopify and record what you find.<br><br>On an <b>Unverified</b> row, note that if the refund did in fact succeed and the store has <b>Notify Customer On Refund</b> switched on, Shopify has <b>already emailed the customer</b>. Assume they may believe they were refunded, and read the order in Shopify before telling them otherwise.",
     })
     create_or_update_custom_field(doctype, {
         "fieldname":       "shopify_refund_gid",
