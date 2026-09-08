@@ -21,6 +21,9 @@ frappe.ui.form.on('Refund Request', {
             if (!info || !info.is_shopify) return;
             shopify_refund_indicator(frm, info);
             shopify_refund_button(frm, info);
+            // Deliberately not conditional on can_write_back: a refusal is when
+            // somebody most needs to see what Shopify actually reports.
+            shopify_refund_targets_button(frm);
             shopify_refund_message(frm, info);
         }).catch(() => null);
     }
@@ -68,6 +71,66 @@ function shopify_refund_button(frm, info) {
 
     frm.add_custom_button(label, function() {
         shopify_confirm_and_write_back(frm, info);
+    }, __('Shopify'));
+}
+
+
+// Offered on every Shopify refund, including ones the write-back refuses,
+// because the refusals are exactly when somebody needs it.  REF-00207 failed
+// twice on production with "no transaction on this order can take a refund" and
+// there was no way to see, from ERPNext, which row failed which test — the
+// response had been discarded.  This asks Shopify and shows the answer.
+//
+// It sends no mutation and writes nothing.  See utils/refund.refund_targets_now.
+function shopify_refund_targets_button(frm) {
+    frm.add_custom_button(__('Check What Shopify Says'), function() {
+        frappe.xcall(
+            'shopify_integration.utils.refund.refund_targets_now',
+            { refund_name: frm.doc.name }
+        ).then(function(info) {
+            if (!info) return;
+
+            const rows = (info.transactions || []).map(function(t) {
+                // A row Shopify never gave a figure for is not a row worth zero,
+                // and the whole diagnosis can turn on the difference.
+                const refundable = t.refundable_reported
+                    ? frappe.format(t.refundable, { fieldtype: 'Data' })
+                    : '<i>' + __('not reported by Shopify') + '</i>';
+                const verdict = t.rejected_because
+                    ? '<span style="color:var(--red-500)">' + t.rejected_because + '</span>'
+                    : '<span style="color:var(--green-600)">' + __('usable') + '</span>';
+                return `<tr>
+                    <td>${frappe.utils.escape_html(t.kind || '')}</td>
+                    <td>${frappe.utils.escape_html(t.status || '')}</td>
+                    <td>${frappe.utils.escape_html(t.gateway || '')}</td>
+                    <td align="right">${frappe.utils.escape_html(t.amount || '')}</td>
+                    <td align="right">${refundable}</td>
+                    <td>${verdict}</td>
+                </tr>`;
+            }).join('');
+
+            const table = rows
+                ? `<table class="table table-bordered" style="margin-top:10px">
+                       <thead><tr>
+                           <th>${__('Kind')}</th><th>${__('Status')}</th>
+                           <th>${__('Gateway')}</th><th align="right">${__('Amount')}</th>
+                           <th align="right">${__('Refundable')}</th>
+                           <th>${__('Verdict')}</th>
+                       </tr></thead><tbody>${rows}</tbody>
+                   </table>`
+                : `<p><b>${__('Shopify returned no transactions at all for this order.')}</b><br>
+                      ${__('A refund needs a parent transaction to attach to, so there is nothing to refund against — this is not the same as an order that has already been refunded.')}</p>`;
+
+            frappe.msgprint({
+                title: __('Shopify Refund Targets'),
+                indicator: info.would_refuse_with ? 'orange' : 'green',
+                message: `<p>${frappe.utils.escape_html(info.message || '')}</p>`
+                    + `<p>${__('Order')}: <b>${frappe.utils.escape_html(info.shopify_order_name || info.shopify_order_id || '')}</b>
+                          &middot; ${__('Refundable total')}: <b>${frappe.utils.escape_html(String(info.refundable_total))}</b>
+                          &middot; ${__('This refund')}: <b>${frappe.utils.escape_html(String(info.amount))}</b></p>`
+                    + table,
+            });
+        }).catch(() => null);
     }, __('Shopify'));
 }
 

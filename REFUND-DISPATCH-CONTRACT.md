@@ -308,6 +308,37 @@ Shopify and is safe to call on every form refresh.
 It is **not** a substitute for reading the dispatch result. Between a pre-flight
 and a payout, anything can change; only the result dict says what happened.
 
+### And one read for when it refuses
+
+```python
+frappe.call("shopify_integration.utils.refund.refund_targets_now",
+            refund_name=name)
+```
+
+Whitelisted, gated on **Shopify Settings write**, and it **cannot pay anybody**:
+it runs the same `RefundTargets` query the payout runs and stops, posts no
+mutation, and writes nothing to the Refund Request. Returns every transaction on
+the order with `kind`, `status`, `gateway`, `amount`, `refundable`,
+`refundable_reported` and `rejected_because`, plus `refundable_total` and the
+`would_refuse_with` verdict taken from `plan_refund` itself — so it can never
+say "fine" about a refund that would then refuse.
+
+It exists because a refusal used to be unexplainable. `REF-00207` on production
+(2026-09-08) refused `no_refundable_transactions` twice and the response was
+discarded, so which row failed which test could only be answered from a Shopify
+admin login for a store nobody had one for. Deliberately **not** gated on
+`enable_refund_writeback`: the diagnosis is needed precisely while the payout is
+switched off.
+
+**`refundable_reported` is the field to read on a headroom refusal.**
+`maximumRefundableV2` reported as `0.00` and not reported at all are the same
+number by the time the filter sees them, and they mean opposite things — a
+settled order, versus this app reading a field the API version does not populate,
+in which case *no* order is refundable anywhere and every one presents as
+already fully refunded. The filter treats both as no-headroom, because refusing
+on a number we do not have is the safe direction; this flag is how a person tells
+them apart.
+
 ### The one distinction that decides the money path
 
 Every result — pre-flight or dispatch — carries `payout_owner`, one of three

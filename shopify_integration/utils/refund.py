@@ -385,6 +385,82 @@ def _headroom(node) -> int:
     return _paise(((node.get("maximumRefundableV2") or {}).get("amount")))
 
 
+def rejection_reason(node) -> str:
+    """Which test disqualified this transaction as a refund parent, or "".
+
+    One function so the filter, the log and the diagnostic can never disagree
+    about why a row was dropped — which is exactly what happened on `REF-00207`:
+    the rows were examined, the verdict was recorded as a sentence that did not
+    fit them, and the rows themselves were discarded.
+
+    Order matters and follows `refundable_parents`: `kind` first, because an
+    AUTHORIZATION or a REFUND row is not a parent whatever its status; then
+    `status`; then headroom, which is the only one that can change over time.
+    """
+    if (node.get("kind") or "").upper() not in _PARENT_KINDS:
+        return "kind"
+    if (node.get("status") or "").upper() != "SUCCESS":
+        return "status"
+    if _headroom(node) <= 0:
+        return "no_headroom"
+    return ""
+
+
+def _headroom_reported(node) -> bool:
+    """Did Shopify actually give us a maximumRefundableV2 amount?
+
+    `_headroom` cannot answer this: `_paise(None)` is 0, so a field Shopify did
+    not populate and one it reported as 0.00 are the same number by the time the
+    filter sees them — and they mean opposite things.  A reported zero is a fact
+    about the order (nothing left to refund).  An absent one is a fact about
+    *this app* (we are reading a field this API version does not fill for this
+    transaction), and in that case no order is ever refundable anywhere, which
+    presents as every order being fully refunded.
+
+    Kept separate from `rejection_reason` on purpose: the filter must treat both
+    as no-headroom — refusing to refund on a number we do not have is the safe
+    direction — while a person reading the log has to be able to tell which it
+    was.
+    """
+    money = node.get("maximumRefundableV2")
+    if not isinstance(money, dict):
+        return False
+    amount = money.get("amount")
+    return amount is not None and str(amount).strip() != ""
+
+
+def transaction_summary(nodes) -> list:
+    """Every transaction Shopify returned, with the verdict on each.
+
+    Deliberately small and deliberately free of anything about a person: this
+    goes into Shopify Log, which many people can read, and into a whitelisted
+    diagnostic.  Ids, kinds, statuses, gateways and figures answer "why did
+    every row fail" completely; nothing else is needed for it.
+
+    `gateway` is reported rather than judged.  It is `manual` on some of these
+    orders and a named gateway such as `CASHFREE - UPI` on others, and nothing
+    in this module branches on it — `plan_refund` copies whatever is there onto
+    the refund verbatim.  Reading a gateway name as evidence about whether money
+    moved is the misreading that produced two wrong conclusions on this project.
+    """
+    return [
+        {
+            "id": str(node.get("id") or ""),
+            "kind": str(node.get("kind") or ""),
+            "status": str(node.get("status") or ""),
+            "gateway": str(node.get("gateway") or ""),
+            "amount": _money(
+                _paise(((node.get("amountSet") or {})
+                        .get("presentmentMoney") or {}).get("amount"))
+            ),
+            "refundable": _money(_headroom(node)),
+            "refundable_reported": _headroom_reported(node),
+            "rejected_because": rejection_reason(node),
+        }
+        for node in transaction_nodes(nodes)
+    ]
+
+
 def refundable_parents(nodes) -> list:
     """
     Parent transactions a refund can attach to, best first.
@@ -454,10 +530,31 @@ def plan_refund(nodes, amount) -> dict:
         )
 
     if not parents:
+        # Two different facts, one code, and they were reported with the same
+        # sentence until 2026-09-08.  REF-00207 on production refused with "every
+        # row is a refund, a void, unsuccessful, or already fully refunded" for
+        # an order whose ERPNext side showed one successful ₹5 payment and no
+        # refund at all — so the message asserted rows that may not have
+        # existed, and the two readings have opposite remedies: pick another
+        # order, versus this store cannot be refunded this way at all.
+        #
+        # The reason_code stays `no_refundable_transactions` for both, because
+        # the caller's decision is identical (nothing was sent, Shopify still
+        # owns the payout) and splitting it would be a CONTRACT_VERSION bump for
+        # no behavioural gain.  It is the human sentence that has to be honest.
+        rows = transaction_nodes(nodes)
+        if not rows:
+            return empty(
+                f"Shopify holds no transactions on this order at all, so there "
+                f"is nothing for a refund to attach to — `refundCreate` needs a "
+                f"parent transaction. This is not the same as an order that has "
+                f"already been refunded. The refund is {_money(wanted)}.",
+                "no_refundable_transactions",
+            )
         return empty(
-            f"No transaction on this order can take a refund — every row is a "
-            f"refund, a void, unsuccessful, or already fully refunded. The "
-            f"refund is {_money(wanted)}.",
+            f"None of the {len(rows)} transactions on this order can take a "
+            f"refund — each one is a refund, a void, unsuccessful, or already "
+            f"fully refunded. The refund is {_money(wanted)}.",
             "no_refundable_transactions",
         )
 
@@ -1096,11 +1193,23 @@ def write_back_refund(refund_name: str, triggered_by: str = "manual") -> dict:
         return result(False, "", "Could not start the write-back; see the Error Log.",
                       OUTCOME_FAILED_UNSENT, reason_code="setup_failed")
 
-    def fail_unsent(message, reason_code):
+    def fail_unsent(message, reason_code, seen=None):
         """Nothing left this process, or Shopify explicitly declined it.  Nobody
-        was paid, and a retry cannot double-pay."""
+        was paid, and a retry cannot double-pay.
+
+        `seen` is the transaction summary when the refusal was a verdict *about*
+        the transactions.  Recorded because REF-00207 proved the alternative
+        unusable: two identical failures whose log payload was
+        {"refund_request": "REF-00207"} and nothing else, so the only question a
+        reader had — which row failed which test — could not be answered from
+        ERPNext at all, and needed a Shopify login nobody had for that store.
+        """
         _release_claim(refund_name, STATUS_FAILED, message)
-        _log(settings, refund_name, shopify_order_id, "Failed", message)
+        payload = {"refund_request": refund_name}
+        if seen is not None:
+            payload["transactions"] = seen
+        _log(settings, refund_name, shopify_order_id, "Failed", message,
+             payload=payload)
         return result(False, STATUS_FAILED, message,
                       OUTCOME_FAILED_UNSENT, reason_code=reason_code, amount=amount)
 
@@ -1144,6 +1253,7 @@ def write_back_refund(refund_name: str, triggered_by: str = "manual") -> dict:
 
         plan = plan_refund(order.get("transactions"), amount)
         if plan["problem"]:
+            seen = transaction_summary(order.get("transactions"))
             # check_eligibility has already refused amount <= 0, so only the two
             # headroom codes can reach here and both belong to failed_unsent.
             # Pinned rather than assumed: a code from the wrong outcome would
@@ -1152,7 +1262,7 @@ def write_back_refund(refund_name: str, triggered_by: str = "manual") -> dict:
             problem_code = plan["problem_code"]
             if problem_code not in REASON_CODES[OUTCOME_FAILED_UNSENT]:
                 problem_code = "insufficient_refundable"
-            return fail_unsent(plan["problem"], problem_code)
+            return fail_unsent(plan["problem"], problem_code, seen=seen)
 
         payload = build_refund_input(
             order_gid,
@@ -1422,6 +1532,131 @@ def writeback_now(refund_name: str) -> dict:
 
     frappe.has_permission(REFUND_REQUEST, "submit", doc=refund_name, throw=True)
     return write_back_refund(refund_name, triggered_by="manual")
+
+
+@frappe.whitelist()
+def refund_targets_now(refund_name: str) -> dict:
+    """
+    What Shopify says is refundable on this refund's order.  Read-only.
+
+    Exists because `REF-00207` refused with `no_refundable_transactions` on
+    production and there was no way to find out why from inside ERPNext: the
+    message did not distinguish "no transactions at all" from "every row
+    disqualified", and the response was discarded.  Answering that needed a
+    Shopify admin login for `electrobotic-in`, which is itself an open item.
+
+    **It cannot pay anybody.** It runs the same `RefundTargets` query the payout
+    runs and stops there — no mutation, no writes to the Refund Request, not
+    even a claim.  `tests/test_refund_targets_diagnostic.py` asserts all of
+    that, including by reading this function's own source for the mutation
+    constant, because the risk is a later edit rather than this one.
+
+    Deliberately **not** gated on `enable_refund_writeback`. Gating the one safe
+    call on the dangerous switch would mean the diagnosis was only available
+    while the payout was armed, which is the mistake
+    `REFUND-REPORT-CONTRACT.md` §7 refuses for the report path. Gated on Shopify
+    Settings write instead — the same permission `backfill_now` uses, for the
+    same reason: it reveals store data and spends an Admin API call.
+
+    :return: {"ok", "reason_code", "message", "amount", "refundable_total",
+              "transactions": [...], "would_refuse_with", "shopify_order_id",
+              "shopify_order_name", "shopify_store"}
+    """
+    frappe.has_permission("Shopify Settings", "write", throw=True)
+
+    out = {"ok": False, "reason_code": "", "message": "", "amount": 0.0,
+           "refundable_total": 0.0, "transactions": [], "would_refuse_with": "",
+           "shopify_order_id": "", "shopify_order_name": "", "shopify_store": ""}
+
+    if not _has_writeback_fields():
+        out["reason_code"] = "not_installed"
+        out["message"] = _NOT_MIGRATED_REASON
+        return out
+
+    row = frappe.db.get_value(
+        REFUND_REQUEST, refund_name,
+        ["sales_order", "net_refund_amount"], as_dict=True,
+    )
+    if not row:
+        out["reason_code"] = "refund_request_missing"
+        out["message"] = f"{REFUND_REQUEST} {refund_name} does not exist."
+        return out
+
+    out["amount"] = flt(row.get("net_refund_amount"))
+
+    sales_order = str(row.get("sales_order") or "").strip()
+    order_row = (frappe.db.get_value(
+        "Sales Order", sales_order, ["shopify_order_id", "shopify_store"], as_dict=True
+    ) or {}) if sales_order else {}
+    out["shopify_order_id"] = str(order_row.get("shopify_order_id") or "").strip()
+    out["shopify_store"] = str(order_row.get("shopify_store") or "").strip()
+
+    if not out["shopify_order_id"]:
+        out["reason_code"] = REASON_NOT_OURS
+        out["message"] = (
+            "This refund has no Shopify order behind it, so there is nothing to "
+            "ask Shopify about."
+        )
+        return out
+
+    # require_enabled=False for the reason in the docstring: this is the read a
+    # person needs precisely while the payout is switched off.
+    settings = _settings_for_store(out["shopify_store"], require_enabled=False)
+    if not settings:
+        out["reason_code"] = "writeback_unavailable_for_store"
+        out["message"] = (
+            f"No enabled Shopify Settings for {out['shopify_store'] or 'this store'}."
+        )
+        return out
+
+    if not has_admin_api_credentials(settings):
+        out["reason_code"] = "no_api_credentials"
+        out["message"] = (
+            f"{settings.name} has no Admin API credentials, so Shopify cannot "
+            f"be asked what is refundable."
+        )
+        return out
+
+    try:
+        data = execute(
+            settings,
+            _REFUND_TARGETS_QUERY,
+            {"orderId": gid("Order", out["shopify_order_id"])},
+            operation="RefundTargets",
+        )
+    except Exception as exc:  # noqa: BLE001 — reported, never raised
+        out["reason_code"] = "query_failed"
+        out["message"] = f"Could not read the order from Shopify: {exc}"
+        return out
+
+    order = (data or {}).get("order")
+    if not order:
+        out["reason_code"] = "shopify_order_not_found"
+        out["message"] = (
+            f"Shopify order {out['shopify_order_id']} was not found, or the "
+            f"token cannot see it."
+        )
+        return out
+
+    nodes = order.get("transactions")
+    out["shopify_order_name"] = str(order.get("name") or "")
+    out["transactions"] = transaction_summary(nodes)
+    # A number, not a formatted string: this is read by a caller and by the
+    # form, and `_money` returns text for messages.
+    out["refundable_total"] = flt(
+        _money(sum(_headroom(p) for p in refundable_parents(nodes)))
+    )
+
+    # The verdict the payout would reach, from the same function it would use —
+    # so this can never say "fine" about a refund that would then refuse.
+    plan = plan_refund(nodes, out["amount"])
+    out["would_refuse_with"] = plan["problem_code"]
+    out["message"] = plan["problem"] or (
+        f"{_money(_paise(out['refundable_total']))} is refundable on this order "
+        f"and the refund is {_money(_paise(out['amount']))} — this would send."
+    )
+    out["ok"] = True
+    return out
 
 
 @frappe.whitelist()
