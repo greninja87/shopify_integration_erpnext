@@ -482,9 +482,11 @@ does hand facts to another app that may record a refund from them.
   move money — pinned by a test asserting the backfill query contains no
   `mutation`;
 - never gate reporting on **`enable_refund_writeback`**. That toggle guards the
-  payout and is `0` on every store, which is where it must stay; gating the
+  payout, and this side must not depend on it whatever it is set to; gating the
   report on it would mean the one safe thing only ran while the dangerous thing
-  was armed;
+  was armed — this clause used to state the toggle's live value as well, the
+  value moved and the clause did not, so no setting for it is recorded here:
+  read it off Shopify Settings for the store;
 - never keep an **"already reported" ledger** of its own and suppress a report
   from it — see §5a. Delivery is at-least-once and deduping is the observer's
   obligation, because a duplicate is absorbable and an omission is not;

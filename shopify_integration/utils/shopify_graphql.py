@@ -33,20 +33,38 @@ Note fulfilled when Shopify rejected the request.  So execute() raises on (2),
 and check_user_errors() exists to make (3) impossible to forget — every caller
 runs its payload through it.
 
-Retries, and the one document that must not be re-posted
---------------------------------------------------------
+Retries, and the documents that must not be re-posted
+-----------------------------------------------------
 execute() retries the identical document up to _MAX_ATTEMPTS times on transport
-errors, 429 and 5xx, which is what every fulfillment caller still gets.
+errors, 429 and 5xx.  That is what a READ still gets, and reads are most of the
+callers: fulfillment's orderFulfillmentOrders query and refund.py's
+RefundTargets query both keep it, because re-posting a read cannot create
+anything.
 
-An earlier version of this docstring justified that by asserting re-pushing a
-fulfillmentCreate that already landed "gets a userErrors rejection, not a
-second shipment".  That is not established.  It does not follow for a PARTIAL
-fulfillment: a partly fulfilled order still has unfulfilled line items, so a
-second fulfillmentCreate has something left to accept — the same headroom
-argument the refund rule below rests on.  fulfillmentCreate has NOT been
-audited for this, and changing its retry behaviour is out of scope for the
-change that removed the claim.  Treat it as an open question, not a safety
-property this module provides.
+An earlier version of this docstring justified giving fulfillmentCreate the
+same treatment by asserting that re-pushing one that already landed "gets a
+userErrors rejection, not a second shipment", and left it standing as an open
+question.  It has been audited since, and the answer is that the claim is false
+for the case fulfillment.py actually builds.  It holds for a FULL fulfillment;
+a PARTIAL one leaves unfulfilled quantity on the fulfillment order, so Shopify
+ACCEPTS a second post of the identical input — a duplicate fulfillment, the
+same goods fulfilled twice, and a second tracking email to the customer, since
+notify comes from notify_customer_on_fulfillment.  It is the same headroom
+argument the refund rule below rests on, and fulfillment.py builds partial
+fulfillments deliberately (plan["unallocated"], STATUS_PARTIAL).  So
+fulfillment.py now posts fulfillmentCreate with idempotent=False, and its
+fulfillmentCancel keeps the retries: that one names an existing fulfillment by
+id and drives it to CANCELED, so a re-post reaches the same end state.
+
+What remains open is on fulfillment.py's side, not this module's.  It has no
+possibly-sent state: every failure path there records STATUS_FAILED, which the
+hourly scheduler and the Fulfil button both re-pick, so idempotent=False cuts
+the automatic re-posts of a possibly-committed mutation to one and then hands
+the remaining risk to the OUTER retry, guarded by nothing but the warning text
+fulfillment._possibly_sent_warning writes into the error field.  refund.py has
+the state this needs — STATUS_UNVERIFIED, which no trigger picks up — and
+giving fulfillment the equivalent needs a new Select option on the custom field
+plus a patch.
 
 refundCreate is different, and audited.  It moves money — a successful one pays
 the customer through the Cashfree-OCC bridge — and refund.py posts it with no
@@ -73,9 +91,9 @@ are two separate questions, and round 2 got into trouble by fusing them.  An
 idempotent caller may re-post on a throttle whatever the body shape, because a
 re-read is free and refund.py's RefundTargets query is promised that
 resilience; it just gets no proof out of it.  A non-idempotent caller may
-re-post only on the proven refusal above.  Whether re-posting a PARTIAL
-fulfillmentCreate is safe remains the open question named earlier — the
-idempotent path is where it lives, and nothing here has answered it.
+re-post only on the proven refusal above.  Both mutations that create something
+— refundCreate and fulfillmentCreate — are now on the second path, so the
+idempotent path is reads and fulfillmentCancel.
 
 Who gets to say "nobody was paid"
 ---------------------------------
@@ -88,8 +106,6 @@ it saw.
 
 import json
 import time
-
-import frappe
 
 from shopify_integration.utils.shopify_api import (
     ShopifyAPIError,
@@ -438,12 +454,14 @@ def execute(
             #                 its throttle resilience — refund.py's comment at
             #                 the RefundTargets query promises exactly that,
             #                 and round 2 stripped it by gating on the body
-            #                 shape for everyone.  Restoring it also restores
-            #                 the pre-round-2 behaviour for fulfillment,
-            #                 deliberately: whether re-posting a PARTIAL
-            #                 fulfillmentCreate is safe is the unaudited open
-            #                 question the module docstring already names, and
-            #                 answering it by side effect is not an answer.
+            #                 shape for everyone.  What is left on this half is
+            #                 reads plus fulfillmentCancel, which reaches the
+            #                 same end state however often it is posted.
+            #                 fulfillmentCreate used to be here too, on the
+            #                 open question the module docstring recorded; the
+            #                 audit found a PARTIAL fulfillment leaves headroom
+            #                 for a duplicate, so it is a non-idempotent caller
+            #                 now.
             #   refused       for a non-idempotent document this is the only
             #                 licence to post again.  refundCreate resolves a
             #                 transactions(first: 10) connection with real

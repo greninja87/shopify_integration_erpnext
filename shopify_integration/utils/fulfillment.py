@@ -53,6 +53,16 @@ A fulfillment failure must never block or unwind a Delivery Note.  The DN is a
 stock document and Shopify is downstream of it.  Every failure path records
 status Failed with the reason, alerts, and leaves the document alone — the
 scheduler and the retry button both re-pick Failed rows.
+
+That last part is also the sharp edge, because fulfillmentCreate is posted with
+idempotent=False (see the post site): a failure AFTER the post may be hiding a
+fulfillment Shopify actually created, and a partly fulfilled order still has
+unfulfilled quantity, so re-posting can ship the same goods twice and send a
+second tracking email.  There is no possibly-sent status to park those rows in,
+so the mitigation is the error text — _possibly_sent_warning, front-loaded into
+custom_shopify_fulfillment_error so the person about to press retry is told to
+open Shopify first.  It is a mitigation, not the fix; the fix is the state
+refund.py has.
 """
 
 import json
@@ -569,6 +579,46 @@ def _release_claim(dn_name: str, status: str, error: str = ""):
     frappe.db.commit()  # nosemgrep: frappe-manual-commit — background job; state must persist
 
 
+def _possibly_sent_warning(shopify_order_id, detail: str = "") -> str:
+    """
+    The text for a fulfillment whose fate is unknown, warning first.
+
+    A MITIGATION, and not the fix.  The fix is the sent/unsent state the refund
+    path has: refund.py parks a possibly-committed refundCreate on
+    STATUS_UNVERIFIED, which no trigger picks up, so nothing automatic can
+    re-post it.  This module has no such state — every failure path here calls
+    _release_claim(STATUS_FAILED), and STATUS_FAILED is retryable both by the
+    hourly scheduler and by the Fulfil button.  Adding one would mean a new
+    Select option on custom_shopify_fulfillment_status (install.py) plus a
+    patch to backfill it, and both the scheduler's SQL and RETRYABLE_STATUSES
+    would have to learn to skip it; that is deliberately not in this change.
+    So idempotent=False cuts the AUTOMATIC re-posts of a mutation Shopify may
+    already have run from _MAX_ATTEMPTS down to one, and this text is all that
+    stands between the remaining risk and the OUTER retry — a person, or the
+    scheduler on its next tick.
+
+    Deliberately front-loaded, the same reasoning as refund.py's
+    _unverified_warning: _release_claim keeps only the first 1000 characters,
+    and a GraphQL error alone can carry 500, so a warning appended AFTER the
+    Shopify error is exactly the part that gets truncated away — and the
+    natural response to a truncated error message is to press retry.
+    """
+    # Kept short on purpose as well as first: it shares 1000 characters with
+    # the Shopify error behind it, and that error is the diagnostic.
+    warning = (
+        f"POSSIBLY FULFILLED — do NOT retry until you have checked Shopify. "
+        f"This fulfillmentCreate reached Shopify and its outcome is not "
+        f"confirmed, so order {shopify_order_id} may already carry the "
+        f"fulfillment and the customer may already have had the tracking "
+        f"email. A partly fulfilled order still has unfulfilled quantity, so "
+        f"a blind retry can ship the same goods twice. Open the order in "
+        f"Shopify: if the fulfillment is NOT there, another attempt is safe; "
+        f"if it IS there, reconcile this Delivery Note by hand instead."
+    )
+    detail = str(detail or "").strip()
+    return f"{warning}\n\n{detail}" if detail else warning
+
+
 # ── Eligibility ───────────────────────────────────────────────────────────────
 
 def _settings_for_store(shop_domain: str, require_enabled: bool = True):
@@ -706,12 +756,43 @@ def fulfil_delivery_note(dn_name: str, settings=None, triggered_by: str = "manua
             _alert(settings, dn_name, message)
         return result(False, STATUS_FAILED, message)
 
+    # Flipped immediately before fulfillmentCreate is posted and never reset —
+    # the same plain local refund.py uses, for the same reason.  It is the one
+    # fact that separates "Shopify never heard about this Delivery Note" from
+    # "Shopify may already have created the fulfillment", and inferring it after
+    # the fact from the exception cannot be done: a transport error looks
+    # identical whether it hit the fulfillment-orders read or the mutation.
+    posted = False
+
+    def possibly_sent(message, exc=None) -> str:
+        """Front-load the possibly-sent warning when the mutation went out.
+
+        Nothing here is inferred from the error codes.  `posted` says whether
+        the mutation left this process, and proves_not_executed — which only
+        the client can set, because only the raise site saw the response body —
+        says whether Shopify answered INSTEAD of running it.  An auth refusal
+        (401/403) or its structured pre-execution throttle refusal therefore
+        keeps the plain message: labelling those possibly-sent would send
+        somebody hunting in Shopify for a fulfillment that cannot be there, and
+        train them to ignore the warning on the rows where it is real.
+        """
+        if not posted:
+            return message
+        if exc is not None and bool(getattr(exc, "proves_not_executed", False)):
+            return message
+        return _possibly_sent_warning(shopify_order_id, message)
+
     # ── Everything past the claim must land in a definite state ──────────────
     try:
         wanted = wanted_lines_for_dn(dn_name)
         if not wanted:
             return fail("No Delivery Note lines with a positive integer quantity.")
 
+        # Keeps execute()'s default retries deliberately: this is a READ.
+        # Re-posting it cannot create a fulfillment, notify a customer or move
+        # a quantity, so it loses nothing by waiting out a throttle or a 502 —
+        # and taking its resilience away would only make transient failures
+        # fail a Delivery Note that would have recovered.
         data = execute(
             settings,
             _FULFILLMENT_ORDERS_QUERY,
@@ -773,18 +854,50 @@ def fulfil_delivery_note(dn_name: str, settings=None, triggered_by: str = "manua
         )
         notify = cint(settings.get("notify_customer_on_fulfillment"))
 
+        # ── The post: at most one of these can ever have EXECUTED ───────────
+        # fulfillmentCreate carries no idempotency key, and the justification
+        # for re-posting it — recorded in shopify_graphql.py as an open
+        # question, "a fulfillmentCreate that already landed gets a userErrors
+        # rejection, not a second shipment" — is true only of a FULL
+        # fulfillment.  This function builds PARTIAL ones on purpose
+        # (plan["unallocated"], STATUS_PARTIAL), and a partly fulfilled order
+        # still has unfulfilled quantity on its fulfillment order, so Shopify
+        # ACCEPTS a second post of the identical input: a duplicate
+        # fulfillment, the same goods fulfilled twice, and a second tracking
+        # email to the customer, since notify comes from
+        # notify_customer_on_fulfillment.  It is the headroom argument the
+        # refund double-pay fix rests on, on a different mutation.
+        #
+        # idempotent=False does not mean "one attempt".  execute() still
+        # retries the one failure Shopify itself certifies as a refusal BEFORE
+        # execution — a THROTTLED 200 with no `data` key and no errors[].path —
+        # because re-posting after a refusal cannot duplicate anything.  What
+        # it no longer retries is a transport error, a 5xx, a bare HTTP 429, or
+        # a THROTTLED body that shows execution began; none of those is
+        # evidence about whether the mutation ran.  The table is in
+        # shopify_graphql.execute()'s docstring.
+        #
+        # This narrows the AUTOMATIC re-posts, and it is NOT the whole fix: see
+        # _possibly_sent_warning for what is left open and why the sent/unsent
+        # state that would close it is not in this change.
+        posted = True
         payload = execute(
             settings,
             _FULFILLMENT_CREATE_MUTATION,
             {"fulfillment": build_fulfillment_input(plan, notify, tracking_info)},
             operation="fulfillmentCreate",
+            idempotent=False,
         )
         created = check_user_errors(payload, "fulfillmentCreate", context=dn_name)
 
         fulfillment = created.get("fulfillment") or {}
         fulfillment_id = str(fulfillment.get("id") or "").strip()
         if not fulfillment_id:
-            return fail("fulfillmentCreate returned no fulfillment id.")
+            # HTTP 200, no errors, no userErrors, and no fulfillment either.
+            # Shopify read the mutation and answered without complaining, so
+            # "nothing happened" is an assumption, not a fact — same call as
+            # refund.py makes on a refundCreate that returns no refund object.
+            return fail(possibly_sent("fulfillmentCreate returned no fulfillment id."))
 
         partial = bool(plan["unallocated"])
         status = STATUS_PARTIAL if partial else STATUS_FULFILLED
@@ -809,6 +922,13 @@ def fulfil_delivery_note(dn_name: str, settings=None, triggered_by: str = "manua
         return result(True, status, note or "Fulfilled in Shopify.", fulfillment_id)
 
     except ShopifyUserError as exc:
+        # No warning here, and that is sound only because of idempotent=False
+        # above: userErrors means Shopify read the mutation and declined it,
+        # and this answer describes the ONLY post that could have executed.
+        # With the ordinary retries it described the last of up to five that
+        # could each have run — and "already fulfilled" is exactly the answer
+        # attempt 2 gets when attempt 1 succeeded, which would have read here
+        # as "nothing happened, retry away".
         msg = str(exc)
         _release_claim(dn_name, STATUS_FAILED, msg)
         frappe.log_error(
@@ -819,7 +939,11 @@ def fulfil_delivery_note(dn_name: str, settings=None, triggered_by: str = "manua
         return result(False, STATUS_FAILED, msg)
 
     except ShopifyAPIError as exc:
-        msg = str(exc)
+        # Which phase raised decides whether Shopify may already hold the
+        # fulfillment.  Before the post, nothing can have happened; after it,
+        # the POST may have been delivered and executed with only its ANSWER
+        # lost — true of a single attempt, so it does not rest on retries.
+        msg = possibly_sent(str(exc), exc)
         _release_claim(dn_name, STATUS_FAILED, msg)
         frappe.log_error(msg, f"Shopify: Fulfillment API Error — {dn_name}")
         _alert(settings, dn_name, msg)
@@ -827,10 +951,13 @@ def fulfil_delivery_note(dn_name: str, settings=None, triggered_by: str = "manua
 
     except Exception:
         tb = frappe.get_traceback()
-        _release_claim(dn_name, STATUS_FAILED, "Unexpected error; see the Error Log.")
+        # A bug of ours after the post is still a fulfillment Shopify may hold,
+        # so the reader gets the same warning as a lost response.
+        msg = possibly_sent("Unexpected error; see the Error Log.")
+        _release_claim(dn_name, STATUS_FAILED, msg)
         frappe.log_error(tb, f"Shopify: Fulfillment Failed — {dn_name}")
         _alert(settings, dn_name, tb)
-        return result(False, STATUS_FAILED, "Unexpected error; see the Error Log.")
+        return result(False, STATUS_FAILED, msg)
 
 
 def _warn_if_truncated(dn_name, shopify_order_id, fulfillment_orders, fo_nodes):
@@ -905,6 +1032,14 @@ def cancel_fulfillment_for_dn(dn_name: str, store_name: str = "") -> dict:
             frappe.log_error(msg, f"Shopify: Fulfillment Cancel Skipped — {dn_name}")
             return {"ok": False, "message": msg}
 
+        # Keeps execute()'s default retries deliberately, and unlike
+        # fulfillmentCreate that is safe: this mutation is effect-idempotent.
+        # It names one existing fulfillment by id and drives it to CANCELED, so
+        # a re-post after a lost response reaches the same end state as the
+        # post that was lost — and a second cancel of an already-cancelled
+        # fulfillment answers with userErrors rather than doing anything.
+        # There is no headroom for it to consume and nothing for it to create,
+        # so no number of re-posts can produce a second anything.
         data = execute(
             settings,
             _FULFILLMENT_CANCEL_MUTATION,

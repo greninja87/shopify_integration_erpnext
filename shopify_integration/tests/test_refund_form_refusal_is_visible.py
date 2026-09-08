@@ -26,11 +26,16 @@ The two states, both from the live shape of the data rather than invented:
   * Ineligible for a setup reason — Refund Write-Back off for the store, or no
     Admin API token.  An orange "Shopify: not written back" indicator, no
     button, no explanation, while payment_portals' Approved intro for the
-    channel sent the reader to this app for the payout.  And not an edge case:
-    `enable_refund_writeback` is 0 on every store and must stay 0 — this app's
-    own tests/test_refund_report.py records that — so **Refund in Shopify** is
-    on no form at all, `writeback_unavailable_for_store` is the live state, and
-    this message is what a reader actually meets.
+    channel sent the reader to this app for the payout.  Two settings make the
+    difference and neither is legible from the form:
+    `enable_refund_writeback` on the store's Shopify Settings, refused as
+    `writeback_unavailable_for_store`, and the Admin API credentials, refused
+    as `no_api_credentials`.  Whichever of them stands, this message is the
+    only account a reader gets.  (This paragraph used to add that the toggle
+    was clear across the estate and had to stay that way, so **Refund in
+    Shopify** was on no form anywhere — a live setting copied into source,
+    which then moved.  See TestNoFileHardCodesTheLiveToggleValue at the foot of
+    this file.)
   * `is_shopify` false on a Shopify-channel refund.  It is
     `payout_owner == OWNER_SHOPIFY`, true only once a GID or the Sales Order's
     `shopify_order_id` exists; let the order link stop reading — no Sales Order
@@ -1003,26 +1008,37 @@ class TestTheModuleHeaderIsTrue(unittest.TestCase):
             "be stated with it",
         )
 
-    def test_it_says_the_button_is_on_no_form_on_the_live_configuration(self):
+    def test_it_says_what_makes_the_button_absent_when_it_is_absent(self):
         """`can_write_back` needs `enable_sync` and `enable_refund_writeback` on
-        the store's Shopify Settings plus Admin API credentials, and this app's
-        own tests/test_refund_report.py records the live state as
-        "enable_refund_writeback is 0 on every store and must stay 0".  So the
-        button is rendered nowhere today and the eligibility refusal is this
-        file's ordinary output — which is the opposite of how a reader would rank
-        the paths from the code alone."""
+        the store's Shopify Settings plus Admin API credentials, and a reader
+        looking at the form can see neither of those settings.  A missing button
+        with no word about why is indistinguishable from a broken page, so the
+        header has to name both halves of the setup and both refusal codes.
+
+        That is the durable half.  This test used to pin the other half: that
+        the estate was currently set one way, that the button was therefore on
+        no form at all and the eligibility refusal was this file's ordinary
+        output — and it held the sentence in place by asserting it was *present*
+        in tests/test_refund_report.py, so correcting the record there broke
+        this test.  The premise had already inverted: the payout exists only
+        while somebody has armed the toggle, and the project's working record
+        for 2026-09-08 has it armed on production, so the button does render on
+        a submitted Shopify-channel refund that passes eligibility.  Which
+        stores it is absent on is not this file's business; what makes it absent
+        is.  See TestNoFileHardCodesTheLiveToggleValue.
+        """
         prose = header_prose()
         self.assertIn("enable_refund_writeback", prose)
-        self.assertIn("writeback_unavailable_for_store", prose)
-        report = (
-            Path(__file__).resolve().parent / "test_refund_report.py"
-        ).read_text(encoding="utf-8")
-        self.assertIn(
-            "enable_refund_writeback is 0 on every store and must stay 0",
-            re.sub(r"\s+", " ", report),
-            "the header cites that file for the live state; if the record has "
-            "moved, the header's claim needs a new source, not a rewording",
-        )
+        self.assertIn("Admin API", prose)
+        for code in MUST_SPEAK:
+            self.assertIn(
+                code,
+                prose,
+                "the header must name the refusal a reader meets when that half "
+                "of the setup is missing — nothing else on the form says it, "
+                "and the header is where the paths get ranked for the next "
+                "editor",
+            )
 
     def test_it_says_what_the_unmigrated_site_gets_instead(self):
         """Correcting the clause by deleting it would leave the reader with no
@@ -1169,6 +1185,213 @@ class TestTheUnmigratedStateIsHandledElsewhere(unittest.TestCase):
             "next reader to put it back",
         )
         self.assertIn("shopify_refund_dead_end_message", preamble)
+
+
+# ── The live setting of the store checkbox is not a fact about this code ─────
+
+#: The files that have carried a claim about how `enable_refund_writeback` is
+#: set in production.  Seven such claims stood in these five, all of them
+#: saying the checkbox was clear across the estate and had to remain so, while
+#: the project's refund write-back working record for 2026-09-08 has it armed
+#: on the two production stores on purpose: with it clear,
+#: `_settings_for_store(require_enabled=True)` finds nothing and the payout
+#: refuses `writeback_unavailable_for_store`, so somebody arming it is what
+#: makes the feature exist at all.  Nothing caught the drift, because a
+#: checkbox anybody can change in a settings form had been copied into source
+#: as though it were a property of the code.
+#:
+#: Two documents outside this list also carry a setting for the same checkbox
+#: (REFUND-DISPATCH-CONTRACT.md, REFUND-WRITEBACK-HANDOFF.md).  They belong to
+#: other work and are deliberately not scanned here.
+TOGGLE_CLAIM_FILES = (
+    Path(__file__).resolve(),
+    Path(__file__).resolve().parent / "test_refund_report.py",
+    Path(__file__).resolve().parents[1] / "utils" / "refund_report.py",
+    FORM,
+    Path(__file__).resolve().parents[2] / "REFUND-REPORT-CONTRACT.md",
+)
+
+#: The ways the checkbox's setting gets written down.
+TOGGLE_VALUES = ("0", "1", "on", "off")
+
+#: The words that turn one store's setting into a claim about the estate.
+TOGGLE_SCOPES = ("every", "each", "all", "both")
+
+_VALUE = r"\b(?:" + "|".join(TOGGLE_VALUES) + r")\b"
+_SCOPE = (
+    r"\b(?:" + "|".join(TOGGLE_SCOPES) + r")\b"
+    r"(?:\s+\w+)?(?:\s+\w+)?\s+stores?\b"
+)
+_WITHIN_ONE_SENTENCE = r"[^.\n]*?"
+
+#: A sentence putting a setting on the whole estate, in either word order.
+ESTATE_CLAIM = re.compile(
+    _VALUE + _WITHIN_ONE_SENTENCE + _SCOPE
+    + "|" + _SCOPE + _WITHIN_ONE_SENTENCE + _VALUE,
+    re.IGNORECASE,
+)
+
+#: A sentence telling the reader the checkbox has to remain at some setting.
+#: Which stores have the payout armed is the owner's call in either direction,
+#: and phrasing it as a rule is why the setting went unread for so long: a rule
+#: does not look like something to go and re-check.
+PRESCRIPTION = re.compile(
+    r"must stay(?:\s+\w+)?(?:\s+\w+)?\s+" + _VALUE, re.IGNORECASE
+)
+
+#: An as-of date.  It is what separates a claim a reader can act on from one
+#: they cannot: a dated claim can be recognised as stale, an undated one is
+#: indistinguishable from a current fact.
+AS_OF_DATE = re.compile(r"\b\d{4}-\d\d-\d\d\b")
+
+#: How far either side of a claim its date is allowed to sit.
+DATE_WINDOW = 240
+
+_FIRST_SCOPE_WORD = TOGGLE_SCOPES[0]
+
+
+def claim_prose(path: Path) -> str:
+    """`path` as one line of flowing prose: comment markers gone, runs of
+    whitespace collapsed.
+
+    A phrase pinned against raw text is defeated by a line wrap landing inside
+    it — that is how the module header's contract sentence escaped its own test
+    once already, and why `header_prose` exists.  A claim spread over three
+    `//` lines is the same claim.
+    """
+    text = path.read_text(encoding="utf-8")
+    return re.sub(
+        r"\s+", " ", re.sub(r"^\s*(?://+|#+)\s?", "", text, flags=re.MULTILINE)
+    )
+
+
+def claims(pattern, text: str):
+    """Every match of `pattern` in `text`."""
+    return [match.group(0) for match in pattern.finditer(text)]
+
+
+def undated(pattern, text: str):
+    """Matches of `pattern` in `text` with no as-of date within reach of them.
+
+    Takes text rather than a path so the rule itself can be exercised on a
+    string — the rule is "date it", not "never say it", and a guard that only
+    ever ran over the tree would leave the next editor free to read it as the
+    latter and delete the fact instead of dating it.
+    """
+    return [
+        match.group(0)
+        for match in pattern.finditer(text)
+        if not AS_OF_DATE.search(
+            text[max(0, match.start() - DATE_WINDOW):match.end() + DATE_WINDOW]
+        )
+    ]
+
+
+def stale_claim(value: str) -> str:
+    """The sentence this round removed, and its inverse, assembled from the
+    vocabulary above rather than spelled out.
+
+    This scan reads its own file, so a needle written out here would be a
+    needle this file contains.  That is not hypothetical: the test this class
+    stands next to used to assert the stale sentence was *present* in
+    tests/test_refund_report.py, which is how correcting the record there came
+    to break a test, and how the sentence survived a round.
+    """
+    return (
+        "enable_refund_writeback is {v} on {scope} store and must stay {v}"
+    ).format(v=value, scope=_FIRST_SCOPE_WORD)
+
+
+class TestNoFileHardCodesTheLiveToggleValue(unittest.TestCase):
+    """What a store's checkbox is set to today is not a fact about this code.
+
+    Seven claims across five files said it was clear everywhere and had to
+    remain so.  It is not, and it is not this app's call: the payout exists
+    only while somebody has armed it, and the project's working record for
+    2026-09-08 has it armed on production.  Every one of those claims read as
+    a standing truth, which is exactly why none of them was ever re-read — so
+    the property worth holding is not the newer setting but the absence of any
+    undated one.
+    """
+
+    # Each of these collects across every file before asserting.  Failing on
+    # the first offender would have hidden four of the seven, and the seven
+    # were only ever found because somebody grepped for the sentence.
+
+    def test_the_stale_sentence_and_its_inverse_are_both_gone(self):
+        found = [
+            "{name}: {needle}".format(name=path.name, needle=needle)
+            for value in TOGGLE_VALUES
+            for needle in [stale_claim(value)]
+            for path in TOGGLE_CLAIM_FILES
+            if needle in claim_prose(path)
+        ]
+        self.assertEqual(
+            [],
+            found,
+            "these state the checkbox's setting as a standing fact: {found!r}. "
+            "Flipping the digit is the same defect carrying a newer "
+            "value.".format(found=found),
+        )
+
+    def test_no_file_puts_a_setting_on_the_whole_estate_undated(self):
+        found = [
+            "{name}: {claim}".format(name=path.name, claim=claim)
+            for path in TOGGLE_CLAIM_FILES
+            for claim in undated(ESTATE_CLAIM, claim_prose(path))
+        ]
+        self.assertEqual(
+            [],
+            found,
+            "these put a setting on the estate with no as-of date: {found!r}. "
+            "Where the reasoning does not need the setting, state the "
+            "reasoning without it; where it does, date it and say where the "
+            "real setting is read.".format(found=found),
+        )
+
+    def test_nothing_prescribes_a_setting_for_the_checkbox(self):
+        found = [
+            "{name}: {claim}".format(name=path.name, claim=claim)
+            for path in TOGGLE_CLAIM_FILES
+            for claim in claims(PRESCRIPTION, claim_prose(path))
+        ]
+        self.assertEqual(
+            [],
+            found,
+            "these prescribe a setting: {found!r}. Arming the payout is the "
+            "owner's decision, and with it disarmed the payout refuses "
+            "writeback_unavailable_for_store.".format(found=found),
+        )
+
+    def test_a_dated_claim_is_allowed_and_an_undated_one_is_not(self):
+        """The rule these tests enforce, exercised on a string rather than on
+        the tree.
+
+        The JS header has to name the setting — which of its paths a reader
+        meets depends on it — so "never write the value down" is the wrong
+        rule and would be obeyed by deleting the fact.  The rule is that a
+        volatile fact carries an as-of date, which is what lets the next
+        reader tell a stale claim from a current one.  The stale sentence had
+        no date, so nothing about it looked old.
+        """
+        claim = "the toggle is {v} on {scope} store".format(
+            v=TOGGLE_VALUES[1], scope=_FIRST_SCOPE_WORD
+        )
+        self.assertTrue(
+            claims(ESTATE_CLAIM, claim),
+            "the scan no longer recognises a claim about the whole estate",
+        )
+        self.assertTrue(
+            undated(ESTATE_CLAIM, claim),
+            "an undated claim about the whole estate has to be reported, or "
+            "the stale sentence comes back exactly as it left",
+        )
+        self.assertEqual(
+            [],
+            undated(ESTATE_CLAIM, "Read as of 2026-09-08: " + claim),
+            "a dated claim must pass, or the rule reads as a ban on stating "
+            "the setting at all",
+        )
 
 
 if __name__ == "__main__":

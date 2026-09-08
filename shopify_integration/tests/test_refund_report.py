@@ -1309,12 +1309,21 @@ class TestReportFromWebhook(RefundReportTestCase):
 
 
 class TestReportingIsNotGatedOnThePayoutToggle(RefundReportTestCase):
-    """The toggle that must stay off guards the payout, not the report."""
+    """`enable_refund_writeback` guards the payout, not the report — whatever
+    it happens to be set to."""
 
     def test_the_store_lookup_ignores_enable_refund_writeback(self):
-        """enable_refund_writeback is 0 on every store and must stay 0.  If the
-        report were gated on it, the one thing that is safe to run would only
-        run while the dangerous thing was armed."""
+        """The lookup finds a store whose `enable_refund_writeback` is 0, which
+        is the case that breaks if the gate ever comes back: were the report
+        gated on that toggle, the one thing that is safe to run would only run
+        while the dangerous thing was armed.
+
+        The 0 seeded below is that case, not a record of what any store is set
+        to.  This docstring used to assert the live setting as well, and the
+        setting moved without it — see
+        test_refund_form_refusal_is_visible.TestNoFileHardCodesTheLiveToggleValue,
+        which now scans this file for exactly that.
+        """
         frappe_stub.set_doc("Shopify Settings", "Test Store", {
             "name": "Test Store",
             "shop_domain": STORE,

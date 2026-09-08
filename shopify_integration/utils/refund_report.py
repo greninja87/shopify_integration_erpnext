@@ -854,10 +854,14 @@ def _settings_for_store(shop_domain: str):
     """Shopify Settings for a store, or None.
 
     Gated on `enable_sync` only, and deliberately **not** on
-    `enable_refund_writeback`.  That toggle guards the payout in `refund.py`
-    and is `0` on every store, which is where it must stay; a report moves no
-    money, and gating it on the payout switch would mean the one safe thing
+    `enable_refund_writeback`.  That toggle guards the payout in `refund.py`,
+    and this lookup must not depend on it whatever it is set to: a report moves
+    no money, and gating it on the payout switch would mean the one safe thing
     only ran while the dangerous thing was armed.
+
+    This docstring used to name the toggle's live value here as well, and the
+    value moved without it — which is the argument for stating the reasoning
+    and leaving the setting to be read off Shopify Settings.
     """
     name = frappe.db.get_value(
         "Shopify Settings", {"shop_domain": shop_domain, "enable_sync": 1}, "name"

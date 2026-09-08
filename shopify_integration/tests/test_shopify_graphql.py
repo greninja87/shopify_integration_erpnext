@@ -15,12 +15,17 @@ one that corrupts data: read it as success and a Delivery Note gets marked
 fulfilled when Shopify rejected the fulfillment.
 
 The third property, and the expensive one, is HOW MANY TIMES a document is
-posted.  execute() retries the identical document, which is right for
-fulfillment and wrong for refundCreate: a successful refundCreate pays a real
-customer through the Cashfree-OCC bridge and carries no idempotency key, so a
-retry after a lost response pays them twice.  TestNonIdempotentExecute pins the
-post count for that case, and TestExecute / TestHttpErrors pin that nothing
-changed for everyone else.
+posted.  execute() retries the identical document, which is right for a read
+and wrong for either mutation that creates something.  A successful
+refundCreate pays a real customer through the Cashfree-OCC bridge and carries
+no idempotency key, so a retry after a lost response pays them twice; a
+fulfillmentCreate against a PARTLY fulfilled order finds unfulfilled quantity
+still there, so a retry ships the same goods twice and emails a second tracking
+notification.  Both pass idempotent=False.  TestNonIdempotentExecute pins the
+post count for that mode, and TestExecute / TestHttpErrors pin that nothing
+changed for the reads.  The wiring on the fulfillment side — which call passes
+it, and what the Delivery Note says afterwards — is pinned in
+tests/test_fulfillment.py.
 """
 
 import sys
@@ -345,7 +350,10 @@ class TestNonIdempotentExecute(GraphQLTestCase):
     """
     execute(idempotent=False) — "this exact document must not be re-posted".
 
-    refundCreate is the caller that needs it.  A refundCreate that succeeds
+    Two callers need it, refundCreate and fulfillmentCreate, on the same
+    headroom argument; refundCreate is the one scripted here because it is the
+    one that moves money, and fulfillment's end of the wiring is pinned in
+    tests/test_fulfillment.py.  A refundCreate that succeeds
     pays a real customer real money through the Cashfree-OCC bridge, and
     build_refund_mutation() is called with no key, so the @idempotent directive
     is absent and Shopify has no way to recognise a second POST of the same

@@ -47,14 +47,21 @@
 // reason of its own.
 //
 // One live fact, because it decides which of these paths a reader actually
-// meets.  can_write_back needs Shopify Settings for the store with enable_sync
-// and enable_refund_writeback both set and Admin API credentials present, and
-// tests/test_refund_report.py records the live state as "enable_refund_writeback
-// is 0 on every store and must stay 0".  So no store is set up for write-back
-// today, the Refund in Shopify button is on no form at all, and
-// writeback_unavailable_for_store — spoken, below — is what this file renders on
-// a live Shopify-channel refund.  The eligibility message is this module's
-// ordinary output, not its edge case.
+// meets — so it is dated, and the place it is really read is named.
+// can_write_back needs Shopify Settings for the store with enable_sync and
+// enable_refund_writeback both set and Admin API credentials present.  Miss the
+// toggle and this file speaks writeback_unavailable_for_store; miss the token
+// and it speaks no_api_credentials; in either state there is no Refund in
+// Shopify button on the form at all, and since neither setting is legible from
+// the form, that message is the only account a reader gets.  As of 2026-09-08
+// the toggle is set: 1 on both production stores, per the project's refund
+// write-back working record of that date.  Shopify Settings for the store is
+// where the current answer lives, not this comment.  So the button does render
+// on a submitted Shopify-channel refund that passes the rest of
+// check_eligibility, and the setup refusal is what a misconfigured store gets
+// rather than this module's ordinary output.  This header claimed the reverse
+// for a while, off a copy of the toggle's then value that no settings change
+// could reach.
 //
 // Who owns the form's headline is a module-wide rule, not a per-path choice.
 // payment_portals' render_summary puts this refund's net-refund figures in the
@@ -78,10 +85,11 @@
 // hook, registered in hooks.py.  The hook is reached only from that app's own
 // Send step, and `sent_by_this_app` withholds that on the Shopify channel — so
 // no route on the form but this button gets there today, which is why the
-// messages below say "nothing on this form" and not "nothing else".  Fewer
-// still on the live configuration: the one route the form has is a button
-// nothing renders while enable_refund_writeback is 0, which is why the messages
-// have to be right about what is missing rather than which button to press.
+// messages below say "nothing on this form" and not "nothing else".  And where
+// the store is not set up, no route at all: the one route the form has is a
+// button nothing renders while enable_refund_writeback is off, which is why the
+// messages have to be right about what is missing rather than which button to
+// press.
 
 // payment_portals' `refund_channel` value whose payout goes out through the
 // Shopify order — utils/refund.CHANNEL_DISPATCH, which this side cannot import.
@@ -119,8 +127,8 @@ const MANUAL_PORTAL_REFUND_CHANNEL = 'Manual Portal Refund';
 // name: it says the payout comes from this app's write-back, that this app's
 // button appears only where the store is set up for write-back, and that where
 // it is not, this app's own message on the form says so.  This is that message,
-// and with enable_refund_writeback 0 on every live store it is the state a
-// reader meets rather than an edge case.  So: a code is spoken when it is
+// and wherever enable_refund_writeback is off for a store it is the whole of
+// what a reader gets, not an aside.  So: a code is spoken when it is
 // reachable on a submitted Shopify-channel refund, is not already accounted for
 // by something else on the form, and is somebody's to fix.
 //
@@ -290,8 +298,8 @@ frappe.ui.form.on('Refund Request', {
             // and off this channel it is about to make none.  On this channel it
             // is deliberately NOT conditional on can_write_back: a refusal is
             // when somebody most needs to see what Shopify actually reports,
-            // and with enable_refund_writeback 0 on every live store the
-            // refusal is the only state there is.
+            // and on a store with enable_refund_writeback off the refusal is
+            // the only state there is.
             if (dispatches_here) {
                 shopify_refund_button(frm, info);
                 shopify_resolve_unverified_button(frm, info);
@@ -526,8 +534,8 @@ function shopify_resolve_unverified_button(frm, info) {
 
 // Offered on every refund travelling by the Shopify refund channel, including
 // ones the write-back refuses, because the refusals are exactly when somebody
-// needs it — and with enable_refund_writeback 0 on every live store, refused is
-// every one of them.  REF-00207 failed twice on production with "no transaction
+// needs it — and a store with enable_refund_writeback off refuses every one
+// of them.  REF-00207 failed twice on production with "no transaction
 // on this order can take a refund" and there was no way to see, from ERPNext,
 // which row failed which test — the response had been discarded.  This asks
 // Shopify and shows the answer.
