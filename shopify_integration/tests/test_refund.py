@@ -16,6 +16,7 @@ Covers the pure half of utils/refund.py, which is where the correctness lives:
   * build_refund_input   — restocking by accident, and losing the reason
 """
 
+import inspect
 import unittest
 from pathlib import Path
 
@@ -382,9 +383,10 @@ class TestBuildRefundInput(unittest.TestCase):
 # ── The mutation document ─────────────────────────────────────────────────────
 
 class TestRefundMutation(unittest.TestCase):
-    """The @idempotent directive is unverified against the configured API
-    version, and an unknown directive is a query-level error that would fail
-    every write-back.  So it is opt-in, and off by default.
+    """The document itself.  Whether it carries an `@idempotent` key is decided
+    by the store's API version at the post — see
+    tests/test_refund_idempotency.py, which owns that behaviour; this class only
+    pins the formatter.
     """
 
     def test_default_document_carries_no_directive(self):
@@ -397,13 +399,17 @@ class TestRefundMutation(unittest.TestCase):
         mutation = r.build_refund_mutation("REF-0007:12999.00")
         self.assertIn('@idempotent(key: "REF-0007:12999.00")', mutation)
 
-    def test_no_key_generator_is_offered_while_the_directive_is_off(self):
-        """idempotency_key() was deleted: nothing called it, and a helper that
-        mints a key while no call sends one reads as though retries were already
-        protected.  The key format lives in build_refund_mutation's docstring
-        until the directive is verified against a live response."""
-        self.assertFalse(hasattr(r, "idempotency_key"))
-        self.assertIn("net_refund_amount", r.build_refund_mutation.__doc__)
+    def test_the_key_generator_is_wired_to_the_post(self):
+        """A minted key that nothing sends would read as though retries were
+        already protected — which is why there was no generator here for so
+        long.  There is one now because the post uses it, above the version
+        that requires it."""
+        self.assertTrue(callable(getattr(r, "idempotency_key", None)))
+        self.assertTrue(callable(getattr(r, "idempotency_required", None)))
+        self.assertIn("idempotency_key", inspect.getsource(r.write_back_refund))
+
+    def test_the_docstring_carries_the_version_that_makes_the_key_mandatory(self):
+        self.assertIn(r.IDEMPOTENCY_REQUIRED_FROM, r.build_refund_mutation.__doc__)
 
     def test_a_key_with_a_quote_in_it_cannot_break_the_document(self):
         mutation = r.build_refund_mutation('bad"key')

@@ -555,11 +555,21 @@ function shopify_refund_targets_button(frm) {
             if (!info) return;
 
             const rows = (info.transactions || []).map(function(t) {
-                // A row Shopify never gave a figure for is not a row worth zero,
-                // and the whole diagnosis can turn on the difference.
-                const refundable = t.refundable_reported
+                // A row nothing gave a figure for is not a row worth zero, and
+                // the whole diagnosis can turn on the difference — that is how
+                // the 2026-09-09 defect was finally read off this table.
+                //
+                // Where the figure came from matters just as much now.  Shopify
+                // only reports headroom inside suggestedRefund; everything else
+                // is this app's own arithmetic over the transactions, which is
+                // sound but is not Shopify's word, so it says so.
+                let refundable = t.refundable_reported
                     ? frappe.format(t.refundable, { fieldtype: 'Data' })
-                    : '<i>' + __('not reported by Shopify') + '</i>';
+                    : '<i>' + __('not reported') + '</i>';
+                if (t.refundable_source === 'derived') {
+                    refundable += ' <span class="text-muted">('
+                        + __('derived') + ')</span>';
+                }
                 const verdict = t.rejected_because
                     ? '<span style="color:var(--red-500)">' + t.rejected_because + '</span>'
                     : '<span style="color:var(--green-600)">' + __('usable') + '</span>';
@@ -591,8 +601,20 @@ function shopify_refund_targets_button(frm) {
                 message: `<p>${frappe.utils.escape_html(info.message || '')}</p>`
                     + `<p>${__('Order')}: <b>${frappe.utils.escape_html(info.shopify_order_name || info.shopify_order_id || '')}</b>
                           &middot; ${__('Refundable total')}: <b>${frappe.utils.escape_html(String(info.refundable_total))}</b>
-                          &middot; ${__('This refund')}: <b>${frappe.utils.escape_html(String(info.amount))}</b></p>`
-                    + table,
+                          &middot; ${__('This refund')}: <b>${frappe.utils.escape_html(String(info.amount))}</b>`
+                    + (info.order_refundable_total === null
+                        || info.order_refundable_total === undefined
+                        ? ''
+                        // Shopify's own figure for the whole order — the one the
+                        // admin prints. Shown beside ours so a disagreement is
+                        // visible rather than having to be suspected.
+                        : ` &middot; ${__('Shopify says')}: <b>${frappe.utils.escape_html(String(info.order_refundable_total))}</b>`)
+                    + `</p>`
+                    + table
+                    + (info.suggestion_available ? '' :
+                        `<p class="text-muted" style="margin-top:8px">
+                            ${__('Shopify offered no suggested refund for this order, so every figure above is worked out from the transactions themselves — what was charged, less what has been given back.')}
+                         </p>`),
             });
         }).catch(() => null);
     }, __('Shopify'));
@@ -678,7 +700,10 @@ function shopify_refund_message(frm, info) {
     // frappe.format, and the Verdict cell interpolates t.rejected_because raw.
     // That last one is safe for a reason that does not generalise to here —
     // rejection_reason returns one of three fixed slugs ('kind', 'status',
-    // 'no_headroom') and never a value read off the order.  `reason` has no such
+    // 'no_headroom') and never a value read off the order.  The Refundable
+    // cell's "(derived)" suffix is the same kind of thing: it is a literal in
+    // this file, chosen by comparing refundable_source against a constant, and
+    // no part of the server's value reaches the markup.  `reason` has no such
     // closed vocabulary: these sentences are built out of document values a
     // person types — the store domain, the Sales Order name, the channel string
     // — so escaping is the right default whether or not a reason_code composes

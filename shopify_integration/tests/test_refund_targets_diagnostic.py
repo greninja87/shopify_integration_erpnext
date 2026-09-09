@@ -175,7 +175,10 @@ class TestTheRefusalRecordsWhatItSaw(WritebackTestCase):
         self.assertEqual(
             set(row),
             {"id", "kind", "status", "gateway", "amount", "refundable",
-             "refundable_reported", "rejected_because"},
+             # A slug naming which of the three sources produced the figure —
+             # see tests/test_refund_headroom.py.  It is about this app's
+             # reading, never about the order or the person behind it.
+             "refundable_reported", "refundable_source", "rejected_because"},
         )
     def test_nothing_was_sent_on_that_path(self):
         self.responses = [targets_response(transactions=[])]
@@ -244,8 +247,16 @@ class TestRefundTargetsNow(WritebackTestCase):
     next failure does not need a Shopify login to explain."""
 
     def test_it_reports_every_row_and_why_each_was_rejected(self):
+        # 10.00 charged against a 5.00 refund already given back, so the SALE
+        # still has headroom and is reported as usable.  The amounts matter
+        # since 2026-09-09: a REFUND row is subtracted from what its parent can
+        # still take, so a 5.00 sale with a 5.00 refund against it is a settled
+        # order and would be rejected here for the right reason — which is not
+        # the reason this test is about.
         self.responses = [targets_response(transactions=[
-            txn(id="gid://shopify/OrderTransaction/9", kind="SALE"),
+            txn(id="gid://shopify/OrderTransaction/9", kind="SALE",
+                amountSet={"presentmentMoney": {"amount": "10.00",
+                                                "currencyCode": "INR"}}),
             txn(kind="REFUND"),
         ])]
         info = r.refund_targets_now(REFUND)
@@ -344,9 +355,18 @@ class TestRefundTargetsNow(WritebackTestCase):
         payout behind a read-only name."""
         import inspect
         source = inspect.getsource(r.refund_targets_now)
-        self.assertIn("_REFUND_TARGETS_QUERY", source)
+        # The read itself moved into read_refund_targets when the suggestion
+        # block gained a fallback, so the guard follows it: the diagnostic must
+        # reach Shopify through that function and through nothing else.
+        self.assertIn("read_refund_targets", source)
+        self.assertNotIn("execute(", source)
         self.assertNotIn("_REFUND_CREATE_MUTATION", source)
         self.assertNotIn("refundCreate", source)
+
+        reader = inspect.getsource(r.read_refund_targets)
+        self.assertIn("_REFUND_TARGETS_QUERY", reader)
+        self.assertNotIn("_REFUND_CREATE_MUTATION", reader)
+        self.assertNotIn("refundCreate", reader)
 
 
 if __name__ == "__main__":

@@ -318,18 +318,34 @@ Request cannot produce two refunds; the second returns `refused` /
 `already_paid` with the original GID. A caller-supplied token would add a
 second, weaker key for the same guarantee.
 
-**Towards Shopify: there is no `@idempotent` key on the mutation either**, and
-that absence is the whole reason §7a exists. `refundCreate` accepts
-`@idempotent(key: "…")`, but it could not be confirmed against the configured
-API version, and an unknown directive is a **query-level** error — so switching
-it on unverified would not degrade gracefully, it would fail *every* write-back
-with a GraphQL error. `build_refund_mutation()` is therefore called with no key,
-Shopify cannot recognise a second POST of the same document as the same refund,
-and the protection is not a key but a delivery rule: **at most one post of the
-mutation can have executed** — five refused posts are still one that could have
-run, and the refusal is what carries it. See §7a. If a live response ever confirms the directive, the key
-will be the Refund Request name plus the amount in minor units, and this
-paragraph changes with it.
+**Towards Shopify: the `@idempotent` key follows the store's API version.**
+Below `2026-04` the mutation goes out without one, and that absence is the whole
+reason §7a exists: Shopify cannot recognise a second POST of the same document
+as the same refund, so the protection is not a key but a delivery rule — **at
+most one post of the mutation can have executed**; five refused posts are still
+one that could have run, and the refusal is what carries it. See §7a.
+
+From `2026-04` the key is **mandatory** — Shopify's changelog of 12 December
+2025, `refundCreate` among seventeen mutations — and it is *not* marked required
+in the schema, so an app that omits it fails at runtime on the money post rather
+than being caught earlier. `idempotency_required(settings)` compares the
+configured version against `IDEMPOTENCY_REQUIRED_FROM` and sends the directive
+from there on; bumping a store's `api_version` is the switch, and nothing else
+has to be remembered.
+
+The key is a **UUIDv5 over the whole `RefundInput`**, namespaced to this app
+(`IDEMPOTENCY_NAMESPACE`) and salted with the Refund Request name. Deterministic,
+so the same refund re-posted is the same key; over the whole input because
+Shopify refuses a key reused with different parameters
+(`IDEMPOTENCY_KEY_PARAMETER_MISMATCH`) and an edited reason note is different
+parameters.
+
+**A keyed post does not change §7a.** Keys deduplicate for 24 hours and a repeat
+with identical parameters returns the first response instead of refunding again
+— which would make `execute()`'s ordinary retries safe on 2026-04 and above —
+but `idempotent=False` is still passed. Trading the delivery rule for Shopify's
+guarantee changes what every verdict in §5 and §6 means, so it is a
+`CONTRACT_VERSION` decision, not a side effect of a version bump.
 
 ---
 
@@ -364,9 +380,11 @@ Whitelisted, gated on **Shopify Settings write**, and it **cannot pay anybody**:
 it runs the same `RefundTargets` query the payout runs and stops, posts no
 mutation, and writes nothing to the Refund Request. Returns every transaction on
 the order with `kind`, `status`, `gateway`, `amount`, `refundable`,
-`refundable_reported` and `rejected_because`, plus `refundable_total` and the
-`would_refuse_with` verdict taken from `plan_refund` itself — so it can never
-say "fine" about a refund that would then refuse.
+`refundable_reported`, `refundable_source` and `rejected_because`, plus
+`refundable_total`, `suggestion_available`, `order_refundable_total` (Shopify's
+own order-level figure, `null` when it reported none — shown beside ours, never
+used as a cap) and the `would_refuse_with` verdict taken from `plan_refund`
+itself — so it can never say "fine" about a refund that would then refuse.
 
 It exists because a refusal used to be unexplainable. `REF-00207` on production
 (2026-09-08) refused `no_refundable_transactions` twice and the response was
@@ -375,14 +393,45 @@ admin login for a store nobody had one for. Deliberately **not** gated on
 `enable_refund_writeback`: the diagnosis is needed precisely while the payout is
 switched off.
 
-**`refundable_reported` is the field to read on a headroom refusal.**
-`maximumRefundableV2` reported as `0.00` and not reported at all are the same
-number by the time the filter sees them, and they mean opposite things — a
-settled order, versus this app reading a field the API version does not populate,
-in which case *no* order is refundable anywhere and every one presents as
-already fully refunded. The filter treats both as no-headroom, because refusing
-on a number we do not have is the safe direction; this flag is how a person tells
-them apart.
+**`refundable_reported` is the field to read on a headroom refusal**, and
+`refundable_source` is the one that says whose number it is. A figure reported
+as `0.00` and no figure at all are the same number by the time the filter sees
+them, and they mean opposite things — a settled order, versus this app failing
+to read the API, in which case *no* order is refundable anywhere and every one
+presents as already fully refunded. The filter treats both as no-headroom,
+because refusing on a number we do not have is the safe direction; these two
+fields are how a person tells them apart.
+
+**That second case was not hypothetical — it was live until 2026-09-09.** The
+query asked for `maximumRefundableV2` on `order.transactions`, and Shopify's
+schema (2026-01 included) says of that field: *"only available for transactions
+of type `SuggestedRefund`."* Off `order.transactions` it is always null, so every
+parent scored zero, on every order, on every store: no refund this app attempted
+could pass its own gate. Production settled it twice on one afternoon — `EB3494`,
+which the admin was offering ₹5.00 on, and `EB3484`, genuinely settled, reported
+the same nothing.
+
+Headroom now comes from up to three sources and `refundable_source` names the
+one that won:
+
+| `refundable_source` | where the figure came from |
+|---|---|
+| `suggested_refund` | `order.suggestedRefund.suggestedTransactions[].maximumRefundableSet` — Shopify's own figure, the one the admin prints. Note the name: **`maximumRefundableSet`**, a MoneyBag on `SuggestedOrderTransaction`, *not* `maximumRefundableV2` |
+| `transaction` | `maximumRefundableV2` on the transaction. Still asked for, still free; null in practice |
+| `derived` | this app's arithmetic — the parent's `amountSet` less every SUCCESS `REFUND`/`VOID` booked against it, with an unattributable one taken off the largest parents |
+| `none` | nothing to go on. Treated as zero, and the only value that sets `refundable_reported` false |
+
+**The lowest reported figure wins.** Over-reporting is not the money risk it
+looks like — Shopify enforces the real limit on `refundCreate` and refuses over
+it, which arrives as `rejected_by_shopify` / `failed_unsent` with nobody paid.
+Under-reporting only refuses. Neither is a double payout, and the second is
+cheaper.
+
+`suggestion_available` is false when Shopify offered no suggestion for the order
+— a normal answer, and also what you see if the store's API version rejects the
+`suggestedRefund` block. That rejection is caught: the read is retried once,
+narrowed to the transactions alone, and the refund proceeds on derived headroom
+rather than failing to read the order at all.
 
 ### The one distinction that decides the money path
 
@@ -778,15 +827,18 @@ committed to the Refund Request *before* the POST, precisely so a worker that
 never comes back leaves that state behind rather than a retryable one, and it is
 cleared only by a person through `resolve_unverified_writeback` (§5).
 
-**There is still no idempotency key**, and that is why this rule is the
-protection rather than a belt beside a brace. `refundCreate` accepts
-`@idempotent(key: "…")`, but the directive could not be confirmed against the
-configured API version, and an unknown directive is a **query-level** error:
-turning it on unverified would not degrade, it would fail *every* write-back.
-So the document goes out with no key, Shopify has no way to recognise a second
-POST of it as the same refund — a partial refund leaves the order enough
-headroom to take another — and "at most one post that could have executed" is
-what stands between a lost response and a customer paid twice. See §2b.
+**On `2026-01` there is no idempotency key**, and that is why this rule is the
+protection rather than a belt beside a brace: the document goes out unkeyed,
+Shopify has no way to recognise a second POST of it as the same refund — a
+partial refund leaves the order enough headroom to take another — and "at most
+one post that could have executed" is what stands between a lost response and a
+customer paid twice.
+
+On `2026-04` and above the document **is** keyed, because Shopify requires it,
+and a lost response could then be re-asked safely (24-hour dedup, first response
+returned). This rule does not relax on its own when that happens: the post is
+still made with `idempotent=False`, and changing that is a `CONTRACT_VERSION`
+decision. See §2b.
 
 ---
 

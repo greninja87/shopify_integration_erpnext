@@ -354,10 +354,11 @@ class TestNonIdempotentExecute(GraphQLTestCase):
     headroom argument; refundCreate is the one scripted here because it is the
     one that moves money, and fulfillment's end of the wiring is pinned in
     tests/test_fulfillment.py.  A refundCreate that succeeds
-    pays a real customer real money through the Cashfree-OCC bridge, and
-    build_refund_mutation() is called with no key, so the @idempotent directive
-    is absent and Shopify has no way to recognise a second POST of the same
-    document as the same refund.  One lost response is enough: attempt 1
+    pays a real customer real money through the Cashfree-OCC bridge, and below
+    API version 2026-04 the document carries no @idempotent key — it is optional
+    there and sent only from the version that requires it — so Shopify has no
+    way to recognise a second POST of the same document as the same refund.
+    One lost response is enough: attempt 1
     creates a real partial refund, its answer dies in the 30-second socket
     timeout, the retry re-posts the identical mutation, the order still has
     headroom because the refund was partial, and the customer is paid twice.

@@ -273,14 +273,23 @@ def execute(
     Why idempotent=False exists
     ---------------------------
     refundCreate is the caller that needs it.  A refundCreate that succeeds pays
-    a real customer real money through the Cashfree-OCC bridge, and
-    build_refund_mutation() is called with no key, so the optional @idempotent
-    directive is absent — Shopify has no way to recognise a second POST of the
-    same document as the same refund.  Attempt 1 creates a real partial refund,
-    its response dies in the _TIMEOUT socket timeout, this function re-POSTs the
-    identical mutation, the order still has headroom because the refund was
-    partial, and Shopify creates a SECOND refund.  Nothing in between consults
-    the stored GID or the worker claim, so nothing stops it.
+    a real customer real money through the Cashfree-OCC bridge, and below Admin
+    API version 2026-04 the document carries no @idempotent key — the directive
+    is optional there and refund.build_refund_mutation() is given one only from
+    the version that requires it — so Shopify has no way to recognise a second
+    POST of the same document as the same refund.  Attempt 1 creates a real
+    partial refund, its response dies in the _TIMEOUT socket timeout, this
+    function re-POSTs the identical mutation, the order still has headroom
+    because the refund was partial, and Shopify creates a SECOND refund.
+    Nothing in between consults the stored GID or the worker claim, so nothing
+    stops it.
+
+    A keyed post (2026-04 and above) would survive that re-POST — Shopify
+    deduplicates a repeat carrying the same key and the same parameters for 24
+    hours and returns the first response — but idempotent=False is passed
+    regardless, and re-enabling the retries on the strength of the key is a
+    deliberate contract change in refund.py rather than something this docstring
+    grants.
 
     Retry only on failures that PROVE non-execution
     -----------------------------------------------

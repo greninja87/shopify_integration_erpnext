@@ -70,23 +70,49 @@ every entry point is inert when the doctype is absent.
 
 The shape asymmetry
 -------------------
-order.transactions takes `first:` but appears to return a plain list, while
-refund.transactions on the mutation result is a connection with edges/node.
-Both forms appear in the official examples and neither could be verified against
-a live response, so transaction_nodes() accepts list, {"nodes": [...]} and
-{"edges": [{"node": ...}]}.  Guessing wrong here fails silently as an empty
-list, which would read as "no refundable parents".
+It is real, and it is in the schema rather than in anyone's reading of it —
+checked against 2026-01 on 2026-09-09.  `Order.transactions` is
+`[OrderTransaction!]!`, a plain list whose `first:` argument merely truncates it;
+`Refund.transactions`, on the mutation result, is an `OrderTransactionConnection!`
+with edges/node.  `SuggestedRefund.suggestedTransactions` is a plain list again.
+transaction_nodes() accepts all three shapes and keeps doing so: guessing wrong
+fails silently as an empty list, which would read as "no refundable parents",
+and the cost of tolerance is nothing.
+
+How much is left to refund
+--------------------------
+Not from the field you would expect.  `maximumRefundableV2` on an
+`OrderTransaction` is documented — 2026-01 included — as "only available for
+transactions of type `SuggestedRefund`", so read off `order.transactions` it is
+always null, `_paise(None)` is 0, and until 2026-09-09 that meant every parent
+on every order on every store scored zero headroom and no refund this app
+attempted could pass its own gate.  Two production orders proved it in one
+afternoon by giving the same answer: `EB3494`, which the Shopify admin was
+offering ₹5.00 on, and `EB3484`, genuinely settled.
+
+`with_headroom` now resolves the figure from up to three sources — Shopify's
+`order.suggestedRefund` (`maximumRefundableSet`, a different name on a different
+object), that transaction field if it is ever filled, and this app's own
+arithmetic over the rows — and the lowest reported one wins.  Everything
+downstream reads one number and `transaction_summary` reports which source it
+came from.  See tests/test_refund_headroom.py.
 
 Layout follows utils/fulfillment.py: pure decision functions first, testable
 with no bench, then the frappe-bound orchestration.
 """
 
+import json
 import re
+import uuid
 
 import frappe
 from frappe.utils import add_to_date, cint, flt, now_datetime
 
-from shopify_integration.utils.shopify_api import ShopifyAPIError, has_admin_api_credentials
+from shopify_integration.utils.shopify_api import (
+    ShopifyAPIError,
+    get_api_version,
+    has_admin_api_credentials,
+)
 from shopify_integration.utils.shopify_graphql import (
     ShopifyUserError,
     check_user_errors,
@@ -342,6 +368,23 @@ _PARENT_KINDS = ("SALE", "CAPTURE")
 # mid-request) and becomes eligible again.  Mirrors fulfillment.py.
 STALE_CLAIM_MINUTES = 30
 
+# The namespace the refund idempotency keys are minted in.  A literal, because
+# it is half of a contract with Shopify's 24-hour dedup window: change it and a
+# retry stops being recognised as the same refund, which is the only thing the
+# key is for.  Derived once, and re-derivable:
+#
+#   uuid.uuid5(uuid.NAMESPACE_URL,
+#              "https://electrobotic.in/shopify_integration/refund-writeback")
+IDEMPOTENCY_NAMESPACE = uuid.UUID("0835780c-f9d9-506e-90c6-b238f4310799")
+
+# The Admin API version at which `@idempotent` stops being optional on
+# refundCreate.  Shopify's changelog, 12 December 2025: seventeen mutations,
+# refundCreate among them, error at RUNTIME without the directive from 2026-04 —
+# and it is not marked required in the schema, so nothing fails earlier and
+# nothing warns.  tests/test_refund.py fails if DEFAULT_API_VERSION reaches this
+# while build_refund_mutation() is still sending no key.
+IDEMPOTENCY_REQUIRED_FROM = "2026-04"
+
 _NOT_MIGRATED_REASON = (
     f"{REFUND_REQUEST} is missing the Shopify write-back fields. "
     f"Run `bench --site <site> migrate`."
@@ -350,12 +393,23 @@ _NOT_MIGRATED_REASON = (
 
 # ── GraphQL documents ─────────────────────────────────────────────────────────
 
-_REFUND_TARGETS_QUERY = """
+# `first: 100` rather than 20, and the figure is load-bearing since headroom
+# started being derived.  `order.transactions` is a plain list and `first:`
+# simply truncates it (Shopify's own word), so a truncated read used to cost
+# only parents we could not have used; now it can hide a REFUND row, and money
+# already given back that we cannot see reads as headroom we still have.  100 is
+# far past anything these orders carry and still one cheap read.
+#
+# The transactions on their own — no suggestion, nothing this store's API
+# version could reject.  It is the fallback for a document Shopify refuses to
+# accept, and it is deliberately the exact query that ran before 2026-09-09, so
+# the worst case of adding the suggestion block is the behaviour we already had.
+_REFUND_TARGETS_NARROW_QUERY = """
 query RefundTargets($orderId: ID!) {
   order(id: $orderId) {
     id
     name
-    transactions(first: 20) {
+    transactions(first: 100) {
       id
       kind
       status
@@ -364,6 +418,55 @@ query RefundTargets($orderId: ID!) {
       amountSet { presentmentMoney { amount currencyCode } }
       maximumRefundableV2 { amount currencyCode }
       parentTransaction { id }
+    }
+  }
+}
+"""
+
+# The same read, plus the only place Shopify actually reports headroom.
+#
+# `maximumRefundableV2` is kept on the transaction because it is in the schema
+# and costs nothing — but it is null there, always, and that is the whole defect
+# this document exists to fix.  Shopify's own words for it, 2026-01 included:
+# "Specifies the available amount with currency to refund on the gateway. This
+# value is only available for transactions of type `SuggestedRefund`."  Read off
+# order.transactions it never arrives, `_paise(None)` is 0, and so every parent
+# on every order on every store scored zero and presented as already fully
+# refunded.  Production proved it twice on 2026-09-09: EB3494, which the Shopify
+# admin offers ₹5.00 on, and EB3484, which is genuinely settled, reported the
+# same nothing.
+#
+# The figure lives on SuggestedOrderTransaction instead, under a different name
+# and a different type — `maximumRefundableSet`, a MoneyBag, NOT
+# `maximumRefundableV2`.  `suggestFullRefund: true` is what makes Shopify
+# compute the suggestion without being told which line items to refund; the
+# headroom it reports is a property of the gateway transaction, not of the
+# suggested amount.
+_REFUND_TARGETS_QUERY = """
+query RefundTargets($orderId: ID!) {
+  order(id: $orderId) {
+    id
+    name
+    transactions(first: 100) {
+      id
+      kind
+      status
+      gateway
+      formattedGateway
+      amountSet { presentmentMoney { amount currencyCode } }
+      maximumRefundableV2 { amount currencyCode }
+      parentTransaction { id }
+    }
+    suggestedRefund(suggestFullRefund: true) {
+      maximumRefundableSet { presentmentMoney { amount currencyCode } }
+      suggestedTransactions {
+        kind
+        gateway
+        formattedGateway
+        amountSet { presentmentMoney { amount currencyCode } }
+        maximumRefundableSet { presentmentMoney { amount currencyCode } }
+        parentTransaction { id }
+      }
     }
   }
 }
@@ -438,9 +541,207 @@ def transaction_nodes(container) -> list:
     return [row for row in rows if isinstance(row, dict)]
 
 
+def _reported_amount(money):
+    """A Shopify money field in minor units, or **None** when it sent no figure.
+
+    None and 0 are different answers and the whole 2026-09-09 diagnosis turned
+    on the difference, so this never collapses them — `_paise` does that, and it
+    is the right thing everywhere the number is going to be spent rather than
+    reasoned about.
+
+    Accepts both shapes so one reader serves the whole module: MoneyV2
+    (`{"amount": "5.00"}`, what `maximumRefundableV2` is) and MoneyBag
+    (`{"presentmentMoney": {"amount": "5.00"}}`, what `amountSet` and
+    `maximumRefundableSet` are).  Presentment currency is preferred because that
+    is the currency the customer paid in and the one every other figure here is
+    quoted in.
+    """
+    if not isinstance(money, dict):
+        return None
+    if "presentmentMoney" in money or "shopMoney" in money:
+        money = money.get("presentmentMoney") or money.get("shopMoney") or {}
+        if not isinstance(money, dict):
+            return None
+    amount = money.get("amount")
+    if amount is None or str(amount).strip() == "":
+        return None
+    return _paise(amount)
+
+
+# ── How much is left to refund, and who says so ──────────────────────────────
+#
+# Three answers, none of them guaranteed, and the lowest reported one wins.
+#
+# That ordering is not timidity, it is where the two errors land.  Over-report
+# and Shopify refuses the refundCreate itself for exceeding the refundable
+# amount — `rejected_by_shopify`, `failed_unsent`, nobody paid.  Under-report and
+# the refund is refused here, which costs a person a look and no money.  Neither
+# is a double payout, and the second is cheaper, so the smallest figure any
+# source will vouch for is the one we spend.
+HEADROOM_FROM_SUGGESTION  = "suggested_refund"  # order.suggestedRefund — Shopify's own
+HEADROOM_FROM_TRANSACTION = "transaction"       # maximumRefundableV2 — null in practice
+HEADROOM_DERIVED          = "derived"           # this app's arithmetic
+HEADROOM_NONE             = "none"              # nothing to go on; treated as zero
+
+# Priority breaks a tie between sources reporting the same figure, so the label
+# names the most authoritative one that agrees.
+_HEADROOM_PRIORITY = {
+    HEADROOM_FROM_SUGGESTION: 0,
+    HEADROOM_FROM_TRANSACTION: 1,
+    HEADROOM_DERIVED: 2,
+}
+
+# Annotation keys written onto a copy of each transaction node by with_headroom.
+# Underscored so they cannot collide with a Shopify field, and read through
+# _headroom/_headroom_source so nothing downstream has to know they exist.
+_HEADROOM_KEY = "_refundable_paise"
+_HEADROOM_SOURCE_KEY = "_refundable_source"
+
+# Kinds that hand money back, and so reduce what a parent still has to give.
+# VOID is in here for the same reason it is not a parent kind: whatever it was
+# attached to, it returned money rather than taking it.
+_RETURNED_KINDS = ("REFUND", "VOID")
+
+
+def suggested_headroom(suggested) -> dict:
+    """`{parent transaction gid: paise}` from `order.suggestedRefund`.
+
+    Shopify's own figure — the one the admin prints under the manual refund box
+    as "₹5.00 available for refund" — and the only place the API reports it.
+    Keyed by `parentTransaction.id` because that is what a suggested transaction
+    and a real one have in common; position in the list means nothing.
+    """
+    rows = transaction_nodes((suggested or {}).get("suggestedTransactions"))
+    out = {}
+    for row in rows:
+        parent = str(((row.get("parentTransaction") or {}).get("id")) or "")
+        if not parent:
+            continue
+        amount = _reported_amount(row.get("maximumRefundableSet"))
+        if amount is None:
+            continue
+        # Two suggestions against one parent: keep the smaller, per the rule
+        # above.  Not expected; cheap to be right about.
+        out[parent] = amount if parent not in out else min(out[parent], amount)
+    return out
+
+
+def derived_headroom(nodes) -> dict:
+    """`{parent transaction gid: paise}` worked out from the rows themselves.
+
+    What Shopify charged on a parent, less everything given back against it.
+    Needs no field the API might not populate, which is precisely why it is
+    here: it is the answer that cannot fail the way `maximumRefundableV2` did.
+
+    A REFUND or VOID whose parent is not one of ours is still money the customer
+    has back, so it is not discarded — it comes off the largest parents in turn.
+    Dropping it would be the one arithmetic error that could invite a second
+    payout, which is the error this module exists to prevent.
+    """
+    remaining = {}
+    for node in transaction_nodes(nodes):
+        if (node.get("kind") or "").upper() not in _PARENT_KINDS:
+            continue
+        if (node.get("status") or "").upper() != "SUCCESS":
+            continue
+        txn_id = str(node.get("id") or "")
+        charged = _reported_amount(node.get("amountSet"))
+        # No id is no parent — refundCreate needs one — and no figure is no
+        # figure: neither becomes a derived zero, which would read as "settled".
+        if not txn_id or charged is None:
+            continue
+        remaining[txn_id] = charged
+
+    if not remaining:
+        return {}
+
+    unattributed = 0
+    for node in transaction_nodes(nodes):
+        if (node.get("kind") or "").upper() not in _RETURNED_KINDS:
+            continue
+        if (node.get("status") or "").upper() != "SUCCESS":
+            continue
+        given_back = _reported_amount(node.get("amountSet")) or 0
+        parent = str(((node.get("parentTransaction") or {}).get("id")) or "")
+        if parent in remaining:
+            remaining[parent] -= given_back
+        else:
+            unattributed += given_back
+
+    for txn_id in sorted(remaining, key=lambda key: remaining[key], reverse=True):
+        if unattributed <= 0:
+            break
+        take = min(unattributed, max(remaining[txn_id], 0))
+        remaining[txn_id] -= take
+        unattributed -= take
+
+    return {txn_id: max(value, 0) for txn_id, value in remaining.items()}
+
+
+def with_headroom(order) -> list:
+    """The order's transaction nodes, each carrying how much it can still take.
+
+    Copies rather than annotating in place: the response is evidence — it goes
+    into the Shopify Log payload and out through the diagnostic — and it has to
+    keep reading as what Shopify said, not as what this app worked out.
+
+    Everything downstream (`rejection_reason`, `refundable_parents`,
+    `plan_refund`, `transaction_summary`) then works off one number without
+    caring where it came from, and `transaction_summary` reports the source so a
+    person can see.
+    """
+    nodes = transaction_nodes((order or {}).get("transactions"))
+    suggested = suggested_headroom((order or {}).get("suggestedRefund"))
+    derived = derived_headroom(nodes)
+
+    annotated = []
+    for node in nodes:
+        txn_id = str(node.get("id") or "")
+        candidates = []
+
+        reported = _reported_amount(node.get("maximumRefundableV2"))
+        if reported is not None:
+            candidates.append((reported, HEADROOM_FROM_TRANSACTION))
+        if txn_id in suggested:
+            candidates.append((suggested[txn_id], HEADROOM_FROM_SUGGESTION))
+        if txn_id in derived:
+            candidates.append((derived[txn_id], HEADROOM_DERIVED))
+
+        if candidates:
+            value, source = min(
+                candidates, key=lambda pair: (pair[0], _HEADROOM_PRIORITY[pair[1]])
+            )
+        else:
+            value, source = 0, HEADROOM_NONE
+
+        annotated.append({**node, _HEADROOM_KEY: value, _HEADROOM_SOURCE_KEY: source})
+
+    return annotated
+
+
 def _headroom(node) -> int:
-    """maximumRefundableV2 in minor units — how much this parent has left."""
+    """How much this parent has left, in minor units.
+
+    The annotation from `with_headroom` when there is one, and the raw
+    `maximumRefundableV2` otherwise — so the pure functions stay callable on a
+    bare Shopify node, which is how most of the tests reach them.
+    """
+    if _HEADROOM_KEY in node:
+        return cint(node.get(_HEADROOM_KEY))
     return _paise(((node.get("maximumRefundableV2") or {}).get("amount")))
+
+
+def _headroom_source(node) -> str:
+    """Which of the three sources the figure came from, for the log and the
+    diagnostic."""
+    source = node.get(_HEADROOM_SOURCE_KEY)
+    if source:
+        return str(source)
+    return (
+        HEADROOM_FROM_TRANSACTION
+        if _reported_amount(node.get("maximumRefundableV2")) is not None
+        else HEADROOM_NONE
+    )
 
 
 def rejection_reason(node) -> str:
@@ -465,26 +766,27 @@ def rejection_reason(node) -> str:
 
 
 def _headroom_reported(node) -> bool:
-    """Did Shopify actually give us a maximumRefundableV2 amount?
+    """Is the figure on this row a figure at all, or a stand-in for silence?
 
-    `_headroom` cannot answer this: `_paise(None)` is 0, so a field Shopify did
-    not populate and one it reported as 0.00 are the same number by the time the
-    filter sees them — and they mean opposite things.  A reported zero is a fact
-    about the order (nothing left to refund).  An absent one is a fact about
-    *this app* (we are reading a field this API version does not fill for this
-    transaction), and in that case no order is ever refundable anywhere, which
-    presents as every order being fully refunded.
+    `_headroom` cannot answer it: `_paise(None)` is 0, so a source that said
+    nothing and one that said 0.00 are the same number by the time the filter
+    sees them — and they mean opposite things.  A known zero is a fact about the
+    order (nothing left to refund).  Nothing known is a fact about *this app*,
+    and when it is true of every row it means no order is refundable anywhere,
+    which presents as every order being already fully refunded.  That is not a
+    hypothetical: it is exactly what shipped until 2026-09-09, because
+    `maximumRefundableV2` is null outside a SuggestedRefund.
 
-    Kept separate from `rejection_reason` on purpose: the filter must treat both
-    as no-headroom — refusing to refund on a number we do not have is the safe
-    direction — while a person reading the log has to be able to tell which it
-    was.
+    "Reported" now means *any* of the three sources produced a figure, including
+    this app's own arithmetic — `refundable_source` in `transaction_summary` is
+    what says which, and it is the field to read when a refusal needs
+    explaining.  The filter still treats an unknown as no-headroom, because
+    refusing on a number we do not have is the safe direction.
     """
-    money = node.get("maximumRefundableV2")
-    if not isinstance(money, dict):
-        return False
-    amount = money.get("amount")
-    return amount is not None and str(amount).strip() != ""
+    source = node.get(_HEADROOM_SOURCE_KEY)
+    if source:
+        return str(source) != HEADROOM_NONE
+    return _reported_amount(node.get("maximumRefundableV2")) is not None
 
 
 def transaction_summary(nodes) -> list:
@@ -513,6 +815,11 @@ def transaction_summary(nodes) -> list:
             ),
             "refundable": _money(_headroom(node)),
             "refundable_reported": _headroom_reported(node),
+            # Which of the three sources the figure came from.  A refusal on
+            # headroom is unreadable without it: `suggested_refund` and
+            # `derived` agreeing on 0.00 is a settled order, `none` on every row
+            # is this app failing to read the API.
+            "refundable_source": _headroom_source(node),
             "rejected_because": rejection_reason(node),
         }
         for node in transaction_nodes(nodes)
@@ -523,9 +830,11 @@ def refundable_parents(nodes) -> list:
     """
     Parent transactions a refund can attach to, best first.
 
-    Keeps kind in {"SALE", "CAPTURE"} with status "SUCCESS" and
-    maximumRefundableV2.amount > 0.  Everything else — REFUND rows, VOID,
-    FAILURE, AUTHORIZATION with nothing captured — is not a parent.
+    Keeps kind in {"SALE", "CAPTURE"} with status "SUCCESS" and headroom above
+    zero.  Everything else — REFUND rows, VOID, FAILURE, AUTHORIZATION with
+    nothing captured — is not a parent.  Headroom is whatever `_headroom` says:
+    the figure `with_headroom` resolved from up to three sources, or the raw
+    `maximumRefundableV2` on a node that never went through it.
 
     "Best first" is largest headroom first, so a refund is spread over as few
     transactions as possible.  Shopify's per-row cap is the authority on how
@@ -546,7 +855,7 @@ def refundable_parents(nodes) -> list:
 def plan_refund(nodes, amount) -> dict:
     """
     Allocate `amount` across refundable parents, capped per parent by its
-    maximumRefundableV2.
+    headroom — see `with_headroom` for where that figure comes from.
 
     :return: {"transactions": [{"parentId", "kind", "gateway", "amount"}],
               "gateways": [gateway names actually allocated, in order],
@@ -574,7 +883,7 @@ def plan_refund(nodes, amount) -> dict:
     """
     def empty(problem, problem_code):
         return {"transactions": [], "gateways": [], "allocated": 0.0,
-                "problem": problem, "problem_code": problem_code}
+                "currency": "", "problem": problem, "problem_code": problem_code}
 
     wanted = _paise(amount)
     parents = refundable_parents(nodes)
@@ -628,12 +937,29 @@ def plan_refund(nodes, amount) -> dict:
     gateways = []
     remaining = wanted
 
+    # The currency every allocated figure is quoted in.  Read off the parents
+    # rather than assumed, because `OrderTransactionInput.amount` is a bare
+    # `Money` scalar with no currency of its own: `RefundInput.currency` is the
+    # only thing that says what these numbers mean, and it must be the
+    # PRESENTMENT currency — which is exactly where `_reported_amount` reads
+    # them from.  Omitted where the order does not report one; Shopify then
+    # applies the order's own, which is what happened to every refund before
+    # 2026-09-09 and is right only while the two currencies agree.
+    #
+    # One order, one presentment currency, so the first parent settles it.
+    currency = ""
+
     for parent in parents:
         if remaining <= 0:
             break
         take = min(remaining, _headroom(parent))
         if take <= 0:
             continue
+
+        if not currency:
+            currency = str((((parent.get("amountSet") or {})
+                             .get("presentmentMoney") or {})
+                            .get("currencyCode") or "")).strip().upper()
 
         gateway = str(parent.get("gateway") or "").strip()
         transactions.append({
@@ -650,6 +976,7 @@ def plan_refund(nodes, amount) -> dict:
         "transactions": transactions,
         "gateways": gateways,
         "allocated": flt(_money(wanted - remaining)),
+        "currency": currency,
         "problem": None,
         "problem_code": "",
     }
@@ -681,6 +1008,13 @@ def build_refund_input(order_gid, plan, note, notify=False, fallback_note="") ->
         ],
     }
 
+    # `currency` is what the amounts are denominated in — see plan_refund.
+    # Sent only when the order reported one: RefundInput.currency is optional,
+    # and inventing a code is worse than letting Shopify apply the order's own.
+    currency = str(plan.get("currency") or "").strip().upper()
+    if currency:
+        payload["currency"] = currency
+
     resolved_note = str(note or "").strip() or str(fallback_note or "").strip()
     if resolved_note:
         payload["note"] = resolved_note
@@ -688,15 +1022,89 @@ def build_refund_input(order_gid, plan, note, notify=False, fallback_note="") ->
     return {"input": payload}
 
 
+def idempotency_key(refund_name: str, payload) -> str:
+    """The `@idempotent` key for one posting of one refund.
+
+    A UUIDv5 — deterministic, so the same refund re-posted is the same key,
+    which is the whole point of the 24-hour dedup window; and a UUID because
+    that is what Shopify asks for ("we strongly recommend using UUIDs").
+
+    Over the **whole input**, not the Refund Request name and amount.  Shopify
+    refuses a key reused with different parameters
+    (`IDEMPOTENCY_KEY_PARAMETER_MISMATCH`), so a narrower key would break the
+    moment somebody edited the reason note between two attempts — a document
+    that is materially the same refund but not the same request.  Hashing the
+    input instead means any change at all mints a new key, and no change mints
+    the old one.
+
+    `sort_keys` because a dict's order is not part of the refund: a key that
+    moved when two fields swapped places would make every retry a new refund.
+    """
+    canonical = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), default=str
+    )
+    return str(uuid.uuid5(IDEMPOTENCY_NAMESPACE, f"{refund_name}|{canonical}"))
+
+
+def idempotency_required(settings) -> bool:
+    """Does this store's API version require the `@idempotent` directive?
+
+    True from `IDEMPOTENCY_REQUIRED_FROM` onwards, and the comparison is a plain
+    string one because Shopify's versions are `YYYY-MM` — which sorts correctly
+    as text, and puts `unstable` (letters, above digits) on the right side of
+    it too.
+
+    The gate exists because the two failure modes are not symmetrical.  Below
+    2026-04 the directive is optional, and adding an unproven one to a live
+    payout risks a query-level error on the money post — which is not a clean
+    refusal but an `Unverified` row for a person to clear.  At 2026-04 and
+    above, *omitting* it is the runtime error, in the same place.  So the
+    version decides, nobody has to remember, and bumping a store's
+    `api_version` is the switch.
+    """
+    return get_api_version(settings) >= IDEMPOTENCY_REQUIRED_FROM
+
+
 def build_refund_mutation(key: str = "") -> str:
     """
     The refundCreate document, with the @idempotent directive only when asked.
 
-    refundCreate accepts `@idempotent(key: "…")`, but that could not be
-    confirmed against the configured API version, and an unknown directive is a
-    query-level error — which execute() raises on, so it would fail *every*
-    write-back rather than degrade.  It is therefore off unless a caller passes
-    a key.  Turn it on once a live response has confirmed it.
+    refundCreate accepts `@idempotent(key: "…")`.  Confirmed against the 2026-01
+    Admin GraphQL reference on 2026-09-09 — the mutation's own documented
+    example carries the directive — so the original reason for leaving it off
+    (unverified against this API version, and an unknown directive is a
+    query-level error that would fail *every* write-back rather than degrade) no
+    longer applies.  It is still off unless a caller passes a key, but that is
+    now a decision with a date on it rather than a caution.
+
+    **From API version 2026-04 the key is MANDATORY.**  Shopify's changelog of
+    12 December 2025 makes refundCreate one of seventeen mutations that error at
+    runtime when the directive is absent — and it does not appear as required in
+    the schema, so nothing catches it before the post.  `DEFAULT_API_VERSION` is
+    2026-01 and nothing fails today; the write-back breaks the moment anyone
+    bumps that string, and it breaks in the worst place there is.  A runtime
+    error on the money post is not a clean refusal: `proves_not_executed` is
+    false for it, so it lands on Unverified and needs a person to open the order
+    in Shopify before anything can move.
+
+    What the key has to be, from the same docs: keys are deduplicated for 24
+    hours; a repeat carrying the same key and the same parameters returns the
+    first response instead of refunding again; a repeat with the same key and
+    DIFFERENT parameters is refused as `IDEMPOTENCY_KEY_PARAMETER_MISMATCH`, and
+    a concurrent one as `IDEMPOTENCY_CONCURRENT_REQUEST`.  So the key must cover
+    the whole input and not merely the Refund Request name and
+    `net_refund_amount` — somebody who edits the reason note between two
+    attempts would otherwise hit the mismatch on a document that is materially
+    the same refund.  A UUIDv5 over the canonical input is the shape Shopify
+    recommends ("we strongly recommend using UUIDs"), and it is deterministic,
+    so the same refund retried is the same key.
+
+    Switching it on is worth more than compliance.  The 24-hour dedup is exactly
+    the guarantee `idempotent=False` is standing in for below: with a key, a post
+    whose answer is lost can be re-asked and will return the ORIGINAL refund
+    rather than pay a second time — which is the one hole the Unverified state
+    exists to cover.  That is a CONTRACT_VERSION-level change to the retry rules
+    and belongs to whoever owns the payout, not to this docstring.
 
     What carries idempotency instead is three things, and the third is the easy
     one to forget: the stored-GID guard, the worker claim, and — for the window
@@ -707,9 +1115,6 @@ def build_refund_mutation(key: str = "") -> str:
 
     No key is generated anywhere yet, deliberately — a helper that minted one
     while nothing sent it would read as though retries were already protected.
-    When this is switched on, the key should be the Refund Request name and the
-    amount in minor units (name plus net_refund_amount to two places), so it
-    changes whenever the refund does.
 
     Quotes are stripped from the key rather than escaped: a key is ours to
     generate, so a quote in one is a bug, and silently breaking out of the
@@ -1226,6 +1631,70 @@ def _log(settings, refund_name, shopify_order_id, status, message, payload=None)
         )
 
 
+def _refuses_the_document(exc) -> bool:
+    """Did Shopify reject the *document*, as opposed to failing to run it?
+
+    A document rejection is a schema or validation answer — the store's API
+    version does not have the field, the argument is not accepted — and it
+    arrives as a query-level failure with a status code.  Retrying it unchanged
+    is pointless; retrying it *without the part that can be rejected* is the
+    whole point.
+
+    Everything else says nothing about the document and must not be re-asked:
+    a throttle (asking again immediately is the one thing that makes it worse),
+    an auth refusal, a 5xx, and a transport failure with no status at all.
+    """
+    if getattr(exc, "status_code", None) not in (200, 400):
+        return False
+    return "THROTTLED" not in list(getattr(exc, "error_codes", None) or [])
+
+
+def read_refund_targets(settings, order_gid):
+    """The order, its transactions, and Shopify's suggested refund if it offers
+    one.  Read-only; posts no mutation on any path.
+
+    :return: `(order, suggestion_available)` — the order dict as Shopify
+             returned it, and whether the suggestion block came back with
+             anything in it.
+    :raises ShopifyAPIError: propagated, so every caller keeps reporting a read
+             failure exactly as it did before.
+
+    The fallback exists because of the shape of the risk here.  Adding
+    `suggestedRefund` to a working document means a store that rejects it loses
+    the transactions as well — a wrong field name fails the *whole* query — and
+    a payout that cannot read the order at all is worse than one reading a
+    number it works out itself.  So a rejected document is re-asked once,
+    narrowed to the part that was already known to work, and the refund goes
+    ahead on derived headroom.  `suggestion_available` is how the diagnostic
+    says that happened.
+    """
+    variables = {"orderId": order_gid}
+    try:
+        data = execute(settings, _REFUND_TARGETS_QUERY, variables,
+                       operation="RefundTargets")
+    except ShopifyAPIError as exc:
+        if not _refuses_the_document(exc):
+            raise
+        # Not silent: a store that cannot answer the suggestion is a store where
+        # every refund is running on this app's arithmetic, and somebody should
+        # know that before they wonder why the figures differ from the admin.
+        frappe.log_error(
+            f"Shopify rejected the RefundTargets document with its suggestedRefund "
+            f"block ({exc}). Re-reading the order without it; refundable headroom "
+            f"will be derived from the transactions instead.",
+            "Shopify: Refund Headroom Degraded",
+        )
+        data = execute(settings, _REFUND_TARGETS_NARROW_QUERY, variables,
+                       operation="RefundTargets")
+        return (data or {}).get("order"), False
+
+    order = (data or {}).get("order")
+    available = bool(
+        ((order or {}).get("suggestedRefund") or {}).get("suggestedTransactions")
+    )
+    return order, available
+
+
 def write_back_refund(refund_name: str, triggered_by: str = "manual") -> dict:
     """
     Tell Shopify about one booked ERPNext refund.
@@ -1376,14 +1845,8 @@ def write_back_refund(refund_name: str, triggered_by: str = "manual") -> dict:
     try:
         order_gid = gid("Order", shopify_order_id)
 
-        data = execute(
-            settings,
-            _REFUND_TARGETS_QUERY,
-            {"orderId": order_gid},
-            operation="RefundTargets",
-        )
+        order, _suggestion_available = read_refund_targets(settings, order_gid)
 
-        order = (data or {}).get("order")
         if not order:
             return fail_unsent(
                 f"Shopify order {shopify_order_id} not found — it may have been "
@@ -1391,9 +1854,14 @@ def write_back_refund(refund_name: str, triggered_by: str = "manual") -> dict:
                 "shopify_order_not_found",
             )
 
-        plan = plan_refund(order.get("transactions"), amount)
+        # Headroom is resolved once, here, and every decision below reads that
+        # one list — the filter, the allocation, and the evidence in the log
+        # cannot disagree about how much was refundable.
+        nodes = with_headroom(order)
+
+        plan = plan_refund(nodes, amount)
         if plan["problem"]:
-            seen = transaction_summary(order.get("transactions"))
+            seen = transaction_summary(nodes)
             # check_eligibility has already refused amount <= 0, so only the two
             # headroom codes can reach here and both belong to failed_unsent.
             # Pinned rather than assumed: a code from the wrong outcome would
@@ -1449,12 +1917,21 @@ def write_back_refund(refund_name: str, triggered_by: str = "manual") -> dict:
         #
         # idempotent=False is the line that gives it, and it is the only thing
         # that makes every post-send "nothing was sent" claim below provable.
-        # build_refund_mutation() is called with no key, so the @idempotent
-        # directive is absent and Shopify cannot recognise a second POST of
-        # this document as the same refund: attempt 1 creates a real partial
-        # refund, its answer dies in the socket timeout, the order still holds
-        # the headroom a partial refund leaves, and attempt 2 pays the customer
-        # a SECOND time through the Cashfree-OCC bridge.
+        # Below API version 2026-04 there is no @idempotent key on this
+        # document, so Shopify cannot recognise a second POST of it as the same
+        # refund: attempt 1 creates a real partial refund, its answer dies in
+        # the socket timeout, the order still holds the headroom a partial
+        # refund leaves, and attempt 2 pays the customer a SECOND time through
+        # the Cashfree-OCC bridge.
+        #
+        # At 2026-04 and above a key IS sent — Shopify requires one — and it
+        # would make a re-post of this exact document safe: keys are
+        # deduplicated for 24 hours and a repeat carrying the same key and the
+        # same parameters returns the FIRST response instead of refunding
+        # again.  idempotent=False stays anyway.  Trading it for Shopify's
+        # guarantee is a CONTRACT_VERSION decision about what every verdict at
+        # the foot of this function means, and it must be taken deliberately by
+        # whoever owns the payout — not inherited from a version bump.
         #
         # So it does not mean "one attempt".  execute() still retries the one
         # failure Shopify itself certifies as a pre-execution refusal — a
@@ -1489,7 +1966,10 @@ def write_back_refund(refund_name: str, triggered_by: str = "manual") -> dict:
         sent = True
         data = execute(
             settings,
-            build_refund_mutation(),
+            build_refund_mutation(
+                idempotency_key(refund_name, payload)
+                if idempotency_required(settings) else ""
+            ),
             payload,
             operation="refundCreate",
             idempotent=False,
@@ -1949,15 +2429,29 @@ def refund_targets_now(refund_name: str) -> dict:
     Settings write instead — the same permission `backfill_now` uses, for the
     same reason: it reveals store data and spends an Admin API call.
 
+    It answered its own question on 2026-09-09, which is what
+    `refundable_source` on each row is now for: every row on two different
+    production orders came back `not reported`, one of them an order the Shopify
+    admin was offering ₹5.00 on. Same answer for an order with headroom and an
+    order without — `maximumRefundableV2` is null outside a SuggestedRefund. See
+    tests/test_refund_headroom.py.
+
     :return: {"ok", "reason_code", "message", "amount", "refundable_total",
               "transactions": [...], "would_refuse_with", "shopify_order_id",
-              "shopify_order_name", "shopify_store"}
+              "shopify_order_name", "shopify_store", "suggestion_available"}
     """
     frappe.has_permission("Shopify Settings", "write", throw=True)
 
     out = {"ok": False, "reason_code": "", "message": "", "amount": 0.0,
            "refundable_total": 0.0, "transactions": [], "would_refuse_with": "",
-           "shopify_order_id": "", "shopify_order_name": "", "shopify_store": ""}
+           "shopify_order_id": "", "shopify_order_name": "", "shopify_store": "",
+           # False also when the read never happened, which is the honest
+           # answer: nothing has been asked, so nothing was offered.
+           "suggestion_available": False,
+           # Shopify's figure for the whole order — what the admin prints as
+           # "available for refund".  None when it said nothing.  Reported and
+           # never spent: see where it is set.
+           "order_refundable_total": None}
 
     if not _has_writeback_fields():
         out["reason_code"] = "not_installed"
@@ -2009,18 +2503,14 @@ def refund_targets_now(refund_name: str) -> dict:
         return out
 
     try:
-        data = execute(
-            settings,
-            _REFUND_TARGETS_QUERY,
-            {"orderId": gid("Order", out["shopify_order_id"])},
-            operation="RefundTargets",
+        order, out["suggestion_available"] = read_refund_targets(
+            settings, gid("Order", out["shopify_order_id"])
         )
     except Exception as exc:  # noqa: BLE001 — reported, never raised
         out["reason_code"] = "query_failed"
         out["message"] = f"Could not read the order from Shopify: {exc}"
         return out
 
-    order = (data or {}).get("order")
     if not order:
         out["reason_code"] = "shopify_order_not_found"
         out["message"] = (
@@ -2029,8 +2519,20 @@ def refund_targets_now(refund_name: str) -> dict:
         )
         return out
 
-    nodes = order.get("transactions")
+    nodes = with_headroom(order)
     out["shopify_order_name"] = str(order.get("name") or "")
+
+    # Shopify's own order-level figure, reported beside ours rather than used as
+    # a cap.  It is the number to look at first when the two disagree.  Not a
+    # cap because it is computed for the *suggestion* — with no refundable line
+    # items left it can be zero on an order whose gateway transaction still has
+    # money in it, and capping by it would refuse a refund Shopify would accept.
+    order_level = _reported_amount(
+        (order.get("suggestedRefund") or {}).get("maximumRefundableSet")
+    )
+    out["order_refundable_total"] = (
+        None if order_level is None else flt(_money(order_level))
+    )
     out["transactions"] = transaction_summary(nodes)
     # A number, not a formatted string: this is read by a caller and by the
     # form, and `_money` returns text for messages.

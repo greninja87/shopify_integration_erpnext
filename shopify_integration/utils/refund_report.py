@@ -1033,11 +1033,13 @@ query OrderRefunds($orderId: ID!) {
 def _refund_nodes(container) -> list:
     """`order.refunds` tolerated as list, nodes or edges.
 
-    `Order.refunds` takes `first:` and the docs show it returning a plain list,
-    while the same field elsewhere appears as a connection.  Neither shape could
-    be verified against a live response, and guessing wrong fails silently as an
-    empty list — which here would read as "this order has no refunds" and report
-    nothing at all.  Same reasoning as `refund.transaction_nodes`.
+    Settled 2026-09-09 against the 2026-01 schema: `Order.refunds` is a plain
+    list, `[Refund!]!`, taking `first:` to truncate it — the same shape as
+    `Order.transactions`, and unlike `Refund.transactions`, which really is an
+    `OrderTransactionConnection!`.  The tolerant reader stays anyway: guessing
+    wrong fails silently as an empty list, which here would read as "this order
+    has no refunds" and report nothing at all, and tolerating three shapes costs
+    nothing.  Same reasoning as `refund.transaction_nodes`.
     """
     return _transaction_nodes(container)
 

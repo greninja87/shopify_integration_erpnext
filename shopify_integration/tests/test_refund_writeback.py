@@ -85,9 +85,16 @@ def install_sales_order_lookup(testcase):
     return _get_all
 
 
-def targets_response(transactions=None, order=True):
+def targets_response(transactions=None, order=True, suggested=None,
+                     suggested_total=None):
     """A RefundTargets response.  order.transactions as a plain list, which is
-    the shape the docs show for that field."""
+    the shape the docs show for that field.
+
+    `suggested` is the `order.suggestedRefund.suggestedTransactions` list, which
+    is where Shopify actually reports refundable headroom — see
+    tests/test_refund_headroom.py.  None means Shopify offered no suggestion,
+    which is a normal answer and not an error.
+    """
     if not order:
         return {"order": None}
     if transactions is None:
@@ -101,7 +108,19 @@ def targets_response(transactions=None, order=True):
             "maximumRefundableV2": {"amount": "12999.00", "currencyCode": "INR"},
             "parentTransaction": None,
         }]
-    return {"order": {"id": ORDER_GID, "name": "#6518", "transactions": transactions}}
+    return {"order": {
+        "id": ORDER_GID,
+        "name": "#6518",
+        "transactions": transactions,
+        "suggestedRefund": ({
+            "suggestedTransactions": suggested,
+            "maximumRefundableSet": (
+                {"presentmentMoney": {"amount": suggested_total,
+                                      "currencyCode": "INR"}}
+                if suggested_total is not None else None
+            ),
+        } if suggested is not None else None),
+    }}
 
 
 def refund_created(gid=REFUND_GID, gateways=("manual",), user_errors=None, refund=True):
@@ -1140,9 +1159,11 @@ class TestWhatProvesNonExecution(unittest.TestCase):
 class TestPostedAtMostOnce(WritebackTestCase):
     """The delivery guarantee every post-send claim in this module rests on.
 
-    `build_refund_mutation()` is called with no key, so the `@idempotent`
-    directive is absent and Shopify cannot recognise a second POST of the same
-    document as the same refund.  `idempotent=False` is what makes the mutation
+    Below API version 2026-04 the document carries no `@idempotent` key — the
+    directive is optional there and is sent only from the version that requires
+    it (tests/test_refund_idempotency.py) — so Shopify cannot recognise a second
+    POST of the same document as the same refund.  `idempotent=False` is what
+    makes the mutation
     posted at most once in any way that could have executed, and it is what
     makes the classification below sound rather than hopeful: a `userErrors`
     answer, a 401 or an exhausted 429 now describe the ONLY request that could

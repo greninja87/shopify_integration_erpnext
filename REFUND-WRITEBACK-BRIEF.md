@@ -170,6 +170,7 @@ to a shared helper.
 | `input.note` | **`reason_note`** | this is the **refund reason**. Fall back to `f"Refund {name}"` when blank. |
 | `input.notify` | — | **`False`** by default. Put it behind a Shopify Settings toggle; ERPNext already emails, and two refund emails to one customer is a support ticket. |
 | `refundLineItems` | — | **omit in v1.** See §8. |
+| `input.currency` | — | **added 2026-09-09.** `OrderTransactionInput.amount` is a bare `Money` scalar carrying no currency, and every figure here is read from `presentmentMoney`, so the presentment currency has to be named or Shopify applies the order's own. Identical on a single-currency store; wrong the moment one is not. Taken from the allocated parent's `amountSet.presentmentMoney.currencyCode`, and omitted when the order reports none. |
 
 **On the refund reason — do not go looking for a `reason` field.** There is no
 separate one. `RefundInput.note` *is* the reason: the docs describe `refundCreate`
@@ -196,9 +197,16 @@ On `#6601` (notdrones, unfulfilled, ₹27,000 refundable) it shows:
 
 Two things worth taking from that last line. The per-row label is the parent
 transaction's gateway — `Manual` again, on a fourth notdrones order — and
-"available for refund" is `maximumRefundableV2` on that transaction, which is
-exactly the per-parent cap `plan_refund` allocates against. The dialog is doing
-what §5 describes; we are reproducing it through the API.
+"available for refund" is the per-parent cap `plan_refund` allocates against.
+The dialog is doing what §5 describes; we are reproducing it through the API.
+
+> **Correction, 2026-09-09.** This paragraph named that cap
+> `maximumRefundableV2` *on the transaction*, and the query below asked for it
+> there. It is null there — Shopify populates it only inside a
+> `SuggestedRefund` — so every parent scored zero headroom and no refund could
+> pass the gate. The admin's "available for refund" figure comes from
+> `order.suggestedRefund.suggestedTransactions[].maximumRefundableSet`. See §4
+> below and `tests/test_refund_headroom.py`.
 
 ## 4. The GraphQL
 
@@ -224,6 +232,32 @@ query RefundTargets($orderId: ID!) {
   }
 }
 ```
+
+> **Superseded 2026-09-09.** The document above is still the fallback (
+> `_REFUND_TARGETS_NARROW_QUERY`), but it cannot answer "how much is left":
+> `maximumRefundableV2` on an `OrderTransaction` is documented, 2026-01
+> included, as *"only available for transactions of type `SuggestedRefund`"* —
+> null on every row of every order here. The live document adds:
+>
+> ```graphql
+>     suggestedRefund(suggestFullRefund: true) {
+>       maximumRefundableSet { presentmentMoney { amount currencyCode } }
+>       suggestedTransactions {
+>         kind gateway formattedGateway
+>         amountSet { presentmentMoney { amount currencyCode } }
+>         maximumRefundableSet { presentmentMoney { amount currencyCode } }
+>         parentTransaction { id }
+>       }
+>     }
+> ```
+>
+> Note the different name and type — `maximumRefundableSet`, a MoneyBag on
+> `SuggestedOrderTransaction`. Matching is by `parentTransaction.id`. Where
+> Shopify offers no suggestion, headroom is derived from the transactions
+> themselves (`amountSet` less every SUCCESS `REFUND`/`VOID` against the
+> parent), and the lowest reported figure wins. A store that rejects the
+> suggestion block falls back to the narrow document rather than failing the
+> read.
 
 **Watch the shape asymmetry:** `order.transactions` takes `first:` but returns a
 plain list (no `edges`/`node`), while `refund.transactions` on the mutation result
@@ -258,6 +292,7 @@ Input:
     "orderId": "gid://shopify/Order/7843650535529",
     "note": "<reason_note>",
     "notify": false,
+    "currency": "INR",
     "transactions": [
       {
         "orderId": "gid://shopify/Order/7843650535529",
