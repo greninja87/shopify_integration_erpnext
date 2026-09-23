@@ -321,7 +321,15 @@ def create_sales_invoice_from_so(so, settings, pe_name: str = None) -> str:
     # Always enable FIFO advance allocation so any Payment Entry
     # (whether created by our integration or manually) is automatically
     # linked to this Sales Invoice on submit.
+    #
+    # only_include_allocated_payments restricts set_advances() to advances
+    # already referencing this SO/party (include_unallocated=False) instead of
+    # sweeping every unallocated advance on the customer's account, oldest
+    # first, onto whichever invoice happens to be created next. Without it,
+    # a customer with more than one open order can have another order's
+    # Payment Entry silently allocated here.
     si.allocate_advances_automatically = 1
+    si.only_include_allocated_payments = 1
 
     # ── Permission workaround: account_perm_check on insert/submit (ERPNext v15) ──
     # Same limitation as the so_to_si() mapper call above: insert()/submit() run
@@ -416,7 +424,16 @@ def create_sales_invoice_from_dn(dn_name: str, settings) -> str:
 
     # Always enable FIFO advance allocation so any Payment Entry
     # linked to the Sales Order is automatically allocated to this SI.
+    #
+    # only_include_allocated_payments restricts set_advances() to advances
+    # already referencing this SO/party (include_unallocated=False) instead of
+    # sweeping every unallocated advance on the customer's account, oldest
+    # first, onto whichever invoice happens to be created next. Without it,
+    # a customer with more than one open order can have another order's
+    # Payment Entry silently allocated here — see the matching note in
+    # create_sales_invoice_from_so() above.
     si.allocate_advances_automatically = 1
+    si.only_include_allocated_payments = 1
 
     # Permission workaround: account_perm_check on insert/submit — see the
     # matching block in create_sales_invoice_from_so() above for the full
