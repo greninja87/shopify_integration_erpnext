@@ -34,11 +34,16 @@ frappe.ui.form.on('Delivery Note', {
                 shopify_fulfillment_indicator(frm, ful_info);
                 shopify_fulfillment_button(frm, ful_info);
 
-                if (ful_info.error) {
+                // Only a real Failed fulfillment needs the full-width headline
+                // banner. Partially Fulfilled is expected/informational (e.g. a
+                // line manually added in ERPNext that isn't on the Shopify
+                // order) and the indicator pill above already says so — a
+                // second, orange, raw-JSON banner just reads as an error.
+                if (ful_info.error && ful_info.status === 'Failed') {
                     messages.push({
                         text: '<b>' + __('Shopify Fulfillment') + ':</b> '
                               + frappe.utils.escape_html(ful_info.error),
-                        colour: ful_info.status === 'Failed' ? 'red' : 'orange',
+                        colour: 'red',
                     });
                 }
             }
