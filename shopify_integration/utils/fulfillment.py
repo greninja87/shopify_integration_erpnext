@@ -840,9 +840,19 @@ def fulfil_delivery_note(dn_name: str, settings=None, triggered_by: str = "manua
                 _release_claim(dn_name, STATUS_FULFILLED, msg)
                 return result(True, STATUS_FULFILLED, msg)
 
+            # Skip the email only under Manual timing: there, a person just
+            # clicked the button/bulk action and is looking straight at the
+            # Delivery Note, so the form banner (custom_shopify_fulfillment_error)
+            # is enough — this case is routinely expected, e.g. a Sales Order
+            # item swapped/edited in ERPNext after the Shopify order was placed,
+            # with the difference settled directly outside Shopify.
+            # Under Immediate/Scheduled nobody is watching this DN in particular,
+            # so it still needs the email to be noticed at all.
+            manual_timing = (settings.get("dn_fulfillment_timing") or "Manual") == "Manual"
             return fail(
                 "No open Shopify fulfillment order line matched this Delivery Note: "
-                + json.dumps(plan["unallocated"])[:500]
+                + json.dumps(plan["unallocated"])[:500],
+                alert=not manual_timing,
             )
 
         # ── Create the fulfillment ───────────────────────────────────────────
@@ -992,13 +1002,58 @@ def _warn_if_truncated(dn_name, shopify_order_id, fulfillment_orders, fo_nodes):
 def _alert(settings, dn_name: str, message: str):
     """Email the configured failure recipients.  Never raises."""
     try:
-        from shopify_integration.utils.sales_invoice import _send_si_failure_email
-
-        _send_si_failure_email(settings, "Delivery Note", dn_name, message)
+        _send_fulfillment_failure_email(settings, dn_name, message)
     except Exception:
         frappe.log_error(
             frappe.get_traceback(), f"Shopify: Fulfillment Alert Failed — {dn_name}"
         )
+
+
+def _send_fulfillment_failure_email(settings, dn_name: str, error_message: str) -> None:
+    """
+    Send a notification email when fulfilling a Delivery Note in Shopify fails.
+
+    This is a separate template from sales_invoice._send_si_failure_email on
+    purpose: the two pipelines (Shopify fulfillment sync vs. ERPNext Sales
+    Invoice creation) never call each other, so an email about one must never
+    claim it is about the other. A fulfillment failure does not mean the
+    Sales Invoice failed or was even attempted.
+    No-ops when failure_email_to is not configured in settings.
+    """
+    to_emails = (settings.get("failure_email_to") or "").strip()
+    if not to_emails:
+        return
+
+    shop = settings.get("shop_domain") or settings.get("name") or "Shopify"
+    cc_emails = (settings.get("failure_email_cc") or "").strip()
+    cc_list = [e.strip() for e in cc_emails.split(",") if e.strip()] if cc_emails else []
+    subject = f"[Shopify] Fulfillment Sync Failed — Delivery Note {dn_name} ({shop})"
+
+    message = f"""
+    <p>The Shopify Integration could not mark this Delivery Note as fulfilled in <b>Shopify</b>.</p>
+    <p>This does not affect Sales Invoice creation, which runs independently.</p>
+    <table border="0" cellpadding="4" style="font-family:Arial;font-size:13px;border-collapse:collapse;">
+      <tr><td style="padding:4px 12px 4px 0;"><b>Reference</b></td><td>Delivery Note: <b>{dn_name}</b></td></tr>
+      <tr><td style="padding:4px 12px 4px 0;"><b>Store</b></td><td>{shop}</td></tr>
+    </table>
+    <br>
+    <p><b>Failure reason:</b></p>
+    <pre style="background:#fef2f2;padding:10px;border-left:4px solid #ef4444;font-size:12px;white-space:pre-wrap;">{error_message[:2000]}</pre>
+    <p style="color:#6b7280;font-size:12px;">
+      See ERPNext &rarr; Error Log for the full traceback, or the Delivery Note's own
+      Shopify Fulfillment status for what was recorded.
+    </p>
+    """
+    try:
+        frappe.sendmail(
+            recipients=[e.strip() for e in to_emails.split(",") if e.strip()],
+            cc=cc_list,
+            subject=subject,
+            message=message,
+            delayed=False,
+        )
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), "Shopify: Fulfillment Failure Email Send Error")
 
 
 # ── Cancellation ──────────────────────────────────────────────────────────────
