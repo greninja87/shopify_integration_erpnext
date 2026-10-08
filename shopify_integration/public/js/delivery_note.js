@@ -168,13 +168,41 @@ function shopify_confirm_and_fulfil(frm, info) {
         ? '<p>' + __('Shopify will email the customer a shipping confirmation.') + '</p>'
         : '<p>' + __('Customer notification is off — no email will be sent.') + '</p>';
 
-    frappe.confirm(
-        '<p>' + __('Mark this order as fulfilled in Shopify?') + '</p>' + warning,
-        function() {
+    // The checkbox only matters once there has already been a mismatch to
+    // override, so it is only offered when the last attempt actually Failed
+    // on one — showing it unconditionally would invite ticking it pre-emptively
+    // on a DN that would otherwise match cleanly.
+    const show_force = info.status === 'Failed'
+        && (info.error || '').indexOf('no matching open fulfillment order line') !== -1;
+
+    const dialog = new frappe.ui.Dialog({
+        title: __('Fulfil in Shopify'),
+        fields: [
+            {
+                fieldtype: 'HTML',
+                fieldname: 'warning_html',
+                options: '<p>' + __('Mark this order as fulfilled in Shopify?') + '</p>' + warning,
+            },
+            {
+                fieldtype: 'Check',
+                fieldname: 'force',
+                label: __('Fulfil regardless of item code match'),
+                default: 0,
+                hidden: show_force ? 0 : 1,
+                description: __(
+                    'Ignores the SKU/line-item mismatch and allocates against whatever '
+                    + 'open quantity Shopify still shows on this order — use this when the '
+                    + 'item was swapped in ERPNext after the Shopify order was placed.'
+                ),
+            },
+        ],
+        primary_action_label: __('Fulfil'),
+        primary_action: function(values) {
+            dialog.hide();
             frappe.dom.freeze(__('Fulfilling in Shopify…'));
             frappe.xcall(
                 'shopify_integration.utils.fulfillment.fulfil_now',
-                { dn_name: frm.doc.name }
+                { dn_name: frm.doc.name, force: values.force ? 1 : 0 }
             ).then(function(result) {
                 frappe.dom.unfreeze();
                 if (result && result.ok) {
@@ -195,6 +223,7 @@ function shopify_confirm_and_fulfil(frm, info) {
             }).catch(function() {
                 frappe.dom.unfreeze();
             });
-        }
-    );
+        },
+    });
+    dialog.show();
 }

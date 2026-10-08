@@ -57,12 +57,14 @@ Go to **ERPNext → Shopify Integration → Shopify Settings** and create a reco
 | Admin API Access Token | *Optional.* Legacy custom apps only — see Gateway Payment Reference below |
 | Client ID / Client Secret | *Optional.* Dev Dashboard apps use these instead of a token |
 
-### 2. Register the Webhook in Shopify
+### 2. Register the Webhooks in Shopify
 
-Go to **Shopify Admin → Settings → Notifications → Webhooks** and add:
+Go to **Shopify Admin → Settings → Notifications → Webhooks** and add one webhook per event below, all pointing at the same URL:
 
 - **Event:** Order creation
-- **Format:** JSON
+- **Event:** Order payment *(required if a Sales Order can ever be created with a balance still due — e.g. Cashfree partial-COD — so the remaining amount gets its own Payment Entry once Shopify shows it collected)*
+- **Event:** Order update *(same reason — some stores only fire this one when the balance is paid, instead of Order payment)*
+- **Format:** JSON (all of the above)
 - **URL:** `https://your-erpnext-domain/api/method/shopify_integration.api.shopify_webhook`
 
 Copy the webhook signing secret and paste it into **Webhook Secret** in Shopify Settings.
@@ -76,6 +78,9 @@ Enable **Enable Payment Entry Creation** and configure:
   - Use **Tag Contains** for Cashfree/Razorpay partial-COD orders
   - Use **Shopify Gateway** for exact gateway name matching
 - **Auto Submit** — automatically submit Payment Entries
+- **Payment Terms Paid** — *optional.* A Payment Terms Template to switch a Sales Order (and
+  its Sales Invoice, if raised) to once Shopify shows the balance fully collected. Leave blank
+  to skip the terms switch and only create the delta Payment Entry.
 
 ### 4. Gateway Payment Reference (Optional)
 
@@ -273,6 +278,17 @@ after commit and can never block a stock document.
 detects this from `supportedActions`, refuses with a clear message, and leaves the order
 for Shopify admin — it does not guess.
 
+**Forcing a mismatched fulfillment.** When a Delivery Note's item code doesn't exist on the
+Shopify order at all — typically because the Sales Order item was swapped/edited in ERPNext
+after the Shopify order was placed, with the price difference settled directly outside
+Shopify — normal matching fails with "no matching open fulfillment order line" and nothing
+is sent. On a Failed Delivery Note from this specific reason, the **Fulfil in Shopify**
+button's dialog offers a **Fulfil regardless of item code match** checkbox: ticking it
+allocates the shipped quantity against whatever open capacity the Shopify order still has,
+regardless of SKU, so the order can still be marked fulfilled. This is a deliberate,
+per-attempt override — it is never applied automatically by on_submit or the hourly
+scheduler, only when a person ticks the box.
+
 ---
 
 ## How It Works
@@ -298,6 +314,24 @@ Shopify Order → Webhook POST → ERPNext API
   ↓
   Shopify Log updated → "Processed"
 ```
+
+Later, if the order was only partially paid and the customer pays the rest:
+
+```
+Shopify fires orders/paid or orders/updated (financial_status == "paid")
+  ↓
+  Sales Order (or its Sales Invoice, if already raised) found
+  balance due = Shopify's cumulative paid amount - what's already allocated
+  ↓
+  Second Payment Entry created for the DELTA only, against whichever
+  document (SO or SI) is currently open
+  Payment Terms Template switched to the "paid" template on both,
+  Payment Schedule rebuilt to match what's actually been collected
+  ↓
+  Shopify Log updated → "Processed"
+```
+
+Idempotent: a replayed webhook that finds nothing left to collect and the terms already switched does nothing.
 
 Later, when goods ship:
 

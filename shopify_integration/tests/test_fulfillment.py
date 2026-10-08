@@ -210,6 +210,55 @@ class TestPlanFulfillment(unittest.TestCase):
 
         self.assertEqual(plan["allocated"], 0)
         self.assertIn("no matching open", plan["unallocated"][0]["reason"])
+        self.assertEqual(plan["forced"], [])
+
+    def test_unmatched_sku_without_force_stays_unallocated(self):
+        """force defaults False — an ordinary mismatch is unaffected."""
+        orders = [fo("fo/1", lines=[fo_line("fol/1", "li/1", "SKU-A", 1)])]
+        plan = f.plan_fulfillment(orders, [want("SKU-ZZZ", 1, "li/999")], force=False)
+
+        self.assertEqual(plan["allocated"], 0)
+        self.assertEqual(plan["forced"], [])
+
+    def test_force_allocates_mismatched_sku_against_open_capacity(self):
+        """The item-swap case this exists for: SKU never on the Shopify order."""
+        orders = [fo("fo/1", lines=[fo_line("fol/1", "li/1", "SKU-A", 1)])]
+        plan = f.plan_fulfillment(orders, [want("SKU-ZZZ", 1, "li/999")], force=True)
+
+        self.assertEqual(plan["allocated"], 1)
+        self.assertEqual(plan["unallocated"], [])
+        self.assertEqual(plan["forced"], [{"sku": "SKU-ZZZ", "qty": 1}])
+        rows = plan["line_items_by_fulfillment_order"][0]["fulfillmentOrderLineItems"]
+        self.assertEqual(rows, [{"id": "fol/1", "quantity": 1}])
+
+    def test_force_does_not_override_a_real_match(self):
+        """A line-item-id/SKU match is used as-is; force never touches it."""
+        orders = [fo("fo/1", lines=[fo_line("fol/1", "li/1", "SKU-A", 2)])]
+        plan = f.plan_fulfillment(orders, [want("SKU-A", 2, "li/1")], force=True)
+
+        self.assertEqual(plan["allocated"], 2)
+        self.assertEqual(plan["forced"], [])
+
+    def test_force_still_reports_unallocated_when_no_capacity_anywhere(self):
+        """force can only spend what's left — an exhausted order still fails."""
+        orders = [fo("fo/1", lines=[fo_line("fol/1", "li/1", "SKU-A", 0)])]
+        plan = f.plan_fulfillment(orders, [want("SKU-ZZZ", 1, "li/999")], force=True)
+
+        self.assertEqual(plan["allocated"], 0)
+        self.assertEqual(plan["forced"], [])
+        self.assertEqual(len(plan["unallocated"]), 1)
+
+    def test_force_spreads_over_remaining_capacity_across_lines(self):
+        """Not enough on one line: force spills onto the next open line too."""
+        orders = [fo("fo/1", lines=[
+            fo_line("fol/1", "li/1", "SKU-A", 1),
+            fo_line("fol/2", "li/2", "SKU-B", 2),
+        ])]
+        plan = f.plan_fulfillment(orders, [want("SKU-ZZZ", 3, "li/999")], force=True)
+
+        self.assertEqual(plan["allocated"], 3)
+        self.assertEqual(plan["unallocated"], [])
+        self.assertEqual(plan["forced"], [{"sku": "SKU-ZZZ", "qty": 3}])
 
     def test_multi_line_order(self):
         orders = [fo("fo/1", lines=[

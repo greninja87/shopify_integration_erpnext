@@ -224,17 +224,28 @@ def _fo_line_key(fo_line) -> tuple:
     )
 
 
-def plan_fulfillment(fulfillment_orders, wanted) -> dict:
+def plan_fulfillment(fulfillment_orders, wanted, force: bool = False) -> dict:
     """
     Work out exactly which fulfillment order line items to fulfil, and how many.
 
     :param fulfillment_orders: nodes from order.fulfillmentOrders
     :param wanted: [{"line_item_id": str, "sku": str, "qty": int}] from the
                    Delivery Note
+    :param force: when a wanted line has no line-item-id or SKU match, allocate
+                  it against whatever open fulfillment order lines still have
+                  remaining capacity instead of leaving it unallocated. For the
+                  routine case this exists for — a Sales Order item swapped in
+                  ERPNext after the Shopify order was placed, so the DN's SKU
+                  was never on the order at all — there is no "correct" line to
+                  match against; this is a deliberate, human-requested override
+                  to mark the order fulfilled in Shopify regardless, not a
+                  smarter match.
     :return: {
         "line_items_by_fulfillment_order": payload for FulfillmentInput,
         "allocated": total units allocated,
         "unallocated": [{"sku", "qty", "reason"}],
+        "forced": [{"sku", "qty"}] — wanted lines allocated only because of
+                  `force`, with no line-item-id or SKU match of their own,
         "third_party": [fulfillment order ids needing a fulfillment REQUEST],
         "locations": [assigned location names touched],
       }
@@ -271,6 +282,7 @@ def plan_fulfillment(fulfillment_orders, wanted) -> dict:
     # fulfillment order id -> [{id, quantity}]
     grouped = {}
     unallocated = []
+    forced = []
     total_allocated = 0
 
     for want in (wanted or []):
@@ -291,6 +303,15 @@ def plan_fulfillment(fulfillment_orders, wanted) -> dict:
         if not candidates and sku:
             candidates = [p for p in pool if p["sku"] and p["sku"] == sku.lower()]
 
+        # Forced fallback: no identity match at all, but the human asked to
+        # fulfil anyway. Spend whatever open capacity the order still has —
+        # there is nothing left to match against, so this is a deliberate
+        # "mark it fulfilled regardless", not a better guess.
+        is_forced = False
+        if not candidates and force:
+            candidates = [p for p in pool if p["remaining"] > 0]
+            is_forced = bool(candidates)
+
         if not candidates:
             unallocated.append({
                 "sku": sku, "qty": qty,
@@ -299,6 +320,7 @@ def plan_fulfillment(fulfillment_orders, wanted) -> dict:
             continue
 
         remaining_to_place = qty
+        placed_forced = 0
         capped = False
         for candidate in candidates:
             if remaining_to_place <= 0:
@@ -319,6 +341,11 @@ def plan_fulfillment(fulfillment_orders, wanted) -> dict:
             candidate["remaining"] -= take
             remaining_to_place -= take
             total_allocated += take
+            if is_forced:
+                placed_forced += take
+
+        if placed_forced:
+            forced.append({"sku": sku, "qty": placed_forced})
 
         if remaining_to_place > 0:
             unallocated.append({
@@ -343,6 +370,7 @@ def plan_fulfillment(fulfillment_orders, wanted) -> dict:
         "line_items_by_fulfillment_order": line_items_by_fo,
         "allocated": total_allocated,
         "unallocated": unallocated,
+        "forced": forced,
         "third_party": [fo.get("id") for fo in classified["third_party"]],
         "locations": locations,
     }
@@ -711,7 +739,8 @@ def check_eligibility(dn_name: str, settings=None) -> dict:
 
 # ── Main entry point ──────────────────────────────────────────────────────────
 
-def fulfil_delivery_note(dn_name: str, settings=None, triggered_by: str = "manual") -> dict:
+def fulfil_delivery_note(dn_name: str, settings=None, triggered_by: str = "manual",
+                          force: bool = False) -> dict:
     """
     Fulfil one Delivery Note's order in Shopify.
 
@@ -719,6 +748,11 @@ def fulfil_delivery_note(dn_name: str, settings=None, triggered_by: str = "manua
     form button, the bulk action.  Never raises — the Delivery Note is a stock
     document and must not be affected by a downstream API problem.
 
+    :param force: see plan_fulfillment(). Only ever set by a human explicitly
+                  asking for it (the "Fulfil regardless of item code" checkbox
+                  on the form button) — on_submit and the scheduler never pass
+                  it, so an automatic retry of a genuinely mismatched Delivery
+                  Note stays Failed instead of silently forcing itself.
     :return: {"ok", "status", "fulfillment_id", "message"}
     """
     def result(ok, status, message, fulfillment_id=""):
@@ -815,7 +849,7 @@ def fulfil_delivery_note(dn_name: str, settings=None, triggered_by: str = "manua
         # and reporting success would be worse than saying so.
         _warn_if_truncated(dn_name, shopify_order_id, fulfillment_orders, fo_nodes)
 
-        plan = plan_fulfillment(fo_nodes, wanted)
+        plan = plan_fulfillment(fo_nodes, wanted, force=force)
 
         # ── Nothing we can create ────────────────────────────────────────────
         if plan["allocated"] <= 0:
@@ -911,10 +945,14 @@ def fulfil_delivery_note(dn_name: str, settings=None, triggered_by: str = "manua
 
         partial = bool(plan["unallocated"])
         status = STATUS_PARTIAL if partial else STATUS_FULFILLED
-        note = ""
+        notes = []
+        if plan.get("forced"):
+            notes.append("Forced — allocated ignoring item code mismatch: "
+                         + json.dumps(plan["forced"])[:400])
         if partial:
-            note = ("Fulfilled, but some quantity was not sent: "
-                    + json.dumps(plan["unallocated"])[:800])
+            notes.append("Fulfilled, but some quantity was not sent: "
+                         + json.dumps(plan["unallocated"])[:800])
+        note = " ".join(notes)
 
         _set_state(dn_name, **{
             FULFILLMENT_ID_FIELD: fulfillment_id,
@@ -1280,16 +1318,19 @@ def get_dn_fulfillment_status(dn_name: str) -> dict:
 
 
 @frappe.whitelist()
-def fulfil_now(dn_name: str) -> dict:
+def fulfil_now(dn_name: str, force=False) -> dict:
     """
     Fulfil one Delivery Note on demand — the form's "Fulfil in Shopify" button.
 
     Runs inline rather than enqueued so the user gets the real outcome back
     instead of an optimistic "queued".  One order is one or two GraphQL calls,
     well inside a web request.
+
+    :param force: from the button's "Fulfil regardless of item code" checkbox —
+                  see plan_fulfillment() for what it actually does.
     """
     frappe.has_permission("Delivery Note", "submit", doc=dn_name, throw=True)
-    return fulfil_delivery_note(dn_name, triggered_by="manual")
+    return fulfil_delivery_note(dn_name, triggered_by="manual", force=cint(force) == 1)
 
 
 @frappe.whitelist()
